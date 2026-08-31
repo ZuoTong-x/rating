@@ -8,13 +8,15 @@ process.on("message", async (message) => {
   started = true;
 
   try {
-    const result = await runWithDatabaseContext(() => generateSubjectTasks(
-      message.subjectId,
-      message.assignment,
-      ({ stage, progress }) => {
-        if (process.connected) process.send({ type: "progress", stage, progress });
-      },
-    ));
+    const result = await runWithDatabaseContext(() =>
+      generateSubjectTasks(
+        message.subjectId,
+        message.assignment,
+        ({ stage, progress }) => {
+          if (process.connected) process.send({ type: "progress", stage, progress });
+        },
+      ),
+    );
     if (process.connected) process.send({ type: "completed", result });
     setImmediate(() => process.exit(0));
   } catch (error) {

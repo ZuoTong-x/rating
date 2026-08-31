@@ -389,7 +389,7 @@ export function createAdminDashboardService({
          WHERE taskVersion = ?
            AND status = 'completed'
            AND completedAt IS NOT NULL
-           AND (? IS NULL OR projectId = ?)
+           AND (?::text IS NULL OR projectId = ?)
          GROUP BY EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')
          ORDER BY hour ASC`,
       )
@@ -433,7 +433,7 @@ export function createAdminDashboardService({
          WHERE rating_tasks.taskVersion = ?
            AND rating_tasks.scorer IS NOT NULL
            AND TRIM(rating_tasks.scorer) <> ''
-           AND (? IS NULL OR rating_tasks.projectId = ?)
+           AND (?::text IS NULL OR rating_tasks.projectId = ?)
          GROUP BY users.id, users.username, users.status
          ORDER BY completedTaskCount DESC, totalTaskCount DESC, LOWER(users.username) ASC, users.username ASC
          LIMIT 12`,
@@ -460,7 +460,7 @@ export function createAdminDashboardService({
          WHERE rating_tasks.taskVersion = ?
            AND rating_tasks.scorer IS NOT NULL
            AND TRIM(rating_tasks.scorer) <> ''
-           AND (? IS NULL OR rating_tasks.projectId = ?)
+           AND (?::text IS NULL OR rating_tasks.projectId = ?)
          GROUP BY teams.id, teams.name, teams.status
          ORDER BY completedTaskCount DESC, totalTaskCount DESC, LOWER(teams.name) ASC, teams.name ASC
          LIMIT 12`,

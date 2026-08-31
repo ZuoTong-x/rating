@@ -4,7 +4,7 @@ import { NImagePreview, useDialog, useMessage } from 'naive-ui';
 import { currentUser } from '../../../composables/auth';
 import { taskCriteria, type TaskCriterionKey } from '../../../constants/scoreCriteria';
 import { imageApi } from '../../../services/images';
-import { isQueryUnavailable } from '../../../services/http';
+import { HttpError, isQueryUnavailable } from '../../../services/http';
 import AsyncStatePlaceholder from '../../../components/AsyncStatePlaceholder.vue';
 import type { RankingRelation, RatingTask, RatingTaskItem, TaskSubmissionMode } from '../../../types/image';
 
@@ -352,37 +352,49 @@ async function submit(advance = false) {
     const result = isEditing.value
       ? await imageApi.updateCompletedTask(task.id, payload)
       : await imageApi.completeTask(task.id, payload);
-    lastSubmissionAt.value = Date.now();
-    lastSavedTask.value = result.task;
-    emit('saved', result.task, advance);
-
-    if (advance) {
+    await handleSavedTask(result.task, advance);
+  } catch (error) {
+    if (error instanceof HttpError && error.status === 409 && !isEditing.value) {
       try {
-        const nextTask = await props.getNextTask?.(result.task);
-        if (nextTask) {
-          message.success('任务已提交，已打开下一条');
-          emit('next', nextTask);
+        const recovered = (await imageApi.assignedTaskDetail(task.id)).task;
+        if (recovered.status === 'completed' && recovered.scorer === scorer) {
+          await handleSavedTask(recovered, advance);
           return;
         }
-
-        message.success('任务已提交');
-        message.info('当前筛选条件下没有下一条待处理任务');
-        visible.value = false;
-        return;
-      } catch (error) {
-        if (isQueryUnavailable(error)) nextTaskError.value = true;
-        else message.error(error instanceof Error ? `当前任务已提交，${error.message}` : '当前任务已提交，但加载下一条失败');
-        return;
-      }
+      } catch {}
     }
-
-    message.success(isEditing.value ? '修改已保存' : '任务已提交');
-    visible.value = false;
-  } catch (error) {
     if (isQueryUnavailable(error)) submitError.value = true;
     else message.error(error instanceof Error ? error.message : '提交失败');
   } finally {
     saving.value = false;
+  }
+}
+
+async function handleSavedTask(savedTask: RatingTask, advance: boolean) {
+  lastSubmissionAt.value = Date.now();
+  lastSavedTask.value = savedTask;
+  emit('saved', savedTask, advance);
+
+  if (!advance) {
+    message.success(isEditing.value ? '修改已保存' : '任务已提交');
+    visible.value = false;
+    return;
+  }
+
+  try {
+    const nextTask = await props.getNextTask?.(savedTask);
+    if (nextTask) {
+      message.success('任务已提交，已打开下一条');
+      emit('next', nextTask);
+      return;
+    }
+
+    message.success('任务已提交');
+    message.info('当前筛选条件下没有下一条待处理任务');
+    visible.value = false;
+  } catch (error) {
+    if (isQueryUnavailable(error)) nextTaskError.value = true;
+    else message.error(error instanceof Error ? `当前任务已提交，${error.message}` : '当前任务已提交，但加载下一条失败');
   }
 }
 

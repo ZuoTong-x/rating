@@ -2,13 +2,15 @@ services:
   postgres:
     image: postgres:18-trixie
     restart: unless-stopped
+    mem_limit: 8g
+    mem_reservation: 2g
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-image_rating}
       # The official image creates POSTGRES_USER as a superuser on init.
       POSTGRES_USER: image_rating
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set}
     volumes:
-      - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/postgres:/var/lib/postgresql
+      - ${POSTGRES_DATA_DIR:-/var/lib/rating/postgres}:/var/lib/postgresql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U $$POSTGRES_USER -d $$POSTGRES_DB"]
       interval: 5s

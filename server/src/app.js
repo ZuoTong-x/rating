@@ -28,6 +28,7 @@ import {
   projectSelectColumns,
   subjectSelectColumns,
   userSelectColumns,
+  runWithDatabaseContext,
 } from "./postgres.js";
 import { createAdminDashboardService } from "./services/admin-dashboard.js";
 import { createAdminScoringService } from "./services/admin-scoring.js";
@@ -82,6 +83,7 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "2mb" }));
+app.use((_req, _res, next) => runWithDatabaseContext(() => next()));
 
 function positiveLimit(name, fallback) {
   const configured = Number(process.env[name]);
@@ -627,7 +629,7 @@ const selectAssignedTaskRowsPageStmt = db.prepare(`
   WHERE rating_tasks.taskVersion = ?
     AND rating_tasks.scorer = ?
     AND rating_tasks.status = 'assigned'
-    AND (? IS NULL OR rating_tasks.projectId = ?)
+    AND (?::text IS NULL OR rating_tasks.projectId = ?)
   ORDER BY rating_tasks.updatedAt DESC, rating_tasks.id ASC
   LIMIT ? OFFSET ?
 `);
@@ -637,7 +639,7 @@ const selectAssignedTaskCountStmt = db.prepare(`
   WHERE taskVersion = ?
     AND scorer = ?
     AND status = 'assigned'
-    AND (? IS NULL OR projectId = ?)
+    AND (?::text IS NULL OR projectId = ?)
 `);
 const selectScorerTaskStatsStmt = db.prepare(`
   SELECT
@@ -646,7 +648,7 @@ const selectScorerTaskStatsStmt = db.prepare(`
   FROM scorer_task_stats
   WHERE taskVersion = ?
     AND scorer = ?
-    AND (? IS NULL OR projectId = ?)
+    AND (?::text IS NULL OR projectId = ?)
 `);
 const selectScorerProjectCountStmt = db.prepare(`
   SELECT COUNT(*) AS total
@@ -3249,7 +3251,7 @@ function queueSubjectDeletion(subjectId) {
 
   queuedSubjectDeletionIds.add(subjectId);
   setImmediate(async () => {
-    void (await deleteQueuedSubject(subjectId));
+    void (await runWithDatabaseContext(() => deleteQueuedSubject(subjectId)));
   });
 }
 
@@ -5142,7 +5144,10 @@ async function completeAssignedTask(taskId, body = {}) {
   if (!scorer) throw httpError(400, "缺少打分人");
   const task = await selectTaskByIdStmt.get(taskId);
   if (!task) throw httpError(404, "任务不存在");
-  if (task.status === "completed") throw httpError(409, "该任务已完成");
+  if (task.status === "completed") {
+    if (task.scorer === scorer) return (await hydrateTaskRows([task]))[0];
+    throw httpError(409, "该任务已完成");
+  }
   if (task.status !== "assigned" || task.scorer !== scorer)
     throw httpError(403, "该任务未分配给当前打分人");
   if (body.projectId && String(body.projectId) !== (task.projectId || task.subjectId))
@@ -7183,10 +7188,19 @@ app.put("/api/images/:id/score", async (req, res, next) => {
 
 app.use((error, req, res, _next) => {
   const timedOut = error?.code === "57014" || error?.cause?.code === "57014";
-  let status = timedOut ? 503 : error.status || 500;
+  const poolQueueTimedOut = error?.message === "timeout exceeded when trying to connect";
+  let status = timedOut || poolQueueTimedOut ? 503 : error.status || 500;
   if (status >= 500) console.error(error);
-  let message = timedOut ? "查询执行超时，请稍后重试" : error.message || "服务异常";
-  const code = timedOut ? "QUERY_TIMEOUT" : error.code || "REQUEST_FAILED";
+  let message = timedOut
+    ? "查询执行超时，请稍后重试"
+    : poolQueueTimedOut
+      ? "请求较多，请稍后重试"
+      : error.message || "服务异常";
+  const code = timedOut
+    ? "QUERY_TIMEOUT"
+    : poolQueueTimedOut
+      ? "QUERY_QUEUE_TIMEOUT"
+      : error.code || "REQUEST_FAILED";
 
   if (error instanceof multer.MulterError) {
     status = 400;

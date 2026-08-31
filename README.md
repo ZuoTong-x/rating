@@ -18,7 +18,7 @@ docker compose up --build -d
 3. 打分账号登录后，在“任务列表”领取分配给自己的五图排序任务并提交。
 4. 已完成任务保存打分人、完成时间、用时、排序结果、并列关系和不适用图片；修改任务不会覆盖初次完成时间和用时。
 
-数据库目标为 Docker Compose 中的 `postgres:18-trixie`，数据持久化在 `${RATING_DATA_DIR}/postgres`。上传图片保存在 `${RATING_DATA_DIR}/uploads`。
+数据库目标为 Docker Compose 中的 `postgres:18-trixie`，数据持久化在宿主机 `${POSTGRES_DATA_DIR}`（默认 `/var/lib/rating/postgres`）。上传图片保存在 `${RATING_DATA_DIR}/uploads`。
 
 ZIP 内目录示例：
 
