@@ -300,7 +300,13 @@ export function createAdminDashboardService({
          JOIN subjects ON subjects.id = project_packages.packageId
          LEFT JOIN subject_task_templates ON subject_task_templates.subjectId = subjects.id
          WHERE project_packages.projectId = ?
-         GROUP BY subjects.id, subjects.name, subjects.imageCount, subjects.categoryCount, subjects.taskStatus, subjects.status
+         GROUP BY project_packages.createdAt,
+                  subjects.id,
+                  subjects.name,
+                  subjects.imageCount,
+                  subjects.categoryCount,
+                  subjects.taskStatus,
+                  subjects.status
          ORDER BY project_packages.createdAt ASC, LOWER(subjects.name) ASC, subjects.name ASC`,
       )
       .all(projectId);

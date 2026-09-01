@@ -23,10 +23,10 @@ create table if not exists import_jobs (
     originalfilename text not null,
     totalchunks integer not null,
     protocol text not null default 'chunked',
-    uploadlength integer,
-    uploadoffset integer not null default 0,
+    uploadlength bigint,
+    uploadoffset bigint not null default 0,
     metadata text,
-    status text not null check (status in ('queued', 'merging', 'importing', 'completed', 'failed')),
+    status text not null check (status in ('queued', 'merging', 'importing', 'awaiting_json', 'completed', 'failed')),
     stage text not null,
     progress integer not null default 0,
     message text,
@@ -35,6 +35,24 @@ create table if not exists import_jobs (
     updatedat timestamptz not null,
     expiresat timestamptz not null
   );
+alter table import_jobs
+    alter column uploadlength type bigint using uploadlength::bigint,
+    alter column uploadoffset type bigint using uploadoffset::bigint;
+do $$
+begin
+  if not exists (
+    select 1
+    from pg_constraint
+    where conrelid = 'import_jobs'::regclass
+      and contype = 'c'
+      and pg_get_constraintdef(oid) like '%awaiting_json%'
+  ) then
+    alter table import_jobs drop constraint if exists import_jobs_status_check;
+    alter table import_jobs
+      add constraint import_jobs_status_check
+      check (status in ('queued', 'merging', 'importing', 'awaiting_json', 'completed', 'failed'));
+  end if;
+end $$;
 
 create table if not exists schema_meta (
     key text primary key,

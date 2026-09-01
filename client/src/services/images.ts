@@ -7,17 +7,21 @@ function downloadFilename(contentDisposition: string | null, fallback: string) {
 }
 
 const ZIP_CHUNK_SIZE = 12 * 1024 * 1024;
-const ZIP_CHUNK_RETRY_COUNT = 3;
-const IMPORT_STATUS_POLL_INTERVAL = 800;
+const ZIP_CHUNK_RETRY_COUNT = 6;
+const ZIP_CHUNK_RETRY_BASE_DELAY = 1000;
+const UPLOAD_RECOVERY_ATTEMPT_LIMIT = 5;
+const IMPORT_STATUS_POLL_INTERVAL = 10_000;
 const RESUMABLE_UPLOAD_STORAGE_PREFIX = 'resumable-zip-upload:';
 const TUS_VERSION = '1.0.0';
 
-type ImportJob = {
+export type ImportJob = {
   uploadId: string;
-  status: 'queued' | 'merging' | 'importing' | 'completed' | 'failed';
+  originalFilename?: string | null;
+  status: 'queued' | 'merging' | 'importing' | 'awaiting_json' | 'completed' | 'failed';
   stage: string;
   progress: number;
   message: string | null;
+  awaitingJson?: boolean;
   result?: { subject: SubjectItem; imported: number; skipped: number; batch: string };
 };
 
@@ -145,10 +149,22 @@ async function createResumableSession(file: File): Promise<ResumableUploadSessio
 }
 
 async function probeResumableSession(uploadUrl: string): Promise<ResumableUploadProbe> {
-  const response = await requestResponse(uploadUrl, {
-    method: 'HEAD',
-    headers: { 'Tus-Resumable': TUS_VERSION }
-  });
+  let response: Response;
+  try {
+    response = await requestResponse(uploadUrl, {
+      method: 'HEAD',
+      headers: { 'Tus-Resumable': TUS_VERSION }
+    });
+  } catch (error) {
+    const status = (error as Error & { status?: number }).status;
+    if (status === 404 || status === 410) {
+      return { status: 'missing', offset: 0, uploadLength: 0 };
+    }
+    if (status === 409) {
+      return { status: 'processing', offset: 0, uploadLength: 0 };
+    }
+    throw error;
+  }
 
   if (response.status === 404 || response.status === 410) {
     return { status: 'missing', offset: 0, uploadLength: 0 };
@@ -223,8 +239,10 @@ async function uploadResumableChunkWithRetry(
     } catch (error) {
       lastError = error;
       const status = (error as Error & { status?: number }).status;
-      if (attempt + 1 < ZIP_CHUNK_RETRY_COUNT && (!status || status >= 500)) {
-        await delay(500 * (attempt + 1));
+      const retryableStatus = !status || [408, 425, 429, 500, 502, 503, 504].includes(status);
+      if (attempt + 1 < ZIP_CHUNK_RETRY_COUNT && retryableStatus) {
+        const backoff = ZIP_CHUNK_RETRY_BASE_DELAY * (2 ** attempt);
+        await delay(Math.min(backoff, 30_000));
         continue;
       }
       break;
@@ -247,6 +265,15 @@ async function waitForImportJob(
     );
   }
   onProcessing?.(job);
+  if (job.status === 'awaiting_json') {
+    const error = new Error(job.message || 'JSON 校验失败，请补充修正后的 JSON') as Error & {
+      awaitingJson?: boolean;
+      uploadId?: string;
+    };
+    error.awaitingJson = true;
+    error.uploadId = uploadId;
+    throw error;
+  }
   if (job.status === 'failed') {
     const error = new Error(job.message || '项目导入失败') as Error & { terminal?: boolean };
     error.terminal = true;
@@ -258,6 +285,7 @@ async function waitForImportJob(
 
 export const imageApi = {
   subjects: () => requestJson<SubjectItem[]>('/api/subjects'),
+  pendingImportJobs: () => requestJson<ImportJob[]>('/api/import/pending-json'),
   projects: () => requestJson<ProjectItem[]>('/api/projects'),
   assignedTaskOptions: () => requestJsonWithRetry<{ projects: ScorerProjectOption[] }>('/api/tasks/assigned/options'),
   projectPage(query: { page?: number; pageSize?: number } = {}) {
@@ -720,6 +748,7 @@ export const imageApi = {
       const existingSession = getStoredResumableSession(file);
       let session = existingSession;
       let uploadCompleted = false;
+      let recoveryAttempts = 0;
       try {
         onProgress?.(0);
         if (!session) {
@@ -780,7 +809,10 @@ export const imageApi = {
             session = { ...session, offset: currentOffset };
             setStoredResumableSession(file, session);
             onProgress?.(reportedBytes());
+            recoveryAttempts = 0;
           } catch (error) {
+            recoveryAttempts += 1;
+            if (recoveryAttempts > UPLOAD_RECOVERY_ATTEMPT_LIMIT) throw error;
             const status = (error as Error & { status?: number }).status;
             const serverOffset = (error as Error & { serverOffset?: number }).serverOffset;
             if (status === 409 && Number.isFinite(serverOffset)) {
@@ -808,6 +840,14 @@ export const imageApi = {
               onProgress?.(reportedBytes());
               continue;
             }
+            if (probe?.status === 'missing') {
+              clearStoredResumableSession(file);
+              session = await createResumableSession(file);
+              currentOffset = 0;
+              setStoredResumableSession(file, session);
+              onProgress?.(0);
+              continue;
+            }
 
             const existingJob = await requestJson<ImportJob>(
               `/api/import/uploads/${encodeURIComponent(session.uploadId)}/status`
@@ -831,11 +871,25 @@ export const imageApi = {
         clearStoredResumableSession(file);
         return result;
       } catch (error) {
-        if (uploadCompleted && (error as Error & { terminal?: boolean }).terminal) {
+        const typedError = error as Error & { terminal?: boolean; awaitingJson?: boolean };
+        if (uploadCompleted && (typedError.terminal || typedError.awaitingJson)) {
           clearStoredResumableSession(file);
         }
         throw error;
       }
+    })();
+  },
+  supplementImportJson(uploadId: string, file: File, options?: {
+    onProcessing?: (job: ImportJob) => void;
+  }) {
+    const formData = new FormData();
+    formData.append('file', file, file.name);
+    return (async () => {
+      const job = await requestJson<ImportJob>(
+        `/api/import/uploads/${encodeURIComponent(uploadId)}/supplement-json`,
+        { method: 'POST', body: formData }
+      );
+      return waitForImportJob(uploadId, job, options?.onProcessing);
     })();
   },
   saveScore(id: string, score: ImageScore) {

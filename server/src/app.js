@@ -44,6 +44,7 @@ const uploadDir = path.resolve(process.env.UPLOAD_DIR || "uploads");
 const zipUploadDir = path.join(uploadDir, "_zips");
 const chunkUploadDir = path.join(uploadDir, "_chunks");
 const resumableUploadDir = path.join(uploadDir, "_resumable");
+const pendingJsonImportDir = path.join(uploadDir, "_pending-json");
 const feedbackUploadDir = path.join(uploadDir, "feedback");
 const imageExts = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 const feedbackImageExts = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -62,6 +63,7 @@ await fs.mkdir(uploadDir, { recursive: true });
 await fs.mkdir(zipUploadDir, { recursive: true });
 await fs.mkdir(chunkUploadDir, { recursive: true });
 await fs.mkdir(resumableUploadDir, { recursive: true });
+await fs.mkdir(pendingJsonImportDir, { recursive: true });
 await fs.mkdir(feedbackUploadDir, { recursive: true });
 
 const corsOrigin = process.env.CORS_ORIGIN?.trim();
@@ -114,6 +116,18 @@ const imageImportConcurrency = Math.min(
 const upload = multer({
   dest: zipUploadDir,
   limits: { fileSize: maxZipBytes },
+});
+
+const jsonSupplementUpload = multer({
+  dest: zipUploadDir,
+  limits: { fileSize: 128 * 1024 * 1024 },
+  fileFilter(_req, file, callback) {
+    if (path.extname(file.originalname || "").toLowerCase() !== ".zip") {
+      callback(httpError(400, "补充 JSON 仅支持 ZIP 文件"));
+      return;
+    }
+    callback(null, true);
+  },
 });
 
 const chunkUpload = multer({
@@ -484,6 +498,9 @@ const deleteImportJobStmt = db.prepare(
 );
 const deleteExpiredImportJobsStmt = db.prepare(
   "DELETE FROM import_jobs WHERE expiresAt <= ?",
+);
+const selectPendingImportJobsStmt = db.prepare(
+  "SELECT * FROM import_jobs WHERE status = 'awaiting_json' AND expiresAt > ? ORDER BY createdAt DESC",
 );
 const insertFeedbackStmt = db.prepare(`
   INSERT INTO feedbacks (
@@ -1091,6 +1108,47 @@ async function loadArchiveTaskManifest(zip) {
   }
 }
 
+async function loadSupplementalJsonArchive(zipPath) {
+  let zip;
+  try {
+    zip = await openZip64Archive(zipPath);
+    await assertArchiveLimits(zip, zipPath);
+    const imageEntry = zip.files.find((entry) => {
+      if (entry.type === "Directory") return false;
+      const relative = cleanRelative(decodeZipEntryPath(entry));
+      return Boolean(relative) && imageExts.has(path.extname(relative).toLowerCase());
+    });
+    if (imageEntry) {
+      throw archiveImportError(422, "补充 JSON 压缩包不能包含图片文件");
+    }
+
+    let archiveManifests;
+    let archiveTaskManifest;
+    try {
+      archiveManifests = await loadArchiveManifests(zip);
+      archiveTaskManifest = await loadArchiveTaskManifest(zip);
+    } catch (error) {
+      throw markSupplementableJsonError(error);
+    }
+    if (!archiveManifests.length && !archiveTaskManifest) {
+      throw archiveImportError(422, "补充 JSON 压缩包中未找到 manifest.json 或 tasks.json");
+    }
+    return {
+      manifestProvided: archiveManifests.length > 0,
+      archiveManifests,
+      taskManifestProvided: Boolean(archiveTaskManifest),
+      archiveTaskManifest,
+    };
+  } catch (error) {
+    if (error?.isArchiveImportError) throw markSupplementableJsonError(error);
+    throw markSupplementableJsonError(
+      archiveImportError(422, "无法读取补充 JSON 压缩包，请确认文件完整", error),
+    );
+  } finally {
+    zip?.close();
+  }
+}
+
 async function loadImageCatalogIndex(archiveManifests = []) {
   const index = new Map();
   for (const manifest of archiveManifests) {
@@ -1474,6 +1532,60 @@ function resumableUploadExpiresAt() {
   return new Date(Date.now() + resumableUploadExpiryMs).toISOString();
 }
 
+function pendingJsonImportPath(uploadId) {
+  validateUploadId(uploadId);
+  return path.join(pendingJsonImportDir, uploadId, "source.zip");
+}
+
+function markSupplementableJsonError(error) {
+  if (error?.isArchiveImportError) {
+    error.isSupplementableJsonError = true;
+  }
+  return error;
+}
+
+function markImportJobMetadata(job, patch) {
+  let metadata = {};
+  if (job.metadata) {
+    try {
+      const parsed = JSON.parse(job.metadata);
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        metadata = parsed;
+      }
+    } catch {}
+  }
+  job.metadata = JSON.stringify({ ...metadata, ...patch });
+}
+
+async function moveFile(sourcePath, targetPath) {
+  await fs.mkdir(path.dirname(targetPath), { recursive: true });
+  try {
+    await fs.rename(sourcePath, targetPath);
+  } catch (error) {
+    if (error?.code !== "EXDEV") throw error;
+    await fs.copyFile(sourcePath, targetPath);
+    await fs.unlink(sourcePath);
+  }
+}
+
+async function preservePendingJsonImportSource(job) {
+  const targetPath = pendingJsonImportPath(job.uploadId);
+  if (path.resolve(job.zipPath) !== path.resolve(targetPath)) {
+    await moveFile(job.zipPath, targetPath);
+  }
+  job.zipPath = targetPath;
+  job.pendingJson = true;
+  markImportJobMetadata(job, { pendingJson: true });
+}
+
+async function cleanupPendingJsonImport(uploadId) {
+  validateUploadId(uploadId);
+  await fs.rm(path.join(pendingJsonImportDir, uploadId), {
+    recursive: true,
+    force: true,
+  });
+}
+
 function tusMetadataHeaderValue(value) {
   return Buffer.from(String(value || ""), "utf8").toString("base64");
 }
@@ -1673,6 +1785,24 @@ async function sweepResumableUploadSessions() {
   );
 }
 
+async function sweepPendingJsonImports() {
+  const rows = await selectPendingImportJobsStmt.all(new Date().toISOString());
+  const activeIds = new Set(rows.map((row) => row.uploadId));
+  const entries = await fs
+    .readdir(pendingJsonImportDir, { withFileTypes: true })
+    .catch(() => []);
+  await Promise.all(
+    entries
+      .filter((entry) => entry.isDirectory() && !activeIds.has(entry.name))
+      .map((entry) =>
+        fs.rm(path.join(pendingJsonImportDir, entry.name), {
+          recursive: true,
+          force: true,
+        }),
+      ),
+  );
+}
+
 function normalizeTusFilename(filename) {
   return path.basename(String(filename || "").replace(/\\/g, "/")).trim();
 }
@@ -1714,7 +1844,7 @@ async function withResumableUploadLock(uploadId, task) {
 async function importZipArchive(
   zipPath,
   originalFilename,
-  { removeSource = true, onProgress } = {},
+  { removeSource = true, onProgress, supplementalJson } = {},
 ) {
   const batch = `${Date.now()}-${crypto.randomUUID().slice(0, 8)}`;
   const subjectId = crypto.randomUUID();
@@ -1765,8 +1895,18 @@ async function importZipArchive(
       );
     }
 
-    const archiveManifests = await loadArchiveManifests(zip);
-    const archiveTaskManifest = await loadArchiveTaskManifest(zip);
+    let archiveManifests;
+    let archiveTaskManifest;
+    try {
+      archiveManifests = supplementalJson?.manifestProvided
+        ? supplementalJson.archiveManifests
+        : await loadArchiveManifests(zip);
+      archiveTaskManifest = supplementalJson?.taskManifestProvided
+        ? supplementalJson.archiveTaskManifest
+        : await loadArchiveTaskManifest(zip);
+    } catch (error) {
+      throw markSupplementableJsonError(error);
+    }
     const catalogIndex = await loadImageCatalogIndex(archiveManifests);
     const storageRoot = await allocateSubjectStorageRoot(
       subjectName,
@@ -1896,12 +2036,26 @@ async function importZipArchive(
       throw archiveImportError(422, "压缩包中的图片均无法导入");
     }
 
-    const { taskTemplates, failedTasks } = buildTaskTemplateRecords(
-      subjectId,
-      archiveTaskManifest,
-      imageRecords,
-      createdAt,
-    );
+    let taskTemplateResult;
+    try {
+      taskTemplateResult = buildTaskTemplateRecords(
+        subjectId,
+        archiveTaskManifest,
+        imageRecords,
+        createdAt,
+      );
+    } catch (error) {
+      throw markSupplementableJsonError(error);
+    }
+    const { taskTemplates, failedTasks } = taskTemplateResult;
+    if (failedTasks.length) {
+      const taskError = archiveImportError(
+        422,
+        `tasks.json 中有 ${failedTasks.length} 条任务校验失败，首条错误：${failedTasks[0].message}；请修正后补充上传`,
+      );
+      taskError.taskFailures = failedTasks;
+      throw markSupplementableJsonError(taskError);
+    }
 
     // All archive I/O and image validation has completed before this write
     // transaction. Keep read indexes in place so imports do not rebuild the
@@ -1994,6 +2148,7 @@ async function runResumableImportJob(job) {
     await persistImportJob(job);
 
     job.result = await importZipArchive(job.zipPath, job.originalFilename, {
+      removeSource: false,
       onProgress: async ({ current, total }) => {
         job.progress = Math.min(99, Math.round((current / total) * 100));
         if (job.progress !== job.lastPersistedProgress) {
@@ -2009,19 +2164,41 @@ async function runResumableImportJob(job) {
     await persistImportJob(job);
   } catch (error) {
     const normalized = normalizeArchiveImportError(error);
-    job.status = "failed";
-    job.stage = "导入失败";
-    job.message = normalized.message || "导入失败，请重试";
-    await persistImportJob(job);
+    if (error?.isSupplementableJsonError) {
+      try {
+        await preservePendingJsonImportSource(job);
+        job.status = "awaiting_json";
+        job.stage = "等待补充 JSON";
+        job.progress = 100;
+        job.message = normalized.message || "JSON 校验失败，请补充修正后的 JSON";
+        job.result = null;
+        await persistImportJob(job);
+      } catch (preserveError) {
+        job.status = "failed";
+        job.stage = "导入失败";
+        job.message = "JSON 校验失败，且无法保留原始 ZIP，请重新上传";
+        await persistImportJob(job);
+        console.error(`Failed to preserve resumable ZIP import (${job.uploadId})`, preserveError);
+      }
+    } else {
+      job.status = "failed";
+      job.stage = "导入失败";
+      job.message = normalized.message || "导入失败，请重试";
+      await persistImportJob(job);
+    }
     console.error(`Resumable ZIP import failed (${job.uploadId})`, error);
   } finally {
     await cleanupResumableUploadSession(job.uploadId).catch(() => {});
+    if (job.status !== "awaiting_json") {
+      await fs.unlink(job.zipPath).catch(() => {});
+    }
 
     // 保留结果一段时间，允许前端在短暂断线后继续查询本次任务。
     setTimeout(
       async () => {
         importJobs.delete(job.uploadId);
         await deleteImportJobStmt.run(job.uploadId);
+        await cleanupPendingJsonImport(job.uploadId).catch(() => {});
       },
       24 * 60 * 60 * 1000,
     ).unref();
@@ -2035,10 +2212,12 @@ function importJobExpiry() {
 function importJobDto(job) {
   const payload = {
     uploadId: job.uploadId,
+    originalFilename: job.originalFilename || null,
     status: job.status,
     stage: job.stage,
     progress: job.progress,
     message: job.message || null,
+    awaitingJson: job.status === "awaiting_json",
   };
   if (job.result) payload.result = job.result;
   return payload;
@@ -2057,6 +2236,9 @@ function importJobFromRow(row) {
   return {
     uploadId: row.uploadId,
     originalFilename: row.originalFilename,
+    zipPath: row.status === "awaiting_json"
+      ? pendingJsonImportPath(row.uploadId)
+      : null,
     totalChunks: row.totalChunks,
     protocol: row.protocol || "chunked",
     uploadLength: row.uploadLength,
@@ -2144,6 +2326,7 @@ async function runChunkedImportJob(job) {
     job.progress = 15;
     await persistImportJob(job);
     job.result = await importZipArchive(job.zipPath, job.originalFilename, {
+      removeSource: false,
       onProgress: async ({ current, total }) => {
         job.progress = Math.min(99, 15 + Math.round((current / total) * 84));
         if (job.progress !== job.lastPersistedProgress) {
@@ -2158,20 +2341,41 @@ async function runChunkedImportJob(job) {
     await persistImportJob(job);
   } catch (error) {
     const normalized = normalizeArchiveImportError(error);
-    job.status = "failed";
-    job.stage = "导入失败";
-    job.message = normalized.message || "导入失败，请重试";
-    await persistImportJob(job);
+    if (error?.isSupplementableJsonError) {
+      try {
+        await preservePendingJsonImportSource(job);
+        job.status = "awaiting_json";
+        job.stage = "等待补充 JSON";
+        job.progress = 100;
+        job.message = normalized.message || "JSON 校验失败，请补充修正后的 JSON";
+        job.result = null;
+        await persistImportJob(job);
+      } catch (preserveError) {
+        job.status = "failed";
+        job.stage = "导入失败";
+        job.message = "JSON 校验失败，且无法保留原始 ZIP，请重新上传";
+        await persistImportJob(job);
+        console.error(`Failed to preserve chunked ZIP import (${job.uploadId})`, preserveError);
+      }
+    } else {
+      job.status = "failed";
+      job.stage = "导入失败";
+      job.message = normalized.message || "导入失败，请重试";
+      await persistImportJob(job);
+    }
     console.error(`Chunked ZIP import failed (${job.uploadId})`, error);
   } finally {
     await fs.rm(job.dir, { recursive: true, force: true }).catch(() => {});
-    await fs.unlink(job.zipPath).catch(() => {});
+    if (job.status !== "awaiting_json") {
+      await fs.unlink(job.zipPath).catch(() => {});
+    }
 
     // 保留结果一段时间，允许前端在短暂断线后继续查询本次任务。
     setTimeout(
       async () => {
         importJobs.delete(job.uploadId);
         await deleteImportJobStmt.run(job.uploadId);
+        await cleanupPendingJsonImport(job.uploadId).catch(() => {});
       },
       24 * 60 * 60 * 1000,
     ).unref();
@@ -2179,6 +2383,64 @@ async function runChunkedImportJob(job) {
 }
 
 // 时间统一存储为 UTC；业务展示和按小时统计固定使用 Asia/Shanghai（UTC+8）。
+async function runSupplementalJsonImportJob(job, supplementalZipPath) {
+  try {
+    job.status = "importing";
+    job.stage = "正在使用补充 JSON 重新处理";
+    job.progress = 0;
+    job.message = null;
+    job.result = null;
+    await persistImportJob(job);
+
+    const supplementalJson = await loadSupplementalJsonArchive(supplementalZipPath);
+    job.result = await importZipArchive(job.zipPath, job.originalFilename, {
+      removeSource: false,
+      supplementalJson,
+      onProgress: async ({ current, total }) => {
+        job.progress = Math.min(99, Math.round((current / total) * 100));
+        if (job.progress !== job.lastPersistedProgress) {
+          job.lastPersistedProgress = job.progress;
+          await persistImportJob(job);
+        }
+      },
+    });
+
+    job.status = "completed";
+    job.stage = "导入完成";
+    job.progress = 100;
+    await persistImportJob(job);
+    await cleanupPendingJsonImport(job.uploadId);
+  } catch (error) {
+    const normalized = normalizeArchiveImportError(error);
+    if (error?.isSupplementableJsonError) {
+      job.status = "awaiting_json";
+      job.stage = "等待补充 JSON";
+      job.progress = 100;
+      job.message = normalized.message || "JSON 校验失败，请继续补充修正后的 JSON";
+      job.result = null;
+    } else {
+      job.status = "failed";
+      job.stage = "导入失败";
+      job.message = normalized.message || "补充 JSON 处理失败，请重新上传";
+    }
+    await persistImportJob(job);
+    console.error(`Supplemental JSON import failed (${job.uploadId})`, error);
+  } finally {
+    await fs.unlink(supplementalZipPath).catch(() => {});
+    if (job.status !== "awaiting_json") {
+      await cleanupPendingJsonImport(job.uploadId).catch(() => {});
+    }
+    setTimeout(
+      async () => {
+        importJobs.delete(job.uploadId);
+        await deleteImportJobStmt.run(job.uploadId);
+        await cleanupPendingJsonImport(job.uploadId).catch(() => {});
+      },
+      24 * 60 * 60 * 1000,
+    ).unref();
+  }
+}
+
 function nowIso() {
   return new Date().toISOString();
 }
@@ -6910,7 +7172,13 @@ app.patch(
           throw httpError(413, "上传数据超过声明的文件大小");
         }
 
-        await fs.appendFile(session.filePath, chunkBuffer);
+        const previousOffset = session.offset;
+        try {
+          await fs.appendFile(session.filePath, chunkBuffer);
+        } catch (error) {
+          await fs.truncate(session.filePath, previousOffset).catch(() => {});
+          throw error;
+        }
 
         const updatedSession = {
           ...session,
@@ -6919,7 +7187,8 @@ app.patch(
           expiresAt: resumableUploadExpiresAt(),
         };
 
-        if (nextOffset === session.uploadLength) {
+        try {
+          if (nextOffset === session.uploadLength) {
           updatedSession.status = "queued";
           await saveResumableUploadSession(updatedSession);
           const job = {
@@ -6931,6 +7200,10 @@ app.patch(
             protocol: "tus",
             uploadLength: session.uploadLength,
             uploadOffset: nextOffset,
+            metadata: JSON.stringify({
+              filename: session.originalFilename,
+              uploadLength: session.uploadLength,
+            }),
             status: "queued",
             stage: "等待处理",
             progress: 0,
@@ -6939,17 +7212,14 @@ app.patch(
             createdAt: nowIso(),
             expiresAt: importJobExpiry(),
           };
-          await insertImportJobStmt.run({
+            await insertImportJobStmt.run({
             uploadId: job.uploadId,
             originalFilename: job.originalFilename,
             totalChunks: job.totalChunks,
             protocol: job.protocol,
             uploadLength: job.uploadLength,
             uploadOffset: job.uploadOffset,
-            metadata: JSON.stringify({
-              filename: job.originalFilename,
-              uploadLength: job.uploadLength,
-            }),
+            metadata: job.metadata,
             status: job.status,
             stage: job.stage,
             progress: job.progress,
@@ -6961,8 +7231,13 @@ app.patch(
           });
           importJobs.set(uploadId, job);
           setImmediate(async () => void (await runResumableImportJob(job)));
-        } else {
-          await saveResumableUploadSession(updatedSession);
+          } else {
+            await saveResumableUploadSession(updatedSession);
+          }
+        } catch (error) {
+          await fs.truncate(session.filePath, previousOffset).catch(() => {});
+          await saveResumableUploadSession(session).catch(() => {});
+          throw error;
         }
 
         res
@@ -7001,17 +7276,73 @@ app.get("/api/import/uploads/:uploadId/status", async (req, res, next) => {
   }
 });
 
+app.get("/api/import/pending-json", async (_req, res, next) => {
+  try {
+    const rows = await selectPendingImportJobsStmt.all(new Date().toISOString());
+    res.json(rows.map(importJobFromRow).map(importJobDto));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post(
+  "/api/import/uploads/:uploadId/supplement-json",
+  jsonSupplementUpload.single("file"),
+  async (req, res, next) => {
+    try {
+      const uploadId = req.params.uploadId;
+      validateUploadId(uploadId);
+      if (!req.file) {
+        throw httpError(400, "请选择包含 manifest.json 或 tasks.json 的 ZIP 文件");
+      }
+
+      const job = await withResumableUploadLock(uploadId, async () => {
+        const currentJob =
+          importJobs.get(uploadId) ||
+          importJobFromRow(await selectImportJobStmt.get(uploadId));
+        if (!currentJob) throw httpError(404, "导入任务不存在或已过期");
+        if (currentJob.status !== "awaiting_json") {
+          throw httpError(409, "当前导入任务不在等待补充 JSON 状态");
+        }
+
+        try {
+          await fs.access(currentJob.zipPath);
+        } catch {
+          throw httpError(410, "原始 ZIP 已不存在，请重新上传图包");
+        }
+
+        currentJob.status = "importing";
+        currentJob.stage = "正在使用补充 JSON 重新处理";
+        currentJob.progress = 0;
+        currentJob.message = null;
+        currentJob.result = null;
+        importJobs.set(uploadId, currentJob);
+        await persistImportJob(currentJob);
+        return currentJob;
+      });
+      setImmediate(async () => {
+        await runSupplementalJsonImportJob(job, req.file.path);
+      });
+      res.status(202).json(importJobDto(job));
+    } catch (error) {
+      if (req.file?.path) await fs.unlink(req.file.path).catch(() => {});
+      next(error);
+    }
+  },
+);
+
 app.delete("/api/import/uploads/:uploadId", async (req, res, next) => {
   try {
     requireTusResumableHeader(req);
     const uploadId = req.params.uploadId;
     const job =
       importJobs.get(uploadId) || importJobFromRow(await selectImportJobStmt.get(uploadId));
-    if (job && !["failed", "completed"].includes(job.status)) {
+    if (job && !["failed", "completed", "awaiting_json"].includes(job.status)) {
       throw httpError(409, "导入任务已开始，无法取消");
     }
 
     await cleanupResumableUploadSession(uploadId);
+    await cleanupPendingJsonImport(uploadId);
     await deleteImportJobStmt.run(uploadId);
     importJobs.delete(uploadId);
     res.status(204).end();
@@ -7071,6 +7402,10 @@ app.post("/api/import/chunks/:uploadId/complete", async (req, res, next) => {
       zipPath: path.join(zipUploadDir, `${uploadId}.zip`),
       originalFilename,
       totalChunks,
+      protocol: "chunked",
+      uploadLength: null,
+      uploadOffset: 0,
+      metadata: null,
       status: "queued",
       stage: "等待处理",
       progress: 0,
@@ -7123,6 +7458,7 @@ app.delete("/api/import/chunks/:uploadId", async (req, res, next) => {
       recursive: true,
       force: true,
     });
+    await cleanupPendingJsonImport(req.params.uploadId);
     await deleteImportJobStmt.run(req.params.uploadId);
     res.status(204).end();
   } catch (error) {
@@ -7229,12 +7565,22 @@ await deleteExpiredImportJobsStmt.run(startupNow);
 await sweepResumableUploadSessions();
 await db.prepare(
   `UPDATE import_jobs
-   SET status = 'failed',
-       stage = '导入失败',
-       message = '服务端在导入过程中重启，请重新上传',
+   SET status = CASE
+         WHEN metadata LIKE '%"pendingJson":true%' THEN 'awaiting_json'
+         ELSE 'failed'
+       END,
+       stage = CASE
+         WHEN metadata LIKE '%"pendingJson":true%' THEN '等待补充 JSON'
+         ELSE '导入失败'
+       END,
+       message = CASE
+         WHEN metadata LIKE '%"pendingJson":true%' THEN COALESCE(message, 'JSON 处理被服务端重启中断，请继续补充 JSON')
+         ELSE '服务端在导入过程中重启，请重新上传'
+       END,
        updatedAt = @updatedAt
    WHERE status IN ('queued', 'merging', 'importing')`,
 ).run({ updatedAt: startupNow });
+await sweepPendingJsonImports();
 
 export { generateSubjectTasks, importZipArchive };
 export default app;

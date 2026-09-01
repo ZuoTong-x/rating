@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onMounted, reactive, ref } from 'vue';
-import { NButton, NProgress, NTag, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
+import { NButton, NInput, NProgress, NTag, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { authApi } from '../services/auth';
 import { imageApi, type TaskAllocationImportResult } from '../services/images';
@@ -158,7 +158,7 @@ function projectPaginationPrefix({ itemCount }: { itemCount?: number }) {
 function openCreateProject() {
   editingProject.value = null;
   projectForm.name = '';
-  projectForm.packageIds = packageOptions.value[0]?.value ? [packageOptions.value[0].value] : [];
+  projectForm.packageIds = [];
   projectModalVisible.value = true;
 }
 
@@ -423,6 +423,8 @@ async function openTaskProject(project: ProjectItem) {
   await loadTaskScorers();
 }
 
+const TASK_GENERATION_POLL_INTERVAL = 10_000;
+
 function wait(milliseconds: number) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds));
 }
@@ -437,7 +439,7 @@ async function waitForTaskGeneration(projectId: string, jobId: string, taskId: s
     });
     if (job.status === 'completed') return job.result;
     if (job.status === 'failed') throw new Error(job.message || '任务生成失败');
-    await wait(800);
+    await wait(TASK_GENERATION_POLL_INTERVAL);
   }
 }
 
@@ -517,12 +519,33 @@ async function startTask() {
 }
 
 function removeProject(project: ProjectItem) {
+  let confirmation = '';
+  const positiveButtonProps = reactive({
+    type: 'error' as const,
+    disabled: true
+  });
+  const updateConfirmation = (value: string) => {
+    confirmation = value;
+    positiveButtonProps.disabled = value !== '立即删除';
+  };
+
   dialog.warning({
     title: '删除项目',
-    content: `确认删除“${project.name}”？项目会被删除，图包和图片会保留；待分配及已分配但未标注的任务会被清理，已完成标注记录保留。`,
-    positiveText: '删除',
+    content: () => h('div', [
+      h('p', { style: { margin: '0 0 12px' } },
+        `删除“${project.name}”后，项目及未完成任务会被清理，图包和图片会保留，已完成标注记录保留。请输入“立即删除”继续。`),
+      h(NInput, {
+        placeholder: '请输入立即删除',
+        clearable: true,
+        autofocus: true,
+        onUpdateValue: updateConfirmation
+      })
+    ]),
+    positiveText: '确认删除',
     negativeText: '取消',
+    positiveButtonProps,
     onPositiveClick: async () => {
+      if (confirmation !== '立即删除') return false;
       try {
         const result = await imageApi.deleteProject(project._id);
         message.success(`项目已删除，清理了 ${result.deletedTaskCount} 个未完成任务`);
@@ -547,6 +570,12 @@ function renderStatus(row: ProjectItem) {
   return h(NTag, { size: 'small', type: taskStatusType(row.taskStatus) }, {
     default: () => taskStatusLabel(row.taskStatus)
   });
+}
+
+function taskActionLabel(row: ProjectItem) {
+  const available = row.availableTaskCount ?? row.taskTemplateCount;
+  if (available) return row.taskStatus === 'scoring' ? '继续下发' : '开始任务';
+  return row.taskTemplateCount > 0 ? '任务已全部下发' : '缺少任务文件';
 }
 
 const columns: DataTableColumns<ProjectItem> = [
@@ -576,7 +605,7 @@ const columns: DataTableColumns<ProjectItem> = [
     title: '功能', key: 'actions', fixed: 'right', width: 220,
     render: row => h('div', { class: 'table-actions' }, [
       ['task_pending', 'scoring'].includes(row.taskStatus)
-        ? h(NButton, { size: 'small', type: 'primary', secondary: true, loading: taskGenerating.value.has(row._id), disabled: !(row.availableTaskCount ?? row.taskTemplateCount), onClick: () => openTaskProject(row) }, { default: () => (row.availableTaskCount ?? row.taskTemplateCount) ? (row.taskStatus === 'scoring' ? '继续下发' : '开始任务') : '缺少任务文件' })
+        ? h(NButton, { size: 'small', type: 'primary', secondary: true, loading: taskGenerating.value.has(row._id), disabled: !(row.availableTaskCount ?? row.taskTemplateCount), onClick: () => openTaskProject(row) }, { default: () => taskActionLabel(row) })
         : null,
       h(NButton, { size: 'small', tertiary: true, onClick: () => openEditProject(row) }, { default: () => '编辑' }),
       h(NButton, { size: 'small', tertiary: true, type: 'error', disabled: taskGenerating.value.has(row._id), onClick: () => removeProject(row) }, { default: () => '删除' })

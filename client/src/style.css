@@ -188,7 +188,7 @@ body {
   z-index: 30;
   display: flex;
   flex-direction: column;
-  align-items: flex-end;
+  align-items: flex-start;
   gap: 12px;
   pointer-events: none;
 }
@@ -198,31 +198,40 @@ body {
 }
 
 .task-stack-trigger {
-  min-width: 52px;
-  max-width: 220px;
-  height: 46px;
-  padding: 0 14px !important;
+  width: 50px;
+  min-width: 50px;
+  height: 50px;
+  padding: 0 !important;
+  border: 1px solid rgba(148, 163, 184, 0.45) !important;
+  border-radius: 50% !important;
+  color: #334155 !important;
+  background: #fff !important;
   box-shadow: 0 14px 34px var(--shadow-color);
+  cursor: grab;
+  touch-action: none;
+}
+
+.task-stack-trigger:hover {
+  color: #0f172a !important;
+  background: #f8fafc !important;
+}
+
+.task-stack-float.is-dragging .task-stack-trigger {
+  cursor: grabbing;
+  box-shadow: 0 18px 38px var(--shadow-color);
 }
 
 .task-stack-trigger .n-button__content {
   display: inline-flex;
-  min-width: 0;
   align-items: center;
-  gap: 8px;
+  justify-content: center;
+  color: inherit;
 }
 
 .task-stack-trigger svg {
   width: 18px;
   height: 18px;
   flex: none;
-}
-
-.task-stack-trigger span {
-  max-width: 150px;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
 }
 
 .task-stack-panel {
