@@ -45,6 +45,7 @@ const zipUploadDir = path.join(uploadDir, "_zips");
 const chunkUploadDir = path.join(uploadDir, "_chunks");
 const resumableUploadDir = path.join(uploadDir, "_resumable");
 const pendingJsonImportDir = path.join(uploadDir, "_pending-json");
+const adminExportDir = path.join(uploadDir, "_exports");
 const feedbackUploadDir = path.join(uploadDir, "feedback");
 const imageExts = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 const feedbackImageExts = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -64,6 +65,7 @@ await fs.mkdir(zipUploadDir, { recursive: true });
 await fs.mkdir(chunkUploadDir, { recursive: true });
 await fs.mkdir(resumableUploadDir, { recursive: true });
 await fs.mkdir(pendingJsonImportDir, { recursive: true });
+await fs.mkdir(adminExportDir, { recursive: true });
 await fs.mkdir(feedbackUploadDir, { recursive: true });
 
 const corsOrigin = process.env.CORS_ORIGIN?.trim();
@@ -193,6 +195,8 @@ const taskAllocationUpload = multer({
 });
 
 const importJobs = new Map();
+const adminExportJobs = new Map();
+const adminExportQueue = [];
 const taskGenerationJobs = new Map();
 const activeTaskGenerationBySubject = new Map();
 const sessionSeenWriteAt = new Map();
@@ -203,6 +207,12 @@ const sessionSeenWriteIntervalMs = 5 * 60 * 1000;
 // PostgreSQL connections for long stretches.
 const TASK_WRITE_BATCH_SIZE = 100;
 const TASK_ASSIGN_BATCH_SIZE = 100;
+const ADMIN_EXPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000;
+const ADMIN_EXPORT_CONCURRENCY = Math.max(
+  1,
+  Number.parseInt(process.env.ADMIN_EXPORT_CONCURRENCY || "1", 10) || 1,
+);
+let activeAdminExportCount = 0;
 const sessionDurationMs = 7 * 24 * 60 * 60 * 1000;
 
 function taskGenerationJobDto(job) {
@@ -217,6 +227,213 @@ function taskGenerationJobDto(job) {
   };
   if (job.result) payload.result = job.result;
   return payload;
+}
+
+function adminExportJobDto(job) {
+  const payload = {
+    jobId: job.jobId,
+    type: job.type,
+    status: job.status,
+    stage: job.stage,
+    progress: job.progress,
+    message: job.message || null,
+    filename: job.filename,
+    contentType: job.contentType,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    expiresAt: job.expiresAt,
+  };
+  if (job.status === "completed") {
+    payload.downloadUrl = `/api/admin/exports/${job.jobId}/download`;
+  }
+  if (job.result) payload.result = job.result;
+  return payload;
+}
+
+function updateAdminExportJob(job, patch) {
+  Object.assign(job, patch, { updatedAt: nowIso() });
+}
+
+function validateAdminExportJobId(jobId) {
+  if (!/^[a-z0-9-]{8,128}$/i.test(jobId)) {
+    throw httpError(400, "导出任务标识不正确");
+  }
+}
+
+function adminExportTimestamp() {
+  return new Date().toISOString().replace(/[:.]/g, "-");
+}
+
+function sanitizeExportFilenamePart(value, fallback) {
+  const text = String(value || "")
+    .trim()
+    .replace(/[<>:"/\\|?*\x00-\x1F]/g, "_")
+    .replace(/\s+/g, "_")
+    .replace(/^\.+$/, "")
+    .slice(0, 96);
+  return text || fallback;
+}
+
+function attachmentDisposition(filename) {
+  const ascii = filename.replace(/[^\x20-\x7E]/g, "_").replace(/["\\]/g, "_");
+  return `attachment; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(filename)}`;
+}
+
+function normalizeAdminExportDate(value, label) {
+  const text = String(value ?? "").trim();
+  if (!text) return null;
+  const date = new Date(text);
+  if (Number.isNaN(date.getTime())) throw httpError(400, `${label}不正确`);
+  return date.toISOString();
+}
+
+function normalizeAdminExportBoolean(value) {
+  if (typeof value === "boolean") return value;
+  const text = String(value ?? "").trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
+}
+
+function adminExportJobConfig(type) {
+  if (type === "project-completed-tasks") {
+    return {
+      fallbackName: "项目",
+      title: "完成任务明细",
+      extension: ".json",
+      contentType: "application/json; charset=utf-8",
+      stage: "等待导出项目任务明细",
+    };
+  }
+  if (type === "scorer-completed-tasks") {
+    return {
+      fallbackName: "打分人",
+      title: "完成任务明细",
+      extension: ".json",
+      contentType: "application/json; charset=utf-8",
+      stage: "等待导出打分人任务明细",
+    };
+  }
+  if (type === "team-task-summary") {
+    return {
+      fallbackName: "团队",
+      title: "任务汇总",
+      extension: ".json",
+      contentType: "application/json; charset=utf-8",
+      stage: "等待导出团队汇总",
+    };
+  }
+  if (type === "project-task-report") {
+    return {
+      fallbackName: "项目",
+      title: "打分详情",
+      extension: ".xlsx",
+      contentType: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      stage: "等待生成 Excel",
+    };
+  }
+  throw httpError(400, "导出类型不正确");
+}
+
+async function adminExportEntityNames(type, query = {}) {
+  if (type === "project-completed-tasks") {
+    const ids = parseQueryList(query.projectIds ?? query.projectId);
+    const projects = await Promise.all(ids.map((id) => getProjectOrThrow(id)));
+    return projects.map((project) => project.name);
+  }
+  if (type === "project-task-report") {
+    const project = await getProjectOrThrow(query.projectId);
+    return [project.name];
+  }
+  if (type === "scorer-completed-tasks") {
+    const values = parseQueryList(query.scorerIds ?? query.scorerId ?? query.scorer);
+    const users = await Promise.all(values.map(async (value) => {
+      const user = (await selectUserByIdStmt.get(value)) || (await selectScorerByUsernameStmt.get(value));
+      if (!user || user.role !== "scorer") throw httpError(400, "打分人不存在");
+      return user;
+    }));
+    return users.map((user) => user.username);
+  }
+  if (type === "team-task-summary") {
+    const ids = await normalizeTeamIds(parseQueryList(query.teamIds ?? query.teamId));
+    const teams = await Promise.all(ids.map(async (id) => {
+      const team = await selectTeamByIdStmt.get(id);
+      if (!team) throw httpError(400, "团队不存在");
+      return team;
+    }));
+    return teams.map((team) => team.name);
+  }
+  return [];
+}
+
+async function adminExportFilename(config) {
+  const names = await adminExportEntityNames(config.type, config.query);
+  const entityName = names.length === 1
+    ? names[0]
+    : `${config.fallbackName}-${names.length || 0}个`;
+  return `${sanitizeExportFilenamePart(entityName, config.fallbackName)}-${config.title}-${adminExportTimestamp()}${config.extension}`;
+}
+
+function normalizeAdminExportRequest(body = {}) {
+  const type = String(body.type || "").trim();
+  const config = adminExportJobConfig(type);
+  const completedFrom = normalizeAdminExportDate(body.completedFrom, "开始完成时间");
+  const completedTo = normalizeAdminExportDate(body.completedTo, "结束完成时间");
+  if (completedFrom && completedTo && new Date(completedFrom).getTime() > new Date(completedTo).getTime()) {
+    throw httpError(400, "完成时间范围不正确");
+  }
+  if (
+    type === "project-completed-tasks" &&
+    !parseQueryList(body.projectIds ?? body.projectId).length
+  ) {
+    throw httpError(400, "请选择需要导出的项目");
+  }
+  if (
+    type === "scorer-completed-tasks" &&
+    !parseQueryList(body.scorerIds ?? body.scorerId ?? body.scorer).length
+  ) {
+    throw httpError(400, "请选择需要导出的打分人");
+  }
+  if (
+    type === "team-task-summary" &&
+    !parseQueryList(body.teamIds ?? body.teamId).length
+  ) {
+    throw httpError(400, "请选择需要导出的团队");
+  }
+  if (type === "project-task-report" && !String(body.projectId || "").trim()) {
+    throw httpError(400, "缺少项目 ID");
+  }
+  return {
+    type,
+    query: {
+      projectId: body.projectId,
+      projectIds: body.projectIds,
+      scorer: body.scorer,
+      scorerId: body.scorerId,
+      scorerIds: body.scorerIds,
+      teamId: body.teamId,
+      teamIds: body.teamIds,
+      completedFrom,
+      completedTo,
+      excludeInactiveScorers: normalizeAdminExportBoolean(body.excludeInactiveScorers),
+    },
+    ...config,
+  };
+}
+
+function runNextAdminExportJob() {
+  if (activeAdminExportCount >= ADMIN_EXPORT_CONCURRENCY) return;
+  const job = adminExportQueue.shift();
+  if (!job) return;
+  activeAdminExportCount += 1;
+  setImmediate(async () => {
+    await runAdminExportJob(job);
+    activeAdminExportCount -= 1;
+    runNextAdminExportJob();
+  });
+}
+
+function scheduleAdminExportJob(job) {
+  adminExportQueue.push(job);
+  runNextAdminExportJob();
 }
 
 function yieldToEventLoop() {
@@ -4540,6 +4757,9 @@ const {
   exportCompletedTasks,
   exportScorerTaskSummary,
   exportTeamTaskSummary,
+  writeProjectCompletedTasksExport,
+  writeScorerCompletedTasksExport,
+  writeTeamTaskSummaryExport,
 } = adminDashboardService;
 
 const adminScoringService = createAdminScoringService({
@@ -4923,7 +5143,8 @@ async function getSubjectTaskReportSummary(subjectId) {
   return report;
 }
 
-async function exportSubjectTaskReport(subjectId, res) {
+async function buildSubjectTaskReportWorkbook(subjectId, onProgress) {
+  onProgress?.({ stage: "正在统计项目任务", progress: 15 });
   const report = await getSubjectTaskReportSummary(subjectId);
   const subject = report.subject;
   const imageStats = {
@@ -4938,6 +5159,7 @@ async function exportSubjectTaskReport(subjectId, res) {
   const workbook = new ExcelJS.Workbook();
   workbook.creator = "评分平台";
   workbook.created = new Date();
+  onProgress?.({ stage: "正在生成 Excel 工作表", progress: 55 });
 
   addReportSheet(
     workbook,
@@ -5038,9 +5260,18 @@ async function exportSubjectTaskReport(subjectId, res) {
     [18, 14, 14, 18, 16, 14, 14, 52, 22],
   ).getColumn(7).numFmt = "0.00%";
 
-  const filename = `task-report-${new Date()
+  return { workbook, report };
+}
+
+function taskReportExportFilename() {
+  return `task-report-${new Date()
     .toISOString()
     .replace(/[:.]/g, "-")}.xlsx`;
+}
+
+async function exportSubjectTaskReport(subjectId, res) {
+  const { workbook } = await buildSubjectTaskReportWorkbook(subjectId);
+  const filename = taskReportExportFilename();
   const file = Buffer.from(await workbook.xlsx.writeBuffer());
   res.setHeader(
     "Content-Type",
@@ -5048,6 +5279,115 @@ async function exportSubjectTaskReport(subjectId, res) {
   );
   res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
   res.send(file);
+}
+
+async function writeSubjectTaskReportFile(subjectId, filePath, onProgress) {
+  const { workbook, report } = await buildSubjectTaskReportWorkbook(subjectId, onProgress);
+  onProgress?.({ stage: "正在写入 Excel 文件", progress: 80 });
+  await workbook.xlsx.writeFile(filePath);
+  onProgress?.({ stage: "Excel 文件已写入", progress: 95 });
+  return {
+    projectId: report.subject._id,
+    projectName: report.subject.name,
+    totalTasks: report.totalTasks,
+    completedTasks: report.completedTasks,
+    scorerCount: report.scorerCount,
+  };
+}
+
+function updateAdminExportProgress(job, progress) {
+  if (!progress) return;
+  updateAdminExportJob(job, {
+    stage: progress.stage || job.stage,
+    progress: Math.max(0, Math.min(99, Number(progress.progress) || job.progress)),
+  });
+}
+
+async function runJsonAdminExport(job, writer) {
+  const stream = createWriteStream(job.filePath, { encoding: "utf8" });
+  try {
+    return await writer(stream, job.query, (progress) => {
+      updateAdminExportProgress(job, progress);
+    });
+  } catch (error) {
+    stream.destroy();
+    throw error;
+  }
+}
+
+async function runAdminExportJob(job) {
+  updateAdminExportJob(job, {
+    status: "running",
+    stage: "正在准备导出",
+    progress: 3,
+    message: null,
+  });
+  try {
+    await fs.mkdir(adminExportDir, { recursive: true });
+    if (job.type === "project-completed-tasks") {
+      job.result = await runJsonAdminExport(job, writeProjectCompletedTasksExport);
+    } else if (job.type === "scorer-completed-tasks") {
+      job.result = await runJsonAdminExport(job, writeScorerCompletedTasksExport);
+    } else if (job.type === "team-task-summary") {
+      job.result = await runJsonAdminExport(job, writeTeamTaskSummaryExport);
+    } else if (job.type === "project-task-report") {
+      const projectId = String(job.query.projectId || "").trim();
+      if (!projectId) throw httpError(400, "缺少项目 ID");
+      job.result = await writeSubjectTaskReportFile(
+        projectId,
+        job.filePath,
+        (progress) => updateAdminExportProgress(job, progress),
+      );
+    } else {
+      throw httpError(400, "导出类型不正确");
+    }
+    updateAdminExportJob(job, {
+      status: "completed",
+      stage: "导出文件已生成",
+      progress: 100,
+    });
+  } catch (error) {
+    await fs.rm(job.filePath, { force: true }).catch(() => {});
+    updateAdminExportJob(job, {
+      status: "failed",
+      stage: "导出失败",
+      progress: 100,
+      message: error?.message || "导出失败，请重试",
+    });
+    console.error(`Admin export failed (${job.jobId})`, error);
+  } finally {
+    setTimeout(async () => {
+      adminExportJobs.delete(job.jobId);
+      await fs.rm(job.filePath, { force: true }).catch(() => {});
+    }, ADMIN_EXPORT_JOB_TTL_MS).unref();
+  }
+}
+
+async function startAdminExportJob(body = {}) {
+  const config = normalizeAdminExportRequest(body);
+  const filename = await adminExportFilename(config);
+  const jobId = crypto.randomUUID();
+  const now = nowIso();
+  const job = {
+    jobId,
+    type: config.type,
+    query: config.query,
+    filename,
+    contentType: config.contentType,
+    extension: config.extension,
+    filePath: path.join(adminExportDir, `${jobId}${config.extension}`),
+    status: "queued",
+    stage: config.stage,
+    progress: 0,
+    message: null,
+    result: null,
+    createdAt: now,
+    updatedAt: now,
+    expiresAt: new Date(Date.now() + ADMIN_EXPORT_JOB_TTL_MS).toISOString(),
+  };
+  adminExportJobs.set(jobId, job);
+  scheduleAdminExportJob(job);
+  return job;
 }
 
 async function scorerTaskScope(query = {}) {
@@ -6415,6 +6755,41 @@ app.use("/api/users", requireAdmin);
 app.use("/api/import", requireAdmin);
 app.use("/api/scorer", requireScorer);
 app.use("/api/tasks/assigned", requireScorer);
+
+app.post("/api/admin/exports", async (req, res, next) => {
+  try {
+    const job = await startAdminExportJob(req.body);
+    res.status(202).json(adminExportJobDto(job));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/exports/:jobId", async (req, res, next) => {
+  try {
+    validateAdminExportJobId(req.params.jobId);
+    const job = adminExportJobs.get(req.params.jobId);
+    if (!job) throw httpError(404, "导出任务不存在或已过期");
+    res.json(adminExportJobDto(job));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/exports/:jobId/download", async (req, res, next) => {
+  try {
+    validateAdminExportJobId(req.params.jobId);
+    const job = adminExportJobs.get(req.params.jobId);
+    if (!job) throw httpError(404, "导出任务不存在或已过期");
+    if (job.status !== "completed") throw httpError(409, "导出文件尚未生成完成");
+    await fs.access(job.filePath);
+    res.setHeader("Content-Type", job.contentType);
+    res.setHeader("Content-Disposition", attachmentDisposition(job.filename));
+    createReadStream(job.filePath).on("error", next).pipe(res);
+  } catch (error) {
+    next(error);
+  }
+});
 
 app.get("/api/admin/dashboard", async (req, res, next) => {
   try {

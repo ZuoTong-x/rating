@@ -12,6 +12,22 @@ async function writeResponseChunk(res, chunk) {
   if (!res.write(chunk)) await once(res, "drain");
 }
 
+async function endResponseStream(stream, chunk = "") {
+  await new Promise((resolve, reject) => {
+    const onError = (error) => {
+      stream.off?.("finish", onFinish);
+      reject(error);
+    };
+    const onFinish = () => {
+      stream.off?.("error", onError);
+      resolve();
+    };
+    stream.once?.("error", onError);
+    stream.once?.("finish", onFinish);
+    stream.end(chunk);
+  });
+}
+
 function parseQueryList(value) {
   if (Array.isArray(value)) {
     return value.flatMap((item) => parseQueryList(item));
@@ -21,6 +37,13 @@ function parseQueryList(value) {
     .split(",")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function parseBooleanFlag(value) {
+  if (Array.isArray(value)) return value.some((item) => parseBooleanFlag(item));
+  if (typeof value === "boolean") return value;
+  const text = String(value ?? "").trim().toLowerCase();
+  return text === "1" || text === "true" || text === "yes" || text === "on";
 }
 
 export function createAdminDashboardService({
@@ -149,7 +172,30 @@ export function createAdminDashboardService({
     return row?.id || null;
   }
 
-  function completedTaskExportFilter({ projectIds = [], scorerNames = [] } = {}, alias = "rating_tasks") {
+  function parseOptionalExportDate(value, label) {
+    if (Array.isArray(value)) return parseOptionalExportDate(value[0], label);
+    const text = String(value ?? "").trim();
+    if (!text) return null;
+    const date = new Date(text);
+    if (Number.isNaN(date.getTime())) throw httpError(400, `${label}不正确`);
+    return date.toISOString();
+  }
+
+  function parseCompletedTaskDateRange(query = {}) {
+    const completedFrom = parseOptionalExportDate(query.completedFrom, "开始完成时间");
+    const completedTo = parseOptionalExportDate(query.completedTo, "结束完成时间");
+    if (completedFrom && completedTo && new Date(completedFrom).getTime() > new Date(completedTo).getTime()) {
+      throw httpError(400, "完成时间范围不正确");
+    }
+    return { completedFrom, completedTo };
+  }
+
+  function completedTaskExportFilter({
+    projectIds = [],
+    scorerNames = [],
+    completedFrom = null,
+    completedTo = null,
+  } = {}, alias = "rating_tasks") {
     const clauses = [];
     const params = [];
     if (projectIds.length) {
@@ -159,6 +205,14 @@ export function createAdminDashboardService({
     if (scorerNames.length) {
       clauses.push(`${alias}.scorer IN (${placeholders(scorerNames.length)})`);
       params.push(...scorerNames);
+    }
+    if (completedFrom) {
+      clauses.push(`${alias}.completedAt >= ?::timestamptz`);
+      params.push(completedFrom);
+    }
+    if (completedTo) {
+      clauses.push(`${alias}.completedAt <= ?::timestamptz`);
+      params.push(completedTo);
     }
     return {
       clause: clauses.length ? `AND ${clauses.join(" AND ")}` : "",
@@ -181,7 +235,7 @@ export function createAdminDashboardService({
     );
   }
 
-  async function listCompletedTaskRows(filters = {}, limit = 200, offset = 0) {
+  async function listCompletedTaskRowsAfter(filters = {}, limit = 1000, lastId = null) {
     const filter = completedTaskExportFilter(filters, "rating_tasks");
     return await db
       .prepare(
@@ -197,10 +251,11 @@ export function createAdminDashboardService({
          WHERE rating_tasks.taskVersion = ?
            AND rating_tasks.status = 'completed'
            ${filter.clause}
-         ORDER BY rating_tasks.completedAt DESC NULLS LAST, rating_tasks.id ASC
-         LIMIT ? OFFSET ?`,
+           AND (?::text IS NULL OR rating_tasks.id > ?)
+         ORDER BY rating_tasks.id ASC
+         LIMIT ?`,
       )
-      .all(taskVersion, ...filter.params, limit, offset);
+      .all(taskVersion, ...filter.params, lastId, lastId, limit);
   }
 
   async function listCompletedExportProjects(filters = {}) {
@@ -775,7 +830,20 @@ export function createAdminDashboardService({
     };
   }
 
-  async function listTeamTaskSummaryRows(teamIds) {
+  async function listTeamTaskSummaryRows(teamIds, options = {}) {
+    const excludeInactiveScorers = Boolean(options.excludeInactiveScorers);
+    const activeSince = options.activeSince || null;
+    const activeClause = excludeInactiveScorers
+      ? `AND EXISTS (
+           SELECT 1
+           FROM rating_tasks recent_tasks
+           WHERE recent_tasks.scorer = users.username
+             AND recent_tasks.taskVersion = ?
+             AND recent_tasks.status = 'completed'
+             AND recent_tasks.completedAt >= ?::timestamptz
+         )`
+      : "";
+    const activeParams = excludeInactiveScorers ? [taskVersion, activeSince] : [];
     return (await db
       .prepare(
         `SELECT teams.id AS teamId,
@@ -783,7 +851,8 @@ export function createAdminDashboardService({
                 users.username AS scorer,
                 COUNT(rating_tasks.id) AS totalTaskCount,
                 SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS uncompletedTaskCount
+                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS uncompletedTaskCount,
+                MAX(CASE WHEN rating_tasks.status = 'completed' THEN rating_tasks.completedAt ELSE NULL END) AS lastCompletedAt
          FROM teams
          JOIN user_teams ON user_teams.teamId = teams.id
          JOIN users ON users.id = user_teams.userId
@@ -796,10 +865,11 @@ export function createAdminDashboardService({
             WHERE deletionRequestedAt IS NULL
           )
          WHERE teams.id IN (${placeholders(teamIds.length)})
+           ${activeClause}
          GROUP BY teams.id, teams.name, users.id, users.username
          ORDER BY LOWER(teams.name) ASC, teams.name ASC, LOWER(users.username) ASC, users.username ASC`,
       )
-      .all(taskVersion, ...teamIds))
+      .all(taskVersion, ...teamIds, ...activeParams))
       .map((row) => {
         const totalTaskCount = Number(row.totalTaskCount || 0);
         const completedTaskCount = Number(row.completedTaskCount || 0);
@@ -812,6 +882,7 @@ export function createAdminDashboardService({
           completedTaskCount,
           uncompletedTaskCount,
           completionRate: reportCompletionRate(completedTaskCount, totalTaskCount),
+          lastCompletedAt: row.lastCompletedAt ?? null,
         };
       });
   }
@@ -826,6 +897,7 @@ export function createAdminDashboardService({
         completedTaskCount: row.completedTaskCount,
         uncompletedTaskCount: row.uncompletedTaskCount,
         completionRate: row.completionRate,
+        lastCompletedAt: row.lastCompletedAt ?? null,
       });
       rowsByTeamId.set(row.teamId, items);
     });
@@ -844,11 +916,78 @@ export function createAdminDashboardService({
       }));
   }
 
-  async function exportCompletedTasks(req, res) {
-    const projectIds = await parseDashboardProjectIds(req.query);
-    const filters = { projectIds };
+  function exportProgress(onProgress, stage, progress) {
+    onProgress?.({
+      stage,
+      progress: Math.max(0, Math.min(99, Math.round(progress))),
+    });
+  }
+
+  async function writeCompletedTasksExport(stream, {
+    filters,
+    header,
+    includeScorers = false,
+  }, onProgress) {
+    exportProgress(onProgress, "正在统计完成任务", 5);
     const taskCount = await countCompletedTasks(filters);
+    exportProgress(onProgress, "正在准备导出摘要", 8);
     const projects = await listCompletedExportProjects(filters);
+    const scorers = includeScorers ? await listCompletedExportScorers(filters) : null;
+    const payload = {
+      exportedAt: nowIso(),
+      ...header,
+      projectCount: projects.length,
+      taskCount,
+      ...(scorers ? { scorerCount: scorers.length, scorers } : {}),
+      projects,
+    };
+    await writeResponseChunk(
+      stream,
+      `${JSON.stringify(payload).slice(0, -1)},"tasks":[`,
+    );
+
+    const batchSize = 1000;
+    let written = 0;
+    let lastId = null;
+    while (true) {
+      const rows = await listCompletedTaskRowsAfter(filters, batchSize, lastId);
+      if (!rows.length) break;
+      lastId = rows[rows.length - 1].id;
+      const tasks = await hydrateTaskRows(rows);
+      for (const task of tasks) {
+        await writeResponseChunk(
+          stream,
+          `${written ? "," : ""}${JSON.stringify(task)}`,
+        );
+        written += 1;
+      }
+      exportProgress(
+        onProgress,
+        `已写入 ${written}/${taskCount} 个任务`,
+        taskCount ? 10 + (written / taskCount) * 85 : 95,
+      );
+    }
+    await endResponseStream(stream, "]}");
+    return {
+      taskCount,
+      projectCount: projects.length,
+      scorerCount: scorers?.length ?? null,
+    };
+  }
+
+  async function writeProjectCompletedTasksExport(stream, query = {}, onProgress) {
+    const projectIds = await parseDashboardProjectIds(query);
+    const filters = { projectIds };
+    return await writeCompletedTasksExport(stream, {
+      filters,
+      header: {
+        projectIds,
+        filters: { projectIds },
+      },
+    }, onProgress);
+  }
+
+  async function exportCompletedTasks(req, res) {
     const jsonFilename = `completed-tasks-${new Date()
       .toISOString()
       .replace(/[:.]/g, "-")}.json`;
@@ -857,36 +996,31 @@ export function createAdminDashboardService({
       "Content-Disposition",
       `attachment; filename="${jsonFilename}"`,
     );
-    res.flushHeaders();
-    await writeResponseChunk(
-      res,
-      `{"exportedAt":${JSON.stringify(nowIso())},"projectIds":${JSON.stringify(projectIds)},"filters":{"projectIds":${JSON.stringify(projectIds)}},"projectCount":${projects.length},"taskCount":${taskCount},"projects":${JSON.stringify(projects)},"tasks":[`,
-    );
+    await writeProjectCompletedTasksExport(res, req.query);
+  }
 
-    const batchSize = 200;
-    let written = 0;
-    for (let offset = 0; offset < taskCount; offset += batchSize) {
-      const rows = await listCompletedTaskRows(filters, batchSize, offset);
-      const tasks = await hydrateTaskRows(rows);
-      for (const task of tasks) {
-        await writeResponseChunk(
-          res,
-          `${written ? "," : ""}${JSON.stringify(task)}`,
-        );
-        written += 1;
-      }
-    }
-    res.end("]}");
+  async function writeScorerCompletedTasksExport(stream, query = {}, onProgress) {
+    const scorerIds = await parseDashboardScorerIds(query);
+    const scorerUsers = await listDashboardScorerExportUsers(scorerIds);
+    const scorerNames = scorerUsers.map((user) => user.username);
+    const completedRange = parseCompletedTaskDateRange(query);
+    const filters = { scorerNames, ...completedRange };
+    return await writeCompletedTasksExport(stream, {
+      filters,
+      includeScorers: true,
+      header: {
+        scorerIds,
+        filters: {
+          scorerIds,
+          scorers: scorerNames,
+          completedFrom: completedRange.completedFrom,
+          completedTo: completedRange.completedTo,
+        },
+      },
+    }, onProgress);
   }
 
   async function exportScorerTaskSummary(req, res) {
-    const scorerIds = await parseDashboardScorerIds(req.query);
-    const scorerUsers = await listDashboardScorerExportUsers(scorerIds);
-    const scorerNames = scorerUsers.map((user) => user.username);
-    const filters = { scorerNames };
-    const taskCount = await countCompletedTasks(filters);
-    const projects = await listCompletedExportProjects(filters);
-    const scorers = await listCompletedExportScorers(filters);
     const jsonFilename = `scorer-completed-tasks-${new Date()
       .toISOString()
       .replace(/[:.]/g, "-")}.json`;
@@ -895,33 +1029,47 @@ export function createAdminDashboardService({
       "Content-Disposition",
       `attachment; filename="${jsonFilename}"`,
     );
-    res.flushHeaders();
-    await writeResponseChunk(
-      res,
-      `{"exportedAt":${JSON.stringify(nowIso())},"scorerIds":${JSON.stringify(scorerIds)},"filters":{"scorerIds":${JSON.stringify(scorerIds)},"scorers":${JSON.stringify(scorerNames)}},"scorerCount":${scorers.length},"projectCount":${projects.length},"taskCount":${taskCount},"scorers":${JSON.stringify(scorers)},"projects":${JSON.stringify(projects)},"tasks":[`,
-    );
+    await writeScorerCompletedTasksExport(res, req.query);
+  }
 
-    const batchSize = 200;
-    let written = 0;
-    for (let offset = 0; offset < taskCount; offset += batchSize) {
-      const rows = await listCompletedTaskRows(filters, batchSize, offset);
-      const tasks = await hydrateTaskRows(rows);
-      for (const task of tasks) {
-        await writeResponseChunk(
-          res,
-          `${written ? "," : ""}${JSON.stringify(task)}`,
-        );
-        written += 1;
-      }
-    }
-    res.end("]}");
+  async function writeTeamTaskSummaryExport(stream, query = {}, onProgress) {
+    const teamIds = await parseTeamSummaryExportIds(query);
+    const excludeInactiveScorers = parseBooleanFlag(query.excludeInactiveScorers);
+    const inactiveWindowDays = 7;
+    const activeSince = excludeInactiveScorers
+      ? new Date(Date.now() - inactiveWindowDays * 24 * 60 * 60 * 1000).toISOString()
+      : null;
+    exportProgress(onProgress, "正在统计团队任务", 30);
+    const rows = await listTeamTaskSummaryRows(teamIds, {
+      excludeInactiveScorers,
+      activeSince,
+    });
+    exportProgress(onProgress, "正在整理团队成员", 70);
+    const teams = await listTeamSummaryExportTeams(teamIds, rows);
+    const distinctScorers = new Set(rows.map((row) => row.scorer));
+    await endResponseStream(stream, JSON.stringify({
+      exportedAt: nowIso(),
+      teamIds,
+      filters: {
+        teamIds,
+        excludeInactiveScorers,
+        activeSince,
+        inactiveWindowDays: excludeInactiveScorers ? inactiveWindowDays : null,
+      },
+      teamCount: teams.length,
+      scorerCount: distinctScorers.size,
+      teams,
+      rows,
+    }));
+    exportProgress(onProgress, "团队汇总已写入文件", 95);
+    return {
+      teamCount: teams.length,
+      scorerCount: distinctScorers.size,
+      rowCount: rows.length,
+    };
   }
 
   async function exportTeamTaskSummary(req, res) {
-    const teamIds = await parseTeamSummaryExportIds(req.query);
-    const rows = await listTeamTaskSummaryRows(teamIds);
-    const teams = await listTeamSummaryExportTeams(teamIds, rows);
-    const distinctScorers = new Set(rows.map((row) => row.scorer));
     const jsonFilename = `team-task-summary-${new Date()
       .toISOString()
       .replace(/[:.]/g, "-")}.json`;
@@ -930,14 +1078,7 @@ export function createAdminDashboardService({
       "Content-Disposition",
       `attachment; filename="${jsonFilename}"`,
     );
-    res.json({
-      exportedAt: nowIso(),
-      teamIds,
-      teamCount: teams.length,
-      scorerCount: distinctScorers.size,
-      teams,
-      rows,
-    });
+    await writeTeamTaskSummaryExport(res, req.query);
   }
 
   return {
@@ -950,5 +1091,8 @@ export function createAdminDashboardService({
     exportCompletedTasks,
     exportScorerTaskSummary,
     exportTeamTaskSummary,
+    writeProjectCompletedTasksExport,
+    writeScorerCompletedTasksExport,
+    writeTeamTaskSummaryExport,
   };
 }

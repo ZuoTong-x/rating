@@ -345,12 +345,23 @@ create index if not exists idx_rating_tasks_project_scorer_order
     on rating_tasks(projectid, taskversion, scorer, tasktype, createdat, id);
 create index if not exists idx_rating_tasks_scorer_status on rating_tasks(scorer, status, subjectid);
 create index if not exists idx_rating_tasks_export on rating_tasks(taskversion, status, completedat desc nulls last, id);
+create index if not exists idx_rating_tasks_export_id
+    on rating_tasks(taskversion, status, id);
+create index if not exists idx_rating_tasks_export_project_id
+    on rating_tasks(taskversion, status, projectid, id);
+create index if not exists idx_rating_tasks_export_scorer_id
+    on rating_tasks(taskversion, status, scorer, id);
+create index if not exists idx_rating_tasks_completed_scorer_time
+    on rating_tasks(taskversion, scorer, completedat, id)
+    where status = 'completed';
 create index if not exists idx_rating_tasks_scorer_version_status on rating_tasks(scorer, taskversion, status, subjectid);
 create index if not exists idx_rating_tasks_scorer_version_status_updated
     on rating_tasks(scorer, taskversion, status, updatedat desc, id);
 create index if not exists idx_rating_tasks_version_scorer_status_order
     on rating_tasks(taskversion, scorer, status, tasktype, createdat, id);
 create index if not exists idx_rating_task_items_image on rating_task_items(imageid);
+create index if not exists idx_rating_task_items_task_position
+    on rating_task_items(taskid, position, imageid);
 create index if not exists idx_subject_task_templates_subject_order
     on subject_task_templates(subjectid, round, criterion, sourcetaskid);
 create index if not exists idx_subject_task_template_items_image

@@ -349,7 +349,12 @@ async function downloadTaskReport() {
     progress: 25
   });
   try {
-    await imageApi.exportProjectTaskReport(projectId);
+    await imageApi.exportProjectTaskReport(projectId, {
+      onProgress: job => taskStack.updateTask(taskId, {
+        progress: job.progress,
+        stage: job.stage
+      })
+    });
     taskStack.finishTask(taskId, { stage: 'Excel 已生成', description: '浏览器已开始下载' });
     message.success('打分详情已导出');
   } catch (error) {

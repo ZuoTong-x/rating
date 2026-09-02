@@ -1,4 +1,4 @@
-import type { AdminDashboard, AdminDashboardAverageDuration, AdminDashboardCharts, AdminDashboardProjectSection, AdminDashboardStats, AdminDashboardWorkloadSection, AdminTaskListItem, FeedbackPage, FeedbackStatus, FeedbackType, ImageItem, ImagePage, ImageQuery, ImageScore, ProjectItem, ProjectPage, RankingRelation, RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem, ScoringManagementSummary, ScoringRollbackJob, ScoringRollbackPreview, ScoringTaskRecordPage, SubjectItem, SubjectTaskReport, TaskListPage, TaskSubmissionMode, TaskSubmissionModeFilter } from '../types/image';
+import type { AdminDashboard, AdminDashboardAverageDuration, AdminDashboardCharts, AdminDashboardProjectSection, AdminDashboardStats, AdminDashboardWorkloadSection, AdminExportJob, AdminExportType, AdminTaskListItem, FeedbackPage, FeedbackStatus, FeedbackType, ImageItem, ImagePage, ImageQuery, ImageScore, ProjectItem, ProjectPage, RankingRelation, RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem, ScoringManagementSummary, ScoringRollbackJob, ScoringRollbackPreview, ScoringTaskRecordPage, SubjectItem, SubjectTaskReport, TaskListPage, TaskSubmissionMode, TaskSubmissionModeFilter } from '../types/image';
 import { handleUnauthorized, requestJson, requestJsonWithRetry, requestResponse } from './http';
 
 function downloadFilename(contentDisposition: string | null, fallback: string) {
@@ -11,6 +11,7 @@ const ZIP_CHUNK_RETRY_COUNT = 6;
 const ZIP_CHUNK_RETRY_BASE_DELAY = 1000;
 const UPLOAD_RECOVERY_ATTEMPT_LIMIT = 5;
 const IMPORT_STATUS_POLL_INTERVAL = 10_000;
+const ADMIN_EXPORT_STATUS_POLL_INTERVAL = 10_000;
 const RESUMABLE_UPLOAD_STORAGE_PREFIX = 'resumable-zip-upload:';
 const TUS_VERSION = '1.0.0';
 
@@ -63,6 +64,57 @@ type TaskCompletionPayload = {
 
 function delay(milliseconds: number) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds));
+}
+
+type AdminExportOptions = {
+  onProgress?: (job: AdminExportJob) => void;
+};
+
+type TeamTaskSummaryExportOptions = AdminExportOptions & {
+  excludeInactiveScorers?: boolean;
+};
+
+type ScorerTaskSummaryExportOptions = AdminExportOptions & {
+  completedFrom?: string | null;
+  completedTo?: string | null;
+};
+
+function triggerDownload(url: string, filename: string) {
+  const anchor = document.createElement('a');
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  anchor.remove();
+}
+
+async function waitForAdminExportJob(job: AdminExportJob, onProgress?: (job: AdminExportJob) => void) {
+  let current = job;
+  let nextPollDelay = 1000;
+  while (true) {
+    onProgress?.(current);
+    if (current.status === 'completed') return current;
+    if (current.status === 'failed') throw new Error(current.message || '导出失败，请重试');
+    await delay(nextPollDelay);
+    nextPollDelay = ADMIN_EXPORT_STATUS_POLL_INTERVAL;
+    current = await requestJson<AdminExportJob>(`/api/admin/exports/${encodeURIComponent(current.jobId)}`);
+  }
+}
+
+async function runAdminExport(
+  type: AdminExportType,
+  payload: Record<string, unknown>,
+  options?: AdminExportOptions
+) {
+  const job = await requestJson<AdminExportJob>('/api/admin/exports', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ type, ...payload })
+  });
+  const completed = await waitForAdminExportJob(job, options?.onProgress);
+  if (!completed.downloadUrl) throw new Error('导出文件缺少下载地址');
+  triggerDownload(completed.downloadUrl, completed.filename);
+  return completed;
 }
 
 export function createUploadId() {
@@ -395,56 +447,30 @@ export const imageApi = {
   scoringRollbackStatus(jobId: string) {
     return requestJson<ScoringRollbackJob>(`/api/admin/scoring/rollback/${encodeURIComponent(jobId)}`);
   },
-  async exportCompletedTasks(filters?: string | string[] | { projectIds?: string[] | null } | null) {
-    const params = new URLSearchParams();
+  async exportCompletedTasks(
+    filters?: string | string[] | { projectIds?: string[] | null } | null,
+    options?: AdminExportOptions
+  ) {
+    let projectIds: string[] = [];
     if (Array.isArray(filters) && filters.length) {
-      params.set('projectIds', filters.join(','));
+      projectIds = filters;
     } else if (typeof filters === 'string' && filters) {
-      params.set('projectId', filters);
+      projectIds = [filters];
     } else if (filters && typeof filters === 'object' && !Array.isArray(filters)) {
-      if (filters.projectIds?.length) params.set('projectIds', filters.projectIds.join(','));
+      projectIds = filters.projectIds || [];
     }
-    const response = await requestResponse(`/api/admin/tasks/completed/export${params.toString() ? `?${params}` : ''}`);
-
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = downloadFilename(response.headers.get('content-disposition'), 'completed-tasks.json');
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+    return runAdminExport('project-completed-tasks', { projectIds }, options);
   },
-  async exportTeamTaskSummary(teamIds: string[]) {
-    const params = new URLSearchParams();
-    if (teamIds.length) params.set('teamIds', teamIds.join(','));
-    const response = await requestResponse(`/api/admin/teams/task-summary/export${params.toString() ? `?${params}` : ''}`);
-
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = downloadFilename(response.headers.get('content-disposition'), 'team-task-summary.json');
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+  async exportTeamTaskSummary(teamIds: string[], options?: TeamTaskSummaryExportOptions) {
+    const payload: Record<string, unknown> = { teamIds };
+    if (options?.excludeInactiveScorers) payload.excludeInactiveScorers = true;
+    return runAdminExport('team-task-summary', payload, options);
   },
-  async exportScorerTaskSummary(scorerIds: string[]) {
-    const params = new URLSearchParams();
-    if (scorerIds.length) params.set('scorerIds', scorerIds.join(','));
-    const response = await requestResponse(`/api/admin/scorers/completed/export${params.toString() ? `?${params}` : ''}`);
-
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = downloadFilename(response.headers.get('content-disposition'), 'scorer-completed-tasks.json');
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+  async exportScorerTaskSummary(scorerIds: string[], options?: ScorerTaskSummaryExportOptions) {
+    const payload: Record<string, unknown> = { scorerIds };
+    if (options?.completedFrom) payload.completedFrom = options.completedFrom;
+    if (options?.completedTo) payload.completedTo = options.completedTo;
+    return runAdminExport('scorer-completed-tasks', payload, options);
   },
   taskReport(subjectId: string) {
     return requestJson<SubjectTaskReport>(`/api/subjects/${encodeURIComponent(subjectId)}/tasks/report`);
@@ -465,17 +491,8 @@ export const imageApi = {
     anchor.remove();
     URL.revokeObjectURL(url);
   },
-  async exportProjectTaskReport(projectId: string) {
-    const response = await requestResponse(`/api/projects/${encodeURIComponent(projectId)}/tasks/report/export`);
-    const blob = await response.blob();
-    const url = URL.createObjectURL(blob);
-    const anchor = document.createElement('a');
-    anchor.href = url;
-    anchor.download = downloadFilename(response.headers.get('content-disposition'), 'task-report.xlsx');
-    document.body.appendChild(anchor);
-    anchor.click();
-    anchor.remove();
-    URL.revokeObjectURL(url);
+  async exportProjectTaskReport(projectId: string, options?: AdminExportOptions) {
+    return runAdminExport('project-task-report', { projectId }, options);
   },
   tasks(subjectId: string, query: {
     page?: number;

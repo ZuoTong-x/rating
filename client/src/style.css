@@ -1129,6 +1129,25 @@ body {
   gap: 4px;
 }
 
+.dashboard-export-filter {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.dashboard-export-filter .n-date-picker {
+  width: 100%;
+}
+
+.dashboard-export-option {
+  display: flex;
+  min-width: 0;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
 .dashboard-project-title-row strong {
   color: var(--text-color);
   font-size: 18px;

@@ -39,6 +39,8 @@ const selectedTeamId = ref<string | null>(null);
 const exportProjectIds = ref<string[]>([]);
 const exportTeamIds = ref<string[]>([]);
 const exportScorerIds = ref<string[]>([]);
+const exportTeamExcludeInactiveScorers = ref(false);
+const exportScorerCompletedRange = ref<[number, number] | null>(null);
 const workloadViewMode = ref<'scorer' | 'team'>('scorer');
 const projects = ref<ProjectItem[]>([]);
 const teams = ref<AccountTeam[]>([]);
@@ -454,25 +456,89 @@ function clearExportScorers() {
   exportScorerIds.value = [];
 }
 
+function exportProjectName(projectId: string) {
+  return projects.value.find(project => project._id === projectId)?.name || '项目';
+}
+
+function exportTeamName(teamId: string) {
+  return teams.value.find(team => team.id === teamId)?.name || '团队';
+}
+
+function exportScorerName(scorerId: string) {
+  return dashboard.value.workloadSummary.scorers.find(scorer => scorer.id === scorerId)?.name || '打分人';
+}
+
+function combinedExportProgress(index: number, total: number, progress: number) {
+  return Math.round(((index + Math.max(0, Math.min(100, progress)) / 100) / total) * 100);
+}
+
+function localDayStartIso(timestamp: number) {
+  const date = new Date(timestamp);
+  date.setHours(0, 0, 0, 0);
+  return date.toISOString();
+}
+
+function localDayEndIso(timestamp: number) {
+  const date = new Date(timestamp);
+  date.setHours(23, 59, 59, 999);
+  return date.toISOString();
+}
+
+function exportDateLabel(timestamp: number) {
+  return new Date(timestamp).toLocaleDateString('zh-CN', {
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  });
+}
+
+function exportScorerCompletedRangePayload() {
+  const range = exportScorerCompletedRange.value;
+  if (!range) return {};
+  const [start, end] = range;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return {};
+  const from = Math.min(start, end);
+  const to = Math.max(start, end);
+  return {
+    completedFrom: localDayStartIso(from),
+    completedTo: localDayEndIso(to)
+  };
+}
+
+function exportScorerCompletedRangeLabel() {
+  const range = exportScorerCompletedRange.value;
+  if (!range) return '';
+  const [start, end] = range;
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return '';
+  return `${exportDateLabel(Math.min(start, end))} 至 ${exportDateLabel(Math.max(start, end))}`;
+}
+
 async function exportProjectCompletedTasks() {
   if (!exportProjectIds.value.length) {
     message.error('请选择需要导出的项目');
     return;
   }
+  const projectIds = [...exportProjectIds.value];
   exportingProjects.value = true;
   const taskId = taskStack.addTask({
     kind: 'export',
     title: '导出项目任务明细',
-    description: `已选择 ${exportProjectIds.value.length} 个项目`,
+    description: `将按项目依次导出 ${projectIds.length} 个 JSON 文件`,
     stage: '正在生成完成任务 JSON',
-    progress: 20
+    progress: 0
   });
   try {
-    await imageApi.exportCompletedTasks({
-      projectIds: exportProjectIds.value
-    });
-    taskStack.finishTask(taskId, { stage: 'JSON 已生成', description: '浏览器已开始下载' });
-    message.success('已开始下载项目任务明细 JSON');
+    for (const [index, projectId] of projectIds.entries()) {
+      const name = exportProjectName(projectId);
+      await imageApi.exportCompletedTasks(projectId, {
+        onProgress: job => taskStack.updateTask(taskId, {
+          progress: combinedExportProgress(index, projectIds.length, job.progress),
+          stage: `${index + 1}/${projectIds.length} ${name}：${job.stage}`
+        })
+      });
+    }
+    taskStack.finishTask(taskId, { stage: 'JSON 已生成', description: `已触发 ${projectIds.length} 个文件下载` });
+    message.success(`已开始下载 ${projectIds.length} 个项目任务明细 JSON`);
   } catch (error) {
     taskStack.failTask(taskId, error);
     message.error(errorMessage(error));
@@ -486,18 +552,29 @@ async function exportTeamTaskSummary() {
     message.error('请选择需要导出的团队');
     return;
   }
+  const teamIds = [...exportTeamIds.value];
+  const excludeInactiveScorers = exportTeamExcludeInactiveScorers.value;
   exportingTeams.value = true;
   const taskId = taskStack.addTask({
     kind: 'export',
     title: '导出团队成员汇总',
-    description: `已选择 ${exportTeamIds.value.length} 个团队`,
+    description: `将按团队依次导出 ${teamIds.length} 个 JSON 文件${excludeInactiveScorers ? '，仅包含近 7 天有打分的成员' : ''}`,
     stage: '正在生成成员任务统计',
-    progress: 30
+    progress: 0
   });
   try {
-    await imageApi.exportTeamTaskSummary(exportTeamIds.value);
-    taskStack.finishTask(taskId, { stage: '团队汇总已生成', description: '浏览器已开始下载' });
-    message.success('已开始下载团队成员汇总 JSON');
+    for (const [index, teamId] of teamIds.entries()) {
+      const name = exportTeamName(teamId);
+      await imageApi.exportTeamTaskSummary([teamId], {
+        excludeInactiveScorers,
+        onProgress: job => taskStack.updateTask(taskId, {
+          progress: combinedExportProgress(index, teamIds.length, job.progress),
+          stage: `${index + 1}/${teamIds.length} ${name}：${job.stage}`
+        })
+      });
+    }
+    taskStack.finishTask(taskId, { stage: '团队汇总已生成', description: `已触发 ${teamIds.length} 个文件下载` });
+    message.success(`已开始下载 ${teamIds.length} 个团队成员汇总 JSON`);
   } catch (error) {
     taskStack.failTask(taskId, error);
     message.error(errorMessage(error));
@@ -511,18 +588,30 @@ async function exportScorerTaskSummary() {
     message.error('请选择需要导出的打分人');
     return;
   }
+  const scorerIds = [...exportScorerIds.value];
+  const completedRange = exportScorerCompletedRangePayload();
+  const completedRangeLabel = exportScorerCompletedRangeLabel();
   exportingScorers.value = true;
   const taskId = taskStack.addTask({
     kind: 'export',
     title: '导出打分人任务明细',
-    description: `已选择 ${exportScorerIds.value.length} 位打分人`,
+    description: `将按打分人依次导出 ${scorerIds.length} 个 JSON 文件${completedRangeLabel ? `，完成时间：${completedRangeLabel}` : ''}`,
     stage: '正在生成已完成任务 JSON',
-    progress: 30
+    progress: 0
   });
   try {
-    await imageApi.exportScorerTaskSummary(exportScorerIds.value);
-    taskStack.finishTask(taskId, { stage: '任务明细已生成', description: '浏览器已开始下载' });
-    message.success('已开始下载打分人已完成任务 JSON');
+    for (const [index, scorerId] of scorerIds.entries()) {
+      const name = exportScorerName(scorerId);
+      await imageApi.exportScorerTaskSummary([scorerId], {
+        ...completedRange,
+        onProgress: job => taskStack.updateTask(taskId, {
+          progress: combinedExportProgress(index, scorerIds.length, job.progress),
+          stage: `${index + 1}/${scorerIds.length} ${name}：${job.stage}`
+        })
+      });
+    }
+    taskStack.finishTask(taskId, { stage: '任务明细已生成', description: `已触发 ${scorerIds.length} 个文件下载` });
+    message.success(`已开始下载 ${scorerIds.length} 个打分人已完成任务 JSON`);
   } catch (error) {
     taskStack.failTask(taskId, error);
     message.error(errorMessage(error));
@@ -679,6 +768,11 @@ onMounted(async () => {
           <div class="dashboard-export-body">
             <n-select v-model:value="exportScorerIds" multiple filterable clearable :options="exportScorerOptions"
               placeholder="选择要导出的打分人" />
+            <div class="dashboard-export-filter">
+              <n-text depth="3">完成时间范围</n-text>
+              <n-date-picker v-model:value="exportScorerCompletedRange" type="daterange" clearable
+                start-placeholder="开始日期" end-placeholder="结束日期" />
+            </div>
             <div class="dashboard-export-meta">
               <n-tag size="small" :bordered="false">已选 {{ exportScorerIds.length }} 位打分人</n-tag>
               <n-text depth="3">包含任务图片、排序/判断结果、提交方式和打分耗时。</n-text>
@@ -706,6 +800,10 @@ onMounted(async () => {
           <div class="dashboard-export-body">
             <n-select v-model:value="exportTeamIds" multiple filterable clearable :options="exportTeamOptions"
               placeholder="选择要导出的团队" />
+            <div class="dashboard-export-option">
+              <n-text depth="3">去掉最近 7 天没有打分的人</n-text>
+              <n-switch v-model:value="exportTeamExcludeInactiveScorers" size="small" />
+            </div>
             <div class="dashboard-export-meta">
               <n-tag size="small" :bordered="false">已选 {{ exportTeamIds.length }} 个团队</n-tag>
               <n-text depth="3">包含打分人、任务总数、已完成、未完成、完成率。</n-text>

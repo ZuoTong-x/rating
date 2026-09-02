@@ -275,6 +275,28 @@ export interface ScoringRollbackJob {
   result?: ScoringRollbackResult;
 }
 
+export type AdminExportType =
+  | 'project-completed-tasks'
+  | 'scorer-completed-tasks'
+  | 'team-task-summary'
+  | 'project-task-report';
+
+export interface AdminExportJob {
+  jobId: string;
+  type: AdminExportType;
+  status: 'queued' | 'running' | 'completed' | 'failed';
+  stage: string;
+  progress: number;
+  message: string | null;
+  filename: string;
+  contentType: string;
+  downloadUrl?: string;
+  createdAt: string;
+  updatedAt: string;
+  expiresAt: string;
+  result?: Record<string, unknown>;
+}
+
 export interface RatingTaskPage {
   total: number;
   page: number;
