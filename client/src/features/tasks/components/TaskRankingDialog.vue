@@ -107,22 +107,27 @@ const detailPrompt = computed(() => {
   return image?.prompt || image?.catalog?.actual_input_prompt || image?.catalog?.prompt || '';
 });
 
+const commonRulePoint = '所有黄色、暴力、暗黑、阴暗的画风表达，都应该在排序中垫底。';
 const rulePoints: Record<string, string[]> = {
-  overall: ['一眼评，不参考其他分数。'],
-  creativity: ['视觉记忆性、趣味性、视觉冲击力、天马行空的想象力。'],
-  mood: ['情绪传达度、氛围、意境、故事感。'],
-  composition: ['主体明确性、视觉层级清晰性、画面平衡性、视线引导性。'],
-  color: ['色彩协调，或有明确控制且协调，或用色大胆且协调。'],
-  lighting: ['光影和谐美观性、光影为画面的加分度、明暗层级是否协调。'],
-  realism: ['皮肤质感真实、材质可信度、摄影美观度、摄影真实性。'],
-  detail: ['画面细节性。'],
-  discomfort: ['是否产生观感不舒适、恶心、厌恶、涉黄或暴力。'],
-  promptAlignment: ['生成结果与提示词中的主体、场景、风格和关键约束的一致程度。'],
-  textCorrectness: ['文字是否正确、清晰，无错别字或乱码。'],
-  anatomyNormality: ['肢体、关节、五官和身体比例是否自然。'],
-  informationClarity: ['信息传达是否突出、明确。'],
-  designQuality: ['整体布局、视觉系统与设计完成度。'],
-  typography: ['文字排版、字形选择和信息层级是否协调。']
+  overall: ['一眼评，不参考其他分数。', commonRulePoint],
+  creativity: ['视觉记忆性、趣味性、视觉冲击力、天马行空的想象力。', commonRulePoint],
+  mood: ['情绪传达度、氛围、意境、故事感。', commonRulePoint],
+  composition: ['主体明确性、视觉层级清晰性、画面平衡性、视线引导性。', commonRulePoint],
+  color: [
+    '色彩协调，或有明确控制且协调，或用色大胆且协调。',
+    '请选择色彩协调、或有明确控制且协调、或用色大胆（撞色/黑白）且协调的数据，只要色彩协调感高/高级，就可以在排序中得高分。',
+    commonRulePoint
+  ],
+  lighting: ['光影和谐美观性、光影为画面的加分度、明暗层级是否协调。', commonRulePoint],
+  realism: ['皮肤质感真实、材质可信度、摄影美观度、摄影真实性。', commonRulePoint],
+  detail: ['画面细节性。', commonRulePoint],
+  discomfort: ['是否产生观感不舒适、恶心、厌恶、涉黄或暴力。', commonRulePoint],
+  promptAlignment: ['生成结果与提示词中的主体、场景、风格和关键约束的一致程度。', commonRulePoint],
+  textCorrectness: ['文字是否正确、清晰，无错别字或乱码。', commonRulePoint],
+  anatomyNormality: ['肢体、关节、五官和身体比例是否自然。', commonRulePoint],
+  informationClarity: ['信息传达是否突出、明确。', commonRulePoint],
+  designQuality: ['整体布局、视觉系统与设计完成度。', commonRulePoint],
+  typography: ['文字排版、字形选择和信息层级是否协调。', commonRulePoint]
 };
 
 const currentRulePoints = computed(() => criterion.value ? rulePoints[criterion.value] : rulePoints.overall);
@@ -506,7 +511,12 @@ async function retryNextTask() {
         <div class="task-rule-heading-wrap">
           <div class="task-rule-panel-header">
             <strong>评分规则</strong>
-            <n-text depth="3">{{ criterionLabel }}：{{ currentRulePoints[0] }}</n-text>
+            <n-text depth="3">{{ criterionLabel }}</n-text>
+          </div>
+          <div class="task-rule-list">
+            <n-text v-for="point in currentRulePoints" :key="point">
+              {{ point }}
+            </n-text>
           </div>
         </div>
         <n-alert type="error" v-if="supportsExclusion && !isCorrectnessCriterion">

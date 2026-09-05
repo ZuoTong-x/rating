@@ -386,10 +386,15 @@ export const imageApi = {
   adminDashboardAverageDuration() {
     return requestJson<AdminDashboardAverageDuration>('/api/admin/dashboard/average-duration');
   },
-  adminDashboardWorkload(query: { scorerId?: string | null; teamId?: string | null } = {}) {
+  adminDashboardWorkload(query: {
+    scorerId?: string | null;
+    teamId?: string | null;
+    mode?: 'scorer' | 'team' | 'both';
+  } = {}) {
     const params = new URLSearchParams();
     if (query.scorerId) params.set('scorerId', query.scorerId);
     if (query.teamId) params.set('teamId', query.teamId);
+    if (query.mode) params.set('mode', query.mode);
     return requestJson<AdminDashboardWorkloadSection>(`/api/admin/dashboard/workload${params.toString() ? `?${params}` : ''}`);
   },
   adminScoringSummary(query: {

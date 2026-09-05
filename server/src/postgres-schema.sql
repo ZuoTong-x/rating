@@ -239,6 +239,14 @@ create table if not exists scorer_task_stats (
     primary key (scorer, taskversion, projectid)
   );
 
+create table if not exists dashboard_completion_hour_stats (
+    taskversion text not null,
+    hour integer not null check (hour between 0 and 23),
+    completedtaskcount bigint not null default 0,
+    updatedat timestamptz not null,
+    primary key (taskversion, hour)
+  );
+
 create table if not exists subject_task_templates (
     id text primary key,
     subjectid text not null,
@@ -372,6 +380,8 @@ create index if not exists idx_feedbacks_status_created on feedbacks(status, sub
 create index if not exists idx_feedback_messages_feedback_created on feedback_messages(feedbackid, createdat asc, id asc);
 create index if not exists idx_scorer_task_stats_project_version
     on scorer_task_stats(projectid, taskversion);
+create index if not exists idx_dashboard_completion_hour_stats_version
+    on dashboard_completion_hour_stats(taskversion, hour);
 create index if not exists idx_users_role_status on users(role, status, username);
 create index if not exists idx_teams_status_name on teams(status, name);
 create index if not exists idx_project_packages_project_package on project_packages(projectid, packageid);
@@ -431,6 +441,40 @@ begin
     on conflict (scorer, taskversion, projectid) do update set
       assigned = scorer_task_stats.assigned + excluded.assigned,
       completed = scorer_task_stats.completed + excluded.completed,
+      updatedat = excluded.updatedat;
+  end if;
+
+  if tg_op in ('DELETE', 'UPDATE')
+     and old.status = 'completed'
+     and old.completedat is not null then
+    update dashboard_completion_hour_stats
+       set completedtaskcount = greatest(
+             0,
+             completedtaskcount
+             - case
+                 when old.taskversion is not null then 1
+                 else 0
+               end
+           ),
+           updatedat = coalesce(new.updatedat, old.updatedat)
+     where taskversion = old.taskversion
+       and hour = extract(hour from old.completedat at time zone 'Asia/Shanghai')::integer;
+  end if;
+
+  if tg_op in ('INSERT', 'UPDATE')
+     and new.status = 'completed'
+     and new.completedat is not null then
+    insert into dashboard_completion_hour_stats(
+      taskversion, hour, completedtaskcount, updatedat
+    )
+    values (
+      new.taskversion,
+      extract(hour from new.completedat at time zone 'Asia/Shanghai')::integer,
+      1,
+      new.updatedat
+    )
+    on conflict (taskversion, hour) do update set
+      completedtaskcount = dashboard_completion_hour_stats.completedtaskcount + 1,
       updatedat = excluded.updatedat;
   end if;
 

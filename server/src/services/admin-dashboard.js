@@ -61,6 +61,8 @@ export function createAdminDashboardService({
 }) {
   const dashboardCache = new Map();
   const dashboardCacheTtlMs = 15 * 1000;
+  let dashboardHourStatsInitialized = false;
+  let dashboardHourStatsInitPromise = null;
 
   async function cachedDashboardValue(key, producer) {
     const cached = dashboardCache.get(key);
@@ -389,35 +391,17 @@ export function createAdminDashboardService({
     const packageRows = await listProjectPackages(project.id, project.packageId);
     const statusCounts = await projectTaskStatusCounts(projectId);
     const totalTasks = statusCounts.pending + statusCounts.assigned + statusCounts.completed;
-    const criterionRows = await db
+    const taskSummary = await db
       .prepare(
-        `SELECT DISTINCT taskType
+        `SELECT COUNT(DISTINCT NULLIF(BTRIM(scorer), '')) AS scorerCount,
+                COUNT(DISTINCT NULLIF(split_part(taskType, ':', 2), '')) AS criterionCount,
+                AVG(CASE
+                  WHEN status = 'completed' AND durationMs >= 0 THEN durationMs
+                END) AS averageDurationMs
          FROM rating_tasks
          WHERE projectId = ? AND taskVersion = ?`,
       )
-      .all(projectId, taskVersion);
-    const scorerCount = Number(
-      (await db
-        .prepare(
-          `SELECT COUNT(DISTINCT scorer) AS total
-           FROM rating_tasks
-           WHERE projectId = ?
-             AND taskVersion = ?
-             AND scorer IS NOT NULL
-             AND TRIM(scorer) <> ''`,
-        )
-        .get(projectId, taskVersion)).total || 0,
-    );
-    const averageDurationMs = (await db
-      .prepare(
-        `SELECT AVG(durationMs) AS value
-         FROM rating_tasks
-         WHERE projectId = ?
-           AND taskVersion = ?
-           AND status = 'completed'
-           AND durationMs >= 0`,
-      )
-      .get(projectId, taskVersion)).value;
+      .get(projectId, taskVersion);
 
     return {
       projectId: project.id,
@@ -433,29 +417,75 @@ export function createAdminDashboardService({
       assignedTaskCount: statusCounts.assigned,
       completedTaskCount: statusCounts.completed,
       completionRate: reportCompletionRate(statusCounts.completed, totalTasks),
-      scorerCount,
-      criterionCount: new Set(
-        criterionRows.map((row) => String(row.taskType || "").split(":")[1] || "").filter(Boolean),
-      ).size,
-      averageDurationSeconds: averageDurationMs == null ? null : averageDurationMs / 1000,
+      scorerCount: Number(taskSummary?.scorerCount || 0),
+      criterionCount: Number(taskSummary?.criterionCount || 0),
+      averageDurationSeconds: taskSummary?.averageDurationMs == null
+        ? null
+        : taskSummary.averageDurationMs / 1000,
     };
   }
 
   async function listDashboardPeakHours(projectId = null) {
-    const rows = await db
-      .prepare(
-        `SELECT EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer AS hour,
-                COUNT(*) AS count
-         FROM rating_tasks
-         WHERE taskVersion = ?
-           AND status = 'completed'
-           AND completedAt IS NOT NULL
-           AND (?::text IS NULL OR projectId = ?)
-         GROUP BY EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')
-         ORDER BY hour ASC`,
-      )
-      .all(taskVersion, projectId, projectId);
-    const countByHour = new Map(rows.map((row) => [Number(row.hour || 0), Number(row.count || 0)]));
+    if (!projectId) {
+      if (!dashboardHourStatsInitialized) {
+        dashboardHourStatsInitPromise ||= (async () => {
+          const existing = await db
+            .prepare(
+              `SELECT 1
+               FROM dashboard_completion_hour_stats
+               WHERE taskVersion = ?
+               LIMIT 1`,
+            )
+            .get(taskVersion);
+          if (!existing) {
+            await db
+              .prepare(
+                `INSERT INTO dashboard_completion_hour_stats
+                   (taskVersion, hour, completedTaskCount, updatedAt)
+                 SELECT ?, EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer,
+                        COUNT(*), CURRENT_TIMESTAMP
+                 FROM rating_tasks
+                 WHERE taskVersion = ?
+                   AND status = 'completed'
+                   AND completedAt IS NOT NULL
+                 GROUP BY EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')
+                 ON CONFLICT (taskVersion, hour) DO UPDATE SET
+                   completedTaskCount = EXCLUDED.completedTaskCount,
+                   updatedAt = EXCLUDED.updatedAt`,
+              )
+              .run(taskVersion, taskVersion);
+          }
+          dashboardHourStatsInitialized = true;
+        })().catch((error) => {
+          dashboardHourStatsInitPromise = null;
+          throw error;
+        });
+        await dashboardHourStatsInitPromise;
+      }
+    }
+    const source = projectId
+      ? await db
+        .prepare(
+          `SELECT EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer AS hour,
+                  COUNT(*) AS count
+           FROM rating_tasks
+           WHERE taskVersion = ?
+             AND status = 'completed'
+             AND completedAt IS NOT NULL
+             AND projectId = ?
+           GROUP BY EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')
+           ORDER BY hour ASC`,
+        )
+        .all(taskVersion, projectId)
+      : await db
+        .prepare(
+          `SELECT hour, completedTaskCount AS count
+           FROM dashboard_completion_hour_stats
+           WHERE taskVersion = ?
+           ORDER BY hour ASC`,
+        )
+        .all(taskVersion);
+    const countByHour = new Map(source.map((row) => [Number(row.hour || 0), Number(row.count || 0)]));
     return Array.from({ length: 24 }, (_, hour) => ({
       hour,
       label: `${String(hour).padStart(2, "0")}:00`,
@@ -481,52 +511,79 @@ export function createAdminDashboardService({
   async function listDashboardScorerProgress(projectId = null) {
     return (await db
       .prepare(
-        `SELECT users.id,
+        `WITH durations AS (
+           SELECT scorer, projectId,
+                  SUM(CASE WHEN status = 'completed' AND durationMs >= 0 THEN durationMs ELSE 0 END) AS durationTotal,
+                  COUNT(*) FILTER (WHERE status = 'completed' AND durationMs >= 0) AS durationCount
+           FROM rating_tasks
+           WHERE taskVersion = ?
+           GROUP BY scorer, projectId
+         )
+         SELECT users.id,
                 users.username AS name,
                 users.status,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs
-         FROM rating_tasks
-         JOIN users ON users.username = rating_tasks.scorer
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount,
+                COALESCE(SUM(scorer_task_stats.completed), 0) AS completedTaskCount,
+                COALESCE(SUM(scorer_task_stats.assigned), 0) AS pendingTaskCount,
+                CASE
+                  WHEN COALESCE(SUM(durations.durationCount), 0) > 0
+                  THEN SUM(durations.durationTotal) / SUM(durations.durationCount)
+                END AS averageDurationMs
+         FROM scorer_task_stats
+         JOIN users ON users.username = scorer_task_stats.scorer
           AND users.role = 'scorer'
-         WHERE rating_tasks.taskVersion = ?
-           AND rating_tasks.scorer IS NOT NULL
-           AND TRIM(rating_tasks.scorer) <> ''
-           AND (?::text IS NULL OR rating_tasks.projectId = ?)
+         LEFT JOIN durations
+           ON durations.scorer = scorer_task_stats.scorer
+          AND durations.projectId = scorer_task_stats.projectId
+         WHERE scorer_task_stats.taskVersion = ?
+           AND scorer_task_stats.projectId <> ''
+           AND (?::text IS NULL OR scorer_task_stats.projectId = ?)
          GROUP BY users.id, users.username, users.status
          ORDER BY completedTaskCount DESC, totalTaskCount DESC, LOWER(users.username) ASC, users.username ASC
          LIMIT 12`,
       )
-      .all(taskVersion, projectId, projectId))
+      .all(taskVersion, taskVersion, projectId, projectId))
       .map(progressSummaryDto);
   }
 
   async function listDashboardTeamProgress(projectId = null) {
     return (await db
       .prepare(
-        `SELECT teams.id,
+        `WITH durations AS (
+           SELECT scorer, projectId,
+                  SUM(CASE WHEN status = 'completed' AND durationMs >= 0 THEN durationMs ELSE 0 END) AS durationTotal,
+                  COUNT(*) FILTER (WHERE status = 'completed' AND durationMs >= 0) AS durationCount
+           FROM rating_tasks
+           WHERE taskVersion = ?
+           GROUP BY scorer, projectId
+         )
+         SELECT teams.id,
                 teams.name,
                 teams.status,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs
-         FROM rating_tasks
-         JOIN users ON users.username = rating_tasks.scorer
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount,
+                COALESCE(SUM(scorer_task_stats.completed), 0) AS completedTaskCount,
+                COALESCE(SUM(scorer_task_stats.assigned), 0) AS pendingTaskCount,
+                CASE
+                  WHEN COALESCE(SUM(durations.durationCount), 0) > 0
+                  THEN SUM(durations.durationTotal) / SUM(durations.durationCount)
+                END AS averageDurationMs
+         FROM user_teams
+         JOIN users ON users.id = user_teams.userId
           AND users.role = 'scorer'
-         JOIN user_teams ON user_teams.userId = users.id
          JOIN teams ON teams.id = user_teams.teamId
-         WHERE rating_tasks.taskVersion = ?
-           AND rating_tasks.scorer IS NOT NULL
-           AND TRIM(rating_tasks.scorer) <> ''
-           AND (?::text IS NULL OR rating_tasks.projectId = ?)
+         LEFT JOIN scorer_task_stats
+           ON scorer_task_stats.scorer = users.username
+          AND scorer_task_stats.taskVersion = ?
+          AND scorer_task_stats.projectId <> ''
+          AND (?::text IS NULL OR scorer_task_stats.projectId = ?)
+         LEFT JOIN durations
+           ON durations.scorer = scorer_task_stats.scorer
+          AND durations.projectId = scorer_task_stats.projectId
          GROUP BY teams.id, teams.name, teams.status
          ORDER BY completedTaskCount DESC, totalTaskCount DESC, LOWER(teams.name) ASC, teams.name ASC
          LIMIT 12`,
       )
-      .all(taskVersion, projectId, projectId))
+      .all(taskVersion, taskVersion, projectId, projectId))
       .map(progressSummaryDto);
   }
 
@@ -583,7 +640,8 @@ export function createAdminDashboardService({
   }
 
   async function getDashboardWorkloadSection(query = {}) {
-    const key = `workload:${String(query.scorerId || "")}:${String(query.teamId || "")}`;
+    const mode = query.mode === "team" || query.mode === "both" ? query.mode : "scorer";
+    const key = `workload:${mode}:${String(query.scorerId || "")}:${String(query.teamId || "")}`;
     return cachedDashboardValue(key, async () => await getDashboardWorkloadSummary(query));
   }
 
@@ -607,10 +665,11 @@ export function createAdminDashboardService({
         `SELECT users.id,
                 users.username AS name,
                 users.status,
-                COUNT(rating_tasks.id) AS totalTaskCount
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount
          FROM users
-         LEFT JOIN rating_tasks ON rating_tasks.scorer = users.username
-          AND rating_tasks.taskVersion = ?
+         LEFT JOIN scorer_task_stats ON scorer_task_stats.scorer = users.username
+          AND scorer_task_stats.taskVersion = ?
+          AND scorer_task_stats.projectId <> ''
          WHERE users.role = 'scorer'
          GROUP BY users.id, users.username, users.status
          ORDER BY totalTaskCount DESC, LOWER(users.username) ASC, users.username ASC`,
@@ -631,13 +690,14 @@ export function createAdminDashboardService({
                 teams.name,
                 teams.status,
                 COUNT(DISTINCT users.id) AS userCount,
-                COUNT(rating_tasks.id) AS totalTaskCount
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount
          FROM teams
          LEFT JOIN user_teams ON user_teams.teamId = teams.id
          LEFT JOIN users ON users.id = user_teams.userId
           AND users.role = 'scorer'
-         LEFT JOIN rating_tasks ON rating_tasks.scorer = users.username
-          AND rating_tasks.taskVersion = ?
+         LEFT JOIN scorer_task_stats ON scorer_task_stats.scorer = users.username
+          AND scorer_task_stats.taskVersion = ?
+          AND scorer_task_stats.projectId <> ''
          GROUP BY teams.id, teams.name, teams.status
          ORDER BY totalTaskCount DESC, LOWER(teams.name) ASC, teams.name ASC`,
       )
@@ -683,56 +743,78 @@ export function createAdminDashboardService({
     if (!scorerId) return null;
     const user = await selectUserByIdStmt.get(scorerId);
     if (!user || user.role !== "scorer") return null;
-    const totals = await db
+    const projectRows = await db
       .prepare(
-        `SELECT COUNT(DISTINCT rating_tasks.projectId) AS projectCount,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs
-         FROM rating_tasks
-         JOIN projects ON projects.id = rating_tasks.projectId
-          AND projects.deletionRequestedAt IS NULL
-         WHERE rating_tasks.taskVersion = ?
-           AND rating_tasks.scorer = ?`,
-      )
-      .get(taskVersion, user.username);
-    const projects = (await db
-      .prepare(
-        `SELECT projects.id AS projectId,
+        `WITH durations AS (
+           SELECT projectId,
+                  SUM(CASE WHEN status = 'completed' AND durationMs >= 0 THEN durationMs ELSE 0 END) AS durationTotal,
+                  COUNT(*) FILTER (WHERE status = 'completed' AND durationMs >= 0) AS durationCount
+           FROM rating_tasks
+           WHERE taskVersion = ? AND scorer = ?
+           GROUP BY projectId
+         )
+         SELECT projects.id AS projectId,
                 projects.name AS projectName,
                 projects.taskStatus,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs
-         FROM rating_tasks
-         JOIN projects ON projects.id = rating_tasks.projectId
+                COALESCE(scorer_task_stats.assigned + scorer_task_stats.completed, 0) AS totalTaskCount,
+                COALESCE(scorer_task_stats.completed, 0) AS completedTaskCount,
+                COALESCE(scorer_task_stats.assigned, 0) AS pendingTaskCount,
+                COALESCE(durations.durationTotal, 0) AS durationTotal,
+                COALESCE(durations.durationCount, 0) AS durationCount
+         FROM scorer_task_stats
+         JOIN projects ON projects.id = scorer_task_stats.projectId
           AND projects.deletionRequestedAt IS NULL
-         WHERE rating_tasks.taskVersion = ?
-           AND rating_tasks.scorer = ?
-         GROUP BY projects.id, projects.name, projects.taskStatus
+         LEFT JOIN durations ON durations.projectId = scorer_task_stats.projectId
+         WHERE scorer_task_stats.taskVersion = ?
+           AND scorer_task_stats.scorer = ?
+           AND scorer_task_stats.projectId <> ''
          ORDER BY completedTaskCount DESC, totalTaskCount DESC, LOWER(projects.name) ASC, projects.name ASC`,
       )
-      .all(taskVersion, user.username))
+      .all(taskVersion, user.username, taskVersion, user.username);
+    const totals = projectRows.reduce((summary, row) => ({
+      projectCount: summary.projectCount + 1,
+      totalTaskCount: summary.totalTaskCount + Number(row.totalTaskCount || 0),
+      pendingTaskCount: summary.pendingTaskCount + Number(row.pendingTaskCount || 0),
+      completedTaskCount: summary.completedTaskCount + Number(row.completedTaskCount || 0),
+      durationTotal: summary.durationTotal + Number(row.durationTotal || 0),
+      durationCount: summary.durationCount + Number(row.durationCount || 0),
+    }), {
+      projectCount: 0,
+      totalTaskCount: 0,
+      pendingTaskCount: 0,
+      completedTaskCount: 0,
+      durationTotal: 0,
+      durationCount: 0,
+    });
+    const projects = projectRows
       .map((row) => {
-        const metrics = dashboardSummaryMetrics(row);
+        const totalTaskCount = Number(row.totalTaskCount || 0);
+        const completedTaskCount = Number(row.completedTaskCount || 0);
         return {
           projectId: row.projectId,
           projectName: row.projectName,
           taskStatus: row.taskStatus,
-          totalTaskCount: metrics.totalTaskCount,
-          pendingTaskCount: metrics.pendingTaskCount,
-          completedTaskCount: metrics.completedTaskCount,
-          completionRate: metrics.completionRate,
-          averageDurationSeconds: metrics.averageDurationSeconds,
+          totalTaskCount,
+          pendingTaskCount: Number(row.pendingTaskCount || 0),
+          completedTaskCount,
+          completionRate: reportCompletionRate(completedTaskCount, totalTaskCount),
+          averageDurationSeconds: Number(row.durationCount || 0)
+            ? Number(row.durationTotal || 0) / Number(row.durationCount || 0) / 1000
+            : null,
         };
       });
     return {
       id: user.id,
       name: user.username,
       status: user.status || "enabled",
-      ...dashboardSummaryMetrics(totals),
+      projectCount: totals.projectCount,
+      totalTaskCount: totals.totalTaskCount,
+      pendingTaskCount: totals.pendingTaskCount,
+      completedTaskCount: totals.completedTaskCount,
+      completionRate: reportCompletionRate(totals.completedTaskCount, totals.totalTaskCount),
+      averageDurationSeconds: totals.durationCount
+        ? totals.durationTotal / totals.durationCount / 1000
+        : null,
       projects,
     };
   }
@@ -743,68 +825,119 @@ export function createAdminDashboardService({
     if (!team) return null;
     const totals = await db
       .prepare(
-        `SELECT COUNT(DISTINCT rating_tasks.projectId) AS projectCount,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs,
+        `SELECT COUNT(DISTINCT scorer_task_stats.projectId) AS projectCount,
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount,
+                COALESCE(SUM(scorer_task_stats.completed), 0) AS completedTaskCount,
+                COALESCE(SUM(scorer_task_stats.assigned), 0) AS pendingTaskCount,
                 COUNT(DISTINCT users.id) AS userCount
          FROM user_teams
          JOIN users ON users.id = user_teams.userId
           AND users.role = 'scorer'
-         LEFT JOIN rating_tasks ON rating_tasks.scorer = users.username
-          AND rating_tasks.taskVersion = ?
+         LEFT JOIN scorer_task_stats ON scorer_task_stats.scorer = users.username
+          AND scorer_task_stats.taskVersion = ?
+          AND scorer_task_stats.projectId <> ''
          WHERE user_teams.teamId = ?`,
       )
       .get(taskVersion, team.id);
-    const members = (await db
+    const memberRows = await db
       .prepare(
-        `SELECT users.id,
+        `WITH durations AS (
+           SELECT rating_tasks.scorer,
+                  SUM(CASE
+                    WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0
+                    THEN rating_tasks.durationMs
+                    ELSE 0
+                  END) AS durationTotal,
+                  COUNT(*) FILTER (
+                    WHERE rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0
+                  ) AS durationCount
+           FROM rating_tasks
+           JOIN users duration_users ON duration_users.username = rating_tasks.scorer
+            AND duration_users.role = 'scorer'
+           JOIN user_teams duration_members ON duration_members.userId = duration_users.id
+           WHERE duration_members.teamId = ?
+             AND rating_tasks.taskVersion = ?
+           GROUP BY rating_tasks.scorer
+         )
+         SELECT users.id,
                 users.username AS name,
                 users.status,
-                COUNT(DISTINCT rating_tasks.projectId) AS projectCount,
-                COUNT(rating_tasks.id) AS totalTaskCount,
-                SUM(CASE WHEN rating_tasks.status = 'completed' THEN 1 ELSE 0 END) AS completedTaskCount,
-                SUM(CASE WHEN rating_tasks.status <> 'completed' THEN 1 ELSE 0 END) AS pendingTaskCount,
-                AVG(CASE WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs END) AS averageDurationMs
+                COUNT(DISTINCT scorer_task_stats.projectId) AS projectCount,
+                COALESCE(SUM(scorer_task_stats.assigned + scorer_task_stats.completed), 0) AS totalTaskCount,
+                COALESCE(SUM(scorer_task_stats.completed), 0) AS completedTaskCount,
+                COALESCE(SUM(scorer_task_stats.assigned), 0) AS pendingTaskCount,
+                COALESCE(durations.durationTotal, 0) AS durationTotal,
+                COALESCE(durations.durationCount, 0) AS durationCount
          FROM user_teams
          JOIN users ON users.id = user_teams.userId
           AND users.role = 'scorer'
-         LEFT JOIN rating_tasks ON rating_tasks.scorer = users.username
-          AND rating_tasks.taskVersion = ?
+         LEFT JOIN scorer_task_stats ON scorer_task_stats.scorer = users.username
+          AND scorer_task_stats.taskVersion = ?
+          AND scorer_task_stats.projectId <> ''
+         LEFT JOIN durations ON durations.scorer = users.username
          WHERE user_teams.teamId = ?
          GROUP BY users.id, users.username, users.status
          ORDER BY totalTaskCount DESC, completedTaskCount DESC, LOWER(users.username) ASC, users.username ASC`,
       )
-      .all(taskVersion, team.id))
-      .map((row) => ({
+      .all(team.id, taskVersion, taskVersion, team.id);
+    const members = memberRows.map((row) => ({
         id: row.id,
         name: row.name,
         status: row.status,
-        ...dashboardSummaryMetrics(row),
+        projectCount: Number(row.projectCount || 0),
+        totalTaskCount: Number(row.totalTaskCount || 0),
+        pendingTaskCount: Number(row.pendingTaskCount || 0),
+        completedTaskCount: Number(row.completedTaskCount || 0),
+        completionRate: reportCompletionRate(
+          Number(row.completedTaskCount || 0),
+          Number(row.totalTaskCount || 0),
+        ),
+        averageDurationSeconds: Number(row.durationCount || 0)
+          ? Number(row.durationTotal || 0) / Number(row.durationCount || 0) / 1000
+          : null,
       }));
+    const teamDurationTotal = memberRows.reduce(
+      (total, row) => total + Number(row.durationTotal || 0),
+      0,
+    );
+    const teamDurationCount = memberRows.reduce(
+      (total, row) => total + Number(row.durationCount || 0),
+      0,
+    );
     return {
       id: team.id,
       name: team.name,
       status: team.status,
       userCount: Number(totals?.userCount || 0),
       ...dashboardSummaryMetrics(totals),
+      averageDurationSeconds: teamDurationCount
+        ? teamDurationTotal / teamDurationCount / 1000
+        : null,
       members,
     };
   }
 
   async function getDashboardWorkloadSummary(query = {}) {
-    const scorers = await listDashboardScorerOptions();
-    const teams = await listDashboardTeamOptions();
-    const selectedScorerId = await resolveDashboardScorerId(query, scorers);
-    const selectedTeamId = await resolveDashboardTeamId(query, teams);
+    const mode = query.mode === "team" || query.mode === "both" ? query.mode : "scorer";
+    const [scorers, teams] = await Promise.all([
+      listDashboardScorerOptions(),
+      listDashboardTeamOptions(),
+    ]);
+    const [selectedScorerId, selectedTeamId] = await Promise.all([
+      resolveDashboardScorerId(query, scorers),
+      resolveDashboardTeamId(query, teams),
+    ]);
+    const [scorer, team] = await Promise.all([
+      mode === "team" ? Promise.resolve(null) : getDashboardScorerSummary(selectedScorerId),
+      mode === "scorer" ? Promise.resolve(null) : getDashboardTeamSummary(selectedTeamId),
+    ]);
     return {
       selectedScorerId,
       selectedTeamId,
       scorers,
       teams,
-      scorer: await getDashboardScorerSummary(selectedScorerId),
-      team: await getDashboardTeamSummary(selectedTeamId),
+      scorer,
+      team,
     };
   }
 
@@ -814,7 +947,7 @@ export function createAdminDashboardService({
     const projectSection = await getDashboardProjectSection(query);
     const charts = await getDashboardCharts();
     const averageDuration = await getDashboardAverageDuration();
-    const workloadSummary = await getDashboardWorkloadSection(query);
+    const workloadSummary = await getDashboardWorkloadSection({ ...query, mode: "both" });
 
     return {
       ...stats,

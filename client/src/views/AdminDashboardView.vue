@@ -408,7 +408,8 @@ async function loadDashboardCharts() {
 async function loadDashboardWorkload() {
   const result: AdminDashboardWorkloadSection = await imageApi.adminDashboardWorkload({
     scorerId: selectedScorerId.value,
-    teamId: selectedTeamId.value
+    teamId: selectedTeamId.value,
+    mode: workloadViewMode.value
   });
   dashboard.value = {
     ...dashboard.value,
@@ -423,13 +424,13 @@ async function loadDashboardWorkload() {
 }
 
 async function loadDashboardDetails() {
-  const results = await Promise.allSettled([
-    loadDashboardProjectSection(),
-    loadDashboardCharts(),
-    loadDashboardWorkload()
-  ]);
-  const failed = results.find(result => result.status === 'rejected');
-  if (failed?.status === 'rejected') message.error(errorMessage(failed.reason));
+  for (const loader of [loadDashboardProjectSection, loadDashboardWorkload, loadDashboardCharts]) {
+    try {
+      await loader();
+    } catch (error) {
+      message.error(errorMessage(error));
+    }
+  }
 }
 
 function selectAllExportProjects() {
@@ -625,7 +626,7 @@ watch(selectedProjectId, () => {
   void loadDashboardProjectSection();
 });
 
-watch([selectedScorerId, selectedTeamId], () => {
+watch([selectedScorerId, selectedTeamId, workloadViewMode], () => {
   if (!dashboardReady.value) return;
   void loadDashboardWorkload();
 });
