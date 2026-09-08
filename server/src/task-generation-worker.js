@@ -1,5 +1,8 @@
-import { generateSubjectTasks } from "./app.js";
 import { runWithDatabaseContext } from "./postgres.js";
+
+process.env.TASK_GENERATION_WORKER = "1";
+
+const { generateSubjectTasks } = await import("./app.js");
 
 let started = false;
 

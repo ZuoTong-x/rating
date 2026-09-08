@@ -671,7 +671,7 @@ export const imageApi = {
     });
   },
   projectTaskGenerationStatus(projectId: string, jobId: string) {
-    return requestJson<{
+    return requestJsonWithRetry<{
       jobId: string;
       subjectId: string;
       projectId: string;

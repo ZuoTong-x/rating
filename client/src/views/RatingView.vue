@@ -14,9 +14,10 @@ const tasks = ref<ScorerTaskListItem[]>([]);
 const loading = ref(false);
 const taskListState = ref<'loading' | 'ready' | 'stale' | 'unavailable'>('loading');
 const taskStatsState = ref<'loading' | 'ready' | 'stale' | 'unavailable'>('loading');
-const taskTotal = ref(0);
 const taskPage = ref(1);
 const taskPageSize = ref(5);
+const taskHasMore = ref(false);
+const taskPageCursors = new Map<number, string>();
 const activeTask = ref<RatingTask | null>(null);
 const rankingVisible = ref(false);
 const openingTaskId = ref<string | null>(null);
@@ -27,6 +28,7 @@ const taskStats = ref<Pick<ScorerDashboard, 'pendingTasks' | 'completedTasks' | 
   totalTasks: 0,
   projectCount: 0
 });
+const taskTotal = computed(() => taskStats.value.totalTasks);
 const taskStatsRefreshMinIntervalMs = 10_000;
 let taskStatsRefreshTimer: number | null = null;
 let taskStatsLoadPromise: Promise<void> | null = null;
@@ -38,6 +40,7 @@ const taskFilters = reactive({
   status: null as 'assigned' | 'completed' | null
 });
 let taskLoadTimer: number | null = null;
+let taskListRefreshPending = false;
 
 const criterionOptions = taskCriteria.map(item => ({ label: item.label, value: item.key }));
 const projectOptions = computed(() => projects.value
@@ -78,6 +81,7 @@ function changePage(page: number) {
 }
 
 function changePageSize(pageSize: number) {
+  taskPageCursors.clear();
   void loadTasks(1, pageSize);
 }
 
@@ -110,6 +114,9 @@ function scheduleTaskStatsRefresh(force = false) {
 async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
   const scorer = currentUser.value?.username;
   if (!scorer) return;
+  if (page === 1) taskPageCursors.clear();
+  const cursor = page > 1 ? taskPageCursors.get(page - 1) : null;
+  if (page > 1 && !cursor) page = 1;
   loading.value = true;
   taskListState.value = tasks.value.length ? 'stale' : 'loading';
   try {
@@ -117,11 +124,13 @@ async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
       scorer,
       page,
       pageSize,
-      includeTotal: true,
+      cursor,
       ...taskFilters
     });
     tasks.value = result.tasks;
-    taskTotal.value = result.total ?? 0;
+    if (result.nextCursor) taskPageCursors.set(page, result.nextCursor);
+    else taskPageCursors.delete(page);
+    taskHasMore.value = result.hasMore;
     taskPage.value = result.page;
     taskPageSize.value = result.pageSize;
     taskListState.value = 'ready';
@@ -195,6 +204,23 @@ function toggleStatusFilter(status: 'assigned' | 'completed') {
   taskFilters.status = taskFilters.status === status ? null : status;
 }
 
+function markTaskListRefreshPending() {
+  taskListRefreshPending = true;
+}
+
+function applyTaskStatsAfterSave(previousTask: RatingTask | null, savedTask: RatingTask) {
+  if (taskStatsState.value === 'unavailable') return;
+  if (!previousTask || previousTask.id !== savedTask.id) return;
+  if (previousTask.status === 'assigned' && savedTask.status === 'completed') {
+    taskStats.value = {
+      ...taskStats.value,
+      pendingTasks: Math.max(0, taskStats.value.pendingTasks - 1),
+      completedTasks: taskStats.value.completedTasks + 1,
+      totalTasks: taskStats.value.totalTasks
+    };
+  }
+}
+
 async function openRanking(task: ScorerTaskListItem) {
   if (openingTaskId.value) return;
   openingTaskId.value = task.id;
@@ -209,12 +235,10 @@ async function openRanking(task: ScorerTaskListItem) {
   }
 }
 
-function handleTaskSaved(task: RatingTask, advancing = false) {
+function handleTaskSaved(task: RatingTask, advancing = false, previousTask: RatingTask | null = null) {
   if (activeTask.value?.id === task.id) activeTask.value = task;
-  if (!advancing) {
-    void loadTasks(taskPage.value, taskPageSize.value);
-    scheduleTaskStatsRefresh();
-  }
+  applyTaskStatsAfterSave(previousTask, task);
+  markTaskListRefreshPending();
 }
 
 async function getNextTask(savedTask?: RatingTask) {
@@ -234,18 +258,12 @@ async function getNextTask(savedTask?: RatingTask) {
 
   const nextTask = nextPage.tasks[0];
   if (nextTask?.id === savedTask?.id) {
-    await loadTasks(taskPage.value, taskPageSize.value);
-    scheduleTaskStatsRefresh();
     return null;
   }
   if (!nextTask) {
-    await loadTasks(taskPage.value, taskPageSize.value);
-    scheduleTaskStatsRefresh();
     return null;
   }
   const result = await imageApi.assignedTaskDetail(nextTask.id);
-  void loadTasks(taskPage.value, taskPageSize.value);
-  scheduleTaskStatsRefresh();
   return result.task;
 }
 
@@ -253,6 +271,13 @@ function openNextTask(task: RatingTask) {
   activeTask.value = task;
   rankingVisible.value = true;
 }
+
+watch(rankingVisible, (show, oldShow) => {
+  if (!oldShow || show) return;
+  if (!taskListRefreshPending) return;
+  taskListRefreshPending = false;
+  void loadTasks(taskPage.value, taskPageSize.value);
+});
 
 function renderTaskImages(task: ScorerTaskListItem) {
   return h('div', { class: 'task-image-strip' }, task.items.map(item => h('div', {
@@ -301,6 +326,7 @@ function scheduleTaskLoad() {
   if (taskLoadTimer != null) window.clearTimeout(taskLoadTimer);
   taskLoadTimer = window.setTimeout(() => {
     taskLoadTimer = null;
+    taskPageCursors.clear();
     void loadTasks(1, taskPageSize.value);
   }, 150);
 }
@@ -398,9 +424,9 @@ onBeforeUnmount(() => {
         <div v-else class="empty">暂无任务</div>
       </div>
       <div class="scorer-task-table-footer">
-        <n-pagination v-if="taskTotal > 0" :page="taskPage" :page-size="taskPageSize"
-          :page-count="Math.ceil(taskTotal / taskPageSize)" show-size-picker
-          :page-sizes="[5, 10, 20, 50]" :prefix="paginationPrefix" @update:page="changePage"
+        <n-pagination v-if="tasks.length || taskHasMore" :page="taskPage" :page-size="taskPageSize"
+          :page-count="taskPage + (taskHasMore ? 1 : 0)" show-size-picker
+          :page-sizes="[5, 10, 20, 50]" @update:page="changePage"
           @update:page-size="changePageSize" />
       </div>
     </div>

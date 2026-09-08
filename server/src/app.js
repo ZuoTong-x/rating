@@ -199,6 +199,53 @@ const adminExportJobs = new Map();
 const adminExportQueue = [];
 const taskGenerationJobs = new Map();
 const activeTaskGenerationBySubject = new Map();
+const isTaskGenerationWorker = process.env.TASK_GENERATION_WORKER === "1";
+const taskGenerationJobTtlMs = 24 * 60 * 60 * 1000;
+const selectTaskGenerationJobStmt = db.prepare(`
+  SELECT jobId, subjectId, status, stage, progress, message, resultJson, createdAt, updatedAt, expiresAt
+  FROM task_generation_jobs
+  WHERE jobId = ?
+`);
+const selectActiveTaskGenerationJobBySubjectStmt = db.prepare(`
+  SELECT jobId, subjectId, status, stage, progress, message, resultJson, createdAt, updatedAt, expiresAt
+  FROM task_generation_jobs
+  WHERE subjectId = ?
+    AND status IN ('queued', 'running')
+  ORDER BY updatedAt DESC, createdAt DESC
+  LIMIT 1
+`);
+const upsertTaskGenerationJobStmt = db.prepare(`
+  INSERT INTO task_generation_jobs (
+    jobId, subjectId, status, stage, progress, message, resultJson,
+    createdAt, updatedAt, expiresAt
+  ) VALUES (
+    @jobId, @subjectId, @status, @stage, @progress, @message, @resultJson,
+    @createdAt, @updatedAt, @expiresAt
+  )
+  ON CONFLICT (jobId) DO UPDATE SET
+    subjectId = excluded.subjectId,
+    status = excluded.status,
+    stage = excluded.stage,
+    progress = excluded.progress,
+    message = excluded.message,
+    resultJson = excluded.resultJson,
+    updatedAt = excluded.updatedAt,
+    expiresAt = excluded.expiresAt
+`);
+const deleteTaskGenerationJobStmt = db.prepare(
+  "DELETE FROM task_generation_jobs WHERE jobId = ?",
+);
+const deleteExpiredTaskGenerationJobsStmt = db.prepare(
+  "DELETE FROM task_generation_jobs WHERE expiresAt <= ?",
+);
+const failInterruptedTaskGenerationJobsStmt = db.prepare(`
+  UPDATE task_generation_jobs
+  SET status = 'failed',
+      stage = '任务生成被服务端重启中断',
+      message = '任务生成被服务端重启中断，请重新发起',
+      updatedAt = @updatedAt
+  WHERE status IN ('queued', 'running')
+`);
 const sessionSeenWriteAt = new Map();
 const subjectTaskReportCache = new Map();
 const subjectTaskReportCacheTtlMs = 15 * 1000;
@@ -207,6 +254,7 @@ const sessionSeenWriteIntervalMs = 5 * 60 * 1000;
 // PostgreSQL connections for long stretches.
 const TASK_WRITE_BATCH_SIZE = 100;
 const TASK_ASSIGN_BATCH_SIZE = 100;
+const TASK_GENERATION_PROGRESS_PERSIST_INTERVAL_MS = 1000;
 const ADMIN_EXPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const ADMIN_EXPORT_CONCURRENCY = Math.max(
   1,
@@ -227,6 +275,102 @@ function taskGenerationJobDto(job) {
   };
   if (job.result) payload.result = job.result;
   return payload;
+}
+
+function taskGenerationJobFromRow(row) {
+  if (!row) return null;
+  let result = null;
+  if (row.resultJson) {
+    try {
+      result = JSON.parse(row.resultJson);
+    } catch {}
+  }
+  return {
+    jobId: row.jobId,
+    subjectId: row.subjectId,
+    status: row.status,
+    stage: row.stage,
+    progress: Number(row.progress || 0),
+    message: row.message || null,
+    result,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    expiresAt: row.expiresAt,
+  };
+}
+
+function taskGenerationJobRecord(job) {
+  return {
+    jobId: job.jobId,
+    subjectId: job.subjectId,
+    status: job.status,
+    stage: job.stage,
+    progress: Math.max(0, Math.min(100, Number(job.progress) || 0)),
+    message: job.message || null,
+    resultJson: job.result ? JSON.stringify(job.result) : null,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    expiresAt: job.expiresAt,
+  };
+}
+
+async function persistTaskGenerationJob(job) {
+  job.updatedAt = nowIso();
+  await upsertTaskGenerationJobStmt.run(taskGenerationJobRecord(job));
+}
+
+async function getTaskGenerationJob(jobId) {
+  const cached = taskGenerationJobs.get(jobId);
+  if (cached) return cached;
+  return taskGenerationJobFromRow(await selectTaskGenerationJobStmt.get(jobId));
+}
+
+async function getActiveTaskGenerationJob(subjectId) {
+  const activeJobId = activeTaskGenerationBySubject.get(subjectId);
+  if (activeJobId) {
+    const cached = taskGenerationJobs.get(activeJobId);
+    if (cached && ["queued", "running"].includes(cached.status)) return cached;
+    const persisted = taskGenerationJobFromRow(
+      await selectTaskGenerationJobStmt.get(activeJobId),
+    );
+    if (persisted && ["queued", "running"].includes(persisted.status)) {
+      taskGenerationJobs.set(persisted.jobId, persisted);
+      return persisted;
+    }
+    activeTaskGenerationBySubject.delete(subjectId);
+  }
+
+  const persisted = taskGenerationJobFromRow(
+    await selectActiveTaskGenerationJobBySubjectStmt.get(subjectId),
+  );
+  if (persisted) {
+    taskGenerationJobs.set(persisted.jobId, persisted);
+    activeTaskGenerationBySubject.set(subjectId, persisted.jobId);
+  }
+  return persisted;
+}
+
+function scheduleTaskGenerationJobCleanup(job) {
+  if (job.cleanupTimer) return;
+  job.cleanupTimer = setTimeout(() => {
+    void deleteTaskGenerationJob(job.jobId).catch((error) => {
+      console.error(`Failed to delete task generation job (${job.jobId})`, error);
+    });
+    delete job.cleanupTimer;
+  }, taskGenerationJobTtlMs).unref();
+}
+
+async function deleteTaskGenerationJob(jobId) {
+  const cached = taskGenerationJobs.get(jobId);
+  if (cached && activeTaskGenerationBySubject.get(cached.subjectId) === jobId) {
+    activeTaskGenerationBySubject.delete(cached.subjectId);
+  }
+  if (cached?.cleanupTimer) {
+    clearTimeout(cached.cleanupTimer);
+    delete cached.cleanupTimer;
+  }
+  taskGenerationJobs.delete(jobId);
+  await deleteTaskGenerationJobStmt.run(jobId);
 }
 
 function adminExportJobDto(job) {
@@ -6515,14 +6659,12 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   }
   const assignment = await parseTaskGenerationAssignees(assigneesInput);
 
-  const activeJobId = activeTaskGenerationBySubject.get(subjectId);
-  if (activeJobId) {
-    const activeJob = taskGenerationJobs.get(activeJobId);
-    if (activeJob && ["queued", "running"].includes(activeJob.status)) {
-      return activeJob;
-    }
+  const activeJob = await getActiveTaskGenerationJob(subjectId);
+  if (activeJob && ["queued", "running"].includes(activeJob.status)) {
+    return activeJob;
   }
 
+  const createdAt = nowIso();
   const job = {
     jobId: crypto.randomUUID(),
     subjectId,
@@ -6531,66 +6673,133 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
     progress: 0,
     message: null,
     result: null,
+    createdAt,
+    updatedAt: createdAt,
+    expiresAt: new Date(Date.now() + taskGenerationJobTtlMs).toISOString(),
   };
+  await persistTaskGenerationJob(job);
   taskGenerationJobs.set(job.jobId, job);
   activeTaskGenerationBySubject.set(subjectId, job.jobId);
 
-  const worker = fork(
-    fileURLToPath(new URL("./task-generation-worker.js", import.meta.url)),
-    [],
-    {
-      env: process.env,
-      stdio: ["ignore", "inherit", "inherit", "ipc"],
-    },
-  );
-  job.worker = worker;
   const invalidateGenerationCaches = () => {
     invalidateTaskSummaryCaches(subjectId);
     invalidateScorerQueryCaches();
   };
+  let worker;
+  try {
+    worker = fork(
+      fileURLToPath(new URL("./task-generation-worker.js", import.meta.url)),
+      [],
+      {
+        env: { ...process.env, TASK_GENERATION_WORKER: "1" },
+        stdio: ["ignore", "inherit", "inherit", "ipc"],
+      },
+    );
+  } catch (error) {
+    invalidateGenerationCaches();
+    job.status = "failed";
+    job.stage = "任务导入失败";
+    job.message = error.message || "任务生成进程启动失败";
+    await persistTaskGenerationJob(job);
+    activeTaskGenerationBySubject.delete(subjectId);
+    throw error;
+  }
+  job.worker = worker;
+  let lastProgressPersistedAt = 0;
+  const commitJobState = (patch = {}, options = {}) => {
+    Object.assign(job, patch);
+    const isProgressUpdate = !options.force && patch.status === "running";
+    const now = Date.now();
+    if (
+      isProgressUpdate &&
+      lastProgressPersistedAt &&
+      now - lastProgressPersistedAt < TASK_GENERATION_PROGRESS_PERSIST_INTERVAL_MS
+    ) {
+      return job.persistPromise || Promise.resolve();
+    }
+    if (isProgressUpdate) lastProgressPersistedAt = now;
+    const next = (job.persistPromise || Promise.resolve())
+      .catch(() => {})
+      .then(() => persistTaskGenerationJob(job));
+    job.persistPromise = next.catch((error) => {
+      console.error(`Task generation job persist failed (${job.jobId})`, error);
+    });
+    return job.persistPromise;
+  };
   worker.on("message", (message) => {
-    if (message?.type === "progress") {
-      job.status = "running";
-      job.stage = message.stage || job.stage;
-      job.progress = Math.max(0, Math.min(100, Number(message.progress) || 0));
-      return;
-    }
-    if (message?.type === "completed") {
-      invalidateGenerationCaches();
-      job.result = message.result;
-      job.status = "completed";
-      job.stage = "任务导入完成";
-      job.progress = 100;
-      worker.disconnect();
-      return;
-    }
-    if (message?.type === "failed") {
-      invalidateGenerationCaches();
-      job.status = "failed";
-      job.stage = "任务导入失败";
-      job.message = message.message || "任务导入失败，请重试";
-      worker.disconnect();
-    }
+    void (async () => {
+      if (message?.type === "progress") {
+        await commitJobState({
+          status: "running",
+          stage: message.stage || job.stage,
+          progress: Math.max(0, Math.min(100, Number(message.progress) || 0)),
+        });
+        return;
+      }
+      if (message?.type === "completed") {
+        invalidateGenerationCaches();
+        await commitJobState({
+          result: message.result,
+          status: "completed",
+          stage: "任务导入完成",
+          progress: 100,
+        }, { force: true });
+        worker.disconnect();
+        activeTaskGenerationBySubject.delete(subjectId);
+        delete job.worker;
+        scheduleTaskGenerationJobCleanup(job);
+        return;
+      }
+      if (message?.type === "failed") {
+        invalidateGenerationCaches();
+        await commitJobState({
+          status: "failed",
+          stage: "任务导入失败",
+          message: message.message || "任务导入失败，请重试",
+        }, { force: true });
+        worker.disconnect();
+        activeTaskGenerationBySubject.delete(subjectId);
+        delete job.worker;
+        scheduleTaskGenerationJobCleanup(job);
+      }
+    })().catch((error) => {
+      console.error(`Task generation job update failed (${job.jobId})`, error);
+    });
   });
   worker.on("error", (error) => {
-    if (["queued", "running"].includes(job.status)) {
-      invalidateGenerationCaches();
-      job.status = "failed";
-      job.stage = "任务导入失败";
-      job.message = error.message || "任务生成进程启动失败";
-    }
+    void (async () => {
+      if (["queued", "running"].includes(job.status)) {
+        invalidateGenerationCaches();
+        await commitJobState({
+          status: "failed",
+          stage: "任务导入失败",
+          message: error.message || "任务生成进程启动失败",
+        }, { force: true });
+      }
+      activeTaskGenerationBySubject.delete(subjectId);
+      delete job.worker;
+      scheduleTaskGenerationJobCleanup(job);
+    })().catch((persistError) => {
+      console.error(`Task generation worker failed (${job.jobId})`, persistError);
+    });
     console.error(`Task generation worker failed (${job.jobId})`, error);
   });
   worker.on("exit", (code) => {
-    if (["queued", "running"].includes(job.status)) {
-      invalidateGenerationCaches();
-      job.status = "failed";
-      job.stage = "任务导入失败";
-      job.message = `任务生成进程异常退出（code ${code}）`;
-    }
-    activeTaskGenerationBySubject.delete(subjectId);
-    delete job.worker;
-    setTimeout(() => taskGenerationJobs.delete(job.jobId), 24 * 60 * 60 * 1000).unref();
+    void (async () => {
+      if (["queued", "running"].includes(job.status)) {
+        invalidateGenerationCaches();
+        await commitJobState({
+          status: "failed",
+          stage: "任务导入失败",
+          message: `任务生成进程异常退出（code ${code}）`,
+        }, { force: true });
+      }
+      activeTaskGenerationBySubject.delete(subjectId);
+      delete job.worker;
+      scheduleTaskGenerationJobCleanup(job);
+    })().catch((error) => {
+      console.error(`Task generation job exit handling failed (${job.jobId})`, error);
+    });
   });
   worker.send({ type: "start", subjectId, assignment });
 
@@ -7376,7 +7585,7 @@ app.post("/api/projects/:id/tasks/generate", requireAdmin, async (req, res, next
 
 app.get("/api/projects/:id/tasks/generate/:jobId", requireAdmin, async (req, res, next) => {
   try {
-    const job = taskGenerationJobs.get(req.params.jobId);
+    const job = await getTaskGenerationJob(req.params.jobId);
     if (!job || job.subjectId !== req.params.id) throw httpError(404, "任务生成作业不存在或已过期");
     res.json(taskGenerationJobDto(job));
   } catch (error) {
@@ -7929,33 +8138,37 @@ app.use((error, req, res, _next) => {
   res.status(status).json({ message, code });
 });
 
-const queuedSubjects = await db
-  .prepare("SELECT id FROM subjects WHERE deletionRequestedAt IS NOT NULL")
-  .all();
-for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
+if (!isTaskGenerationWorker) {
+  const queuedSubjects = await db
+    .prepare("SELECT id FROM subjects WHERE deletionRequestedAt IS NOT NULL")
+    .all();
+  for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
 
-const startupNow = nowIso();
-await deleteExpiredSessionsStmt.run(startupNow);
-await deleteExpiredImportJobsStmt.run(startupNow);
-await sweepResumableUploadSessions();
-await db.prepare(
-  `UPDATE import_jobs
-   SET status = CASE
-         WHEN metadata LIKE '%"pendingJson":true%' THEN 'awaiting_json'
-         ELSE 'failed'
-       END,
-       stage = CASE
-         WHEN metadata LIKE '%"pendingJson":true%' THEN '等待补充 JSON'
-         ELSE '导入失败'
-       END,
-       message = CASE
-         WHEN metadata LIKE '%"pendingJson":true%' THEN COALESCE(message, 'JSON 处理被服务端重启中断，请继续补充 JSON')
-         ELSE '服务端在导入过程中重启，请重新上传'
-       END,
-       updatedAt = @updatedAt
-   WHERE status IN ('queued', 'merging', 'importing')`,
-).run({ updatedAt: startupNow });
-await sweepPendingJsonImports();
+  const startupNow = nowIso();
+  await deleteExpiredSessionsStmt.run(startupNow);
+  await deleteExpiredImportJobsStmt.run(startupNow);
+  await deleteExpiredTaskGenerationJobsStmt.run(startupNow);
+  await sweepResumableUploadSessions();
+  await db.prepare(
+    `UPDATE import_jobs
+     SET status = CASE
+           WHEN metadata LIKE '%"pendingJson":true%' THEN 'awaiting_json'
+           ELSE 'failed'
+         END,
+         stage = CASE
+           WHEN metadata LIKE '%"pendingJson":true%' THEN '等待补充 JSON'
+           ELSE '导入失败'
+         END,
+         message = CASE
+           WHEN metadata LIKE '%"pendingJson":true%' THEN COALESCE(message, 'JSON 处理被服务端重启中断，请继续补充 JSON')
+           ELSE '服务端在导入过程中重启，请重新上传'
+         END,
+         updatedAt = @updatedAt
+     WHERE status IN ('queued', 'merging', 'importing')`,
+  ).run({ updatedAt: startupNow });
+  await failInterruptedTaskGenerationJobsStmt.run({ updatedAt: startupNow });
+  await sweepPendingJsonImports();
+}
 
 export { generateSubjectTasks, importZipArchive };
 export default app;

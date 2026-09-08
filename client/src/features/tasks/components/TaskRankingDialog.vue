@@ -15,7 +15,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   'update:show': [value: boolean];
-  saved: [task: RatingTask, advancing: boolean];
+  saved: [task: RatingTask, advancing: boolean, previousTask: RatingTask | null];
   next: [task: RatingTask];
 }>();
 const RAPID_SUBMISSION_INTERVAL_MS = 3000;
@@ -376,9 +376,10 @@ async function submit(advance = false) {
 }
 
 async function handleSavedTask(savedTask: RatingTask, advance: boolean) {
+  const previousTask = props.task;
   lastSubmissionAt.value = Date.now();
   lastSavedTask.value = savedTask;
-  emit('saved', savedTask, advance);
+  emit('saved', savedTask, advance, previousTask || null);
 
   if (!advance) {
     message.success(isEditing.value ? '修改已保存' : '任务已提交');

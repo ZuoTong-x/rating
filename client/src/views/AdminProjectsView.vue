@@ -3,6 +3,7 @@ import { computed, h, onMounted, reactive, ref } from 'vue';
 import { NButton, NInput, NProgress, NTag, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { authApi } from '../services/auth';
+import { HttpError } from '../services/http';
 import { imageApi, type TaskAllocationImportResult } from '../services/images';
 import { parseTaskAllocationWorkbook } from '../utils/task-allocation';
 import { useTaskStackStore } from '../stores/taskStack';
@@ -424,14 +425,32 @@ async function openTaskProject(project: ProjectItem) {
 }
 
 const TASK_GENERATION_POLL_INTERVAL = 10_000;
+const TASK_GENERATION_MISSING_RETRY_LIMIT = 3;
+type TaskGenerationJob = Awaited<ReturnType<typeof imageApi.projectTaskGenerationStatus>>;
 
 function wait(milliseconds: number) {
   return new Promise(resolve => window.setTimeout(resolve, milliseconds));
 }
 
 async function waitForTaskGeneration(projectId: string, jobId: string, taskId: string) {
+  let missingRetryCount = 0;
   while (true) {
-    const job = await imageApi.projectTaskGenerationStatus(projectId, jobId);
+    let job: TaskGenerationJob;
+    try {
+      job = await imageApi.projectTaskGenerationStatus(projectId, jobId);
+      missingRetryCount = 0;
+    } catch (error) {
+      if (
+        error instanceof HttpError &&
+        error.status === 404 &&
+        missingRetryCount < TASK_GENERATION_MISSING_RETRY_LIMIT
+      ) {
+        missingRetryCount += 1;
+        await wait(1_000 * missingRetryCount);
+        continue;
+      }
+      throw error;
+    }
     setProgress(projectId, job.progress, job.stage);
     taskStack.updateTask(taskId, {
       progress: job.progress,

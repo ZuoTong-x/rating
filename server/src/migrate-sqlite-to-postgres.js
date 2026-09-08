@@ -17,6 +17,7 @@ const migrationOrder = [
   "subjects",
   "teams",
   "projects",
+  "task_generation_jobs",
   "user_sessions",
   "project_packages",
   "user_teams",

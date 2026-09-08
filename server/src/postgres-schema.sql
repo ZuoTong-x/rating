@@ -35,6 +35,7 @@ create table if not exists import_jobs (
     updatedat timestamptz not null,
     expiresat timestamptz not null
   );
+
 alter table import_jobs
     alter column uploadlength type bigint using uploadlength::bigint,
     alter column uploadoffset type bigint using uploadoffset::bigint;
@@ -87,6 +88,44 @@ create table if not exists projects (
     updatedat timestamptz not null,
     foreign key (packageid) references subjects(id) on delete restrict
   );
+
+create table if not exists task_generation_jobs (
+    jobid text primary key,
+    subjectid text not null,
+    status text not null check (status in ('queued', 'running', 'completed', 'failed')),
+    stage text not null,
+    progress integer not null default 0,
+    message text,
+    resultjson text,
+    createdat timestamptz not null,
+    updatedat timestamptz not null,
+    expiresat timestamptz not null,
+    foreign key (subjectid) references projects(id) on delete cascade
+  );
+
+do $$
+begin
+  if to_regclass('task_generation_jobs') is not null and not exists (
+    select 1
+    from pg_constraint c
+    join pg_class rel on rel.oid = c.conrelid
+    join pg_class ref on ref.oid = c.confrelid
+    where c.conname = 'task_generation_jobs_subjectid_fkey'
+      and rel.relname = 'task_generation_jobs'
+      and ref.relname = 'projects'
+  ) then
+    delete from task_generation_jobs
+    where not exists (
+      select 1 from projects where projects.id = task_generation_jobs.subjectid
+    );
+
+    alter table task_generation_jobs
+      drop constraint if exists task_generation_jobs_subjectid_fkey;
+    alter table task_generation_jobs
+      add constraint task_generation_jobs_subjectid_fkey
+      foreign key (subjectid) references projects(id) on delete cascade;
+  end if;
+end $$;
 
 create table if not exists project_packages (
     projectid text not null,
@@ -329,6 +368,9 @@ create index if not exists idx_users_role_username on users(role, username);
 create index if not exists idx_users_role_lastloginat on users(role, lastloginat);
 create index if not exists idx_user_sessions_expiresat on user_sessions(expiresat);
 create index if not exists idx_import_jobs_expiresat on import_jobs(expiresat);
+create index if not exists idx_task_generation_jobs_subject_status
+    on task_generation_jobs(subjectid, status, updatedat desc);
+create index if not exists idx_task_generation_jobs_expiresat on task_generation_jobs(expiresat);
 create index if not exists idx_user_projects_project_user on user_projects(projectid, userid);
 create index if not exists idx_user_teams_team_user on user_teams(teamid, userid);
 create index if not exists idx_project_teams_team_project on project_teams(teamid, projectid);
@@ -367,6 +409,12 @@ create index if not exists idx_rating_tasks_scorer_version_status_updated
     on rating_tasks(scorer, taskversion, status, updatedat desc, id);
 create index if not exists idx_rating_tasks_version_scorer_status_order
     on rating_tasks(taskversion, scorer, status, tasktype, createdat, id);
+create index if not exists idx_rating_tasks_assigned_list
+    on rating_tasks(taskversion, scorer, status, projectid, createdat, id)
+    where status in ('assigned', 'completed');
+create index if not exists idx_rating_tasks_next_assigned
+    on rating_tasks(taskversion, scorer, projectid, createdat, id)
+    where status = 'assigned';
 create index if not exists idx_rating_task_items_image on rating_task_items(imageid);
 create index if not exists idx_rating_task_items_task_position
     on rating_task_items(taskid, position, imageid);
