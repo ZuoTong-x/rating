@@ -8,11 +8,28 @@ import type {
 import { requestEmpty, requestJson } from './http';
 
 export const authApi = {
-  login(username: string, password: string) {
+  login(username: string, password: string, captcha?: { id: string; answer: string } | null) {
     return requestJson<{ user: AuthUser }>('/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ username, password })
+      body: JSON.stringify({
+        username,
+        password,
+        captchaId: captcha?.id,
+        captchaAnswer: captcha?.answer
+      })
+    });
+  },
+  captcha() {
+    return requestJson<{ captchaId: string; image: string; expiresAt: string }>('/api/auth/captcha', {
+      method: 'POST'
+    });
+  },
+  changePassword(currentPassword: string, newPassword: string) {
+    return requestJson<{ user: AuthUser }>('/api/auth/change-password', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ currentPassword, newPassword })
     });
   },
   session() {

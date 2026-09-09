@@ -2,7 +2,7 @@
 import { computed, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import TaskStackFloat from '../components/TaskStackFloat.vue';
-import { clearCurrentUser, currentUser } from '../composables/auth';
+import { clearCurrentUser, currentUser, openChangePasswordModal } from '../composables/auth';
 import { useAppTheme } from '../composables/theme';
 import { adminNavItems, filterNavItems, resolveAdminActiveKey, resolveScorerActiveKey, scorerNavItems } from '../config/adminNav';
 import { authApi } from '../services/auth';
@@ -48,6 +48,10 @@ function handleMenuSelect(key: string) {
 
 const userInitial = computed(() => currentUser.value?.username.trim().charAt(0).toLocaleUpperCase() || 'U');
 const userRoleLabel = computed(() => currentUser.value?.role === 'admin' ? '管理员' : '打分人');
+
+function openChangePassword() {
+  openChangePasswordModal();
+}
 
 async function logout() {
   await authApi.logout().catch(() => { });
@@ -115,6 +119,7 @@ async function logout() {
                 <strong>{{ currentUser.username }}</strong>
                 <n-text depth="3">{{ userRoleLabel }}</n-text>
               </div>
+              <n-button text class="user-profile-logout" @click="openChangePassword">修改密码</n-button>
               <n-button text class="user-profile-logout" @click="logout">退出登录</n-button>
               <n-divider />
               <div class="user-profile-version">Version: <span>v1.0.0</span></div>

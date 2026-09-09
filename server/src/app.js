@@ -34,6 +34,7 @@ import { createAdminDashboardService } from "./services/admin-dashboard.js";
 import { createAdminScoringService } from "./services/admin-scoring.js";
 
 const app = express();
+if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY);
 const taskImageSelectColumns =
   "id AS _id, subjectId, filename, originalPath, storagePath, thumbnailPath, category, directory, isInfographic, prompt";
 const taskListImageSelectColumns =
@@ -258,10 +259,16 @@ const sessionSeenWriteAt = new Map();
 const subjectTaskReportCache = new Map();
 const subjectTaskReportCacheTtlMs = 15 * 1000;
 const sessionSeenWriteIntervalMs = 5 * 60 * 1000;
-// Keep task generation transactions short so large jobs do not monopolize
-// PostgreSQL connections for long stretches.
-const TASK_WRITE_BATCH_SIZE = 100;
-const TASK_ASSIGN_BATCH_SIZE = 100;
+// Keep large task jobs bounded while avoiding thousands of tiny transactions.
+// These can be tuned per deployment without changing the allocation logic.
+const configuredTaskWriteBatchSize = Number.parseInt(process.env.TASK_WRITE_BATCH_SIZE || "1000", 10);
+const configuredTaskAssignBatchSize = Number.parseInt(process.env.TASK_ASSIGN_BATCH_SIZE || "1000", 10);
+const TASK_WRITE_BATCH_SIZE = Number.isInteger(configuredTaskWriteBatchSize)
+  ? Math.min(5000, Math.max(100, configuredTaskWriteBatchSize))
+  : 1000;
+const TASK_ASSIGN_BATCH_SIZE = Number.isInteger(configuredTaskAssignBatchSize)
+  ? Math.min(5000, Math.max(100, configuredTaskAssignBatchSize))
+  : 1000;
 const TASK_GENERATION_PROGRESS_PERSIST_INTERVAL_MS = 1000;
 const ADMIN_EXPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const ADMIN_EXPORT_CONCURRENCY = Math.max(
@@ -270,6 +277,15 @@ const ADMIN_EXPORT_CONCURRENCY = Math.max(
 );
 let activeAdminExportCount = 0;
 const sessionDurationMs = 7 * 24 * 60 * 60 * 1000;
+const authFailureWindowMs = 15 * 60 * 1000;
+const authAccountFailureLimit = 5;
+const authAccountLockMs = 10 * 60 * 1000;
+const authIpWindowMs = 10 * 60 * 1000;
+const authIpLockMs = 10 * 60 * 1000;
+const authIpFailedAttemptLimit = 10;
+const authIpDistinctUsernameLimit = 3;
+const authCaptchaTtlMs = 5 * 60 * 1000;
+const authCaptchaSecret = process.env.AUTH_CAPTCHA_SECRET || crypto.randomBytes(32).toString("hex");
 
 function taskGenerationJobDto(job) {
   const payload = {
@@ -793,10 +809,10 @@ const selectImageByIdStmt = db.prepare(
   `SELECT ${imageSelectColumns} FROM images WHERE id = ?`,
 );
 const selectUserAuthByUsernameStmt = db.prepare(
-  "SELECT id, username, password, role, status, lastLoginAt, createdAt, updatedAt FROM users WHERE username = ? AND role = 'admin'",
+  "SELECT id, username, password, role, status, mustChangePassword, failedLoginAttempts, failedLoginWindowStart, lockedUntil, lastLoginAt, createdAt, updatedAt FROM users WHERE username = ? AND role = 'admin'",
 );
 const selectScorerByUsernameStmt = db.prepare(
-  "SELECT id, username, password, role, status, lastLoginAt, createdAt, updatedAt FROM users WHERE username = ? AND role = 'scorer'",
+  "SELECT id, username, password, role, status, mustChangePassword, failedLoginAttempts, failedLoginWindowStart, lockedUntil, lastLoginAt, createdAt, updatedAt FROM users WHERE username = ? AND role = 'scorer'",
 );
 const selectAllScorerNamesStmt = db.prepare(`
   SELECT username
@@ -820,7 +836,7 @@ const insertSessionStmt = db.prepare(`
   VALUES (@tokenHash, @userId, @expiresAt, @createdAt, @lastSeenAt)
 `);
 const selectSessionUserStmt = db.prepare(`
-  SELECT users.id, users.username, users.role, users.status, users.lastLoginAt, users.createdAt, users.updatedAt
+  SELECT users.id, users.username, users.role, users.status, users.mustChangePassword, users.lastLoginAt, users.createdAt, users.updatedAt
   FROM user_sessions
   JOIN users ON users.id = user_sessions.userId
   WHERE user_sessions.tokenHash = ?
@@ -834,6 +850,102 @@ const deleteSessionStmt = db.prepare(
 );
 const deleteExpiredSessionsStmt = db.prepare(
   "DELETE FROM user_sessions WHERE expiresAt <= ?",
+);
+const insertAuthLoginAttemptStmt = db.prepare(`
+  INSERT INTO auth_login_attempts (id, username, ip, succeeded, createdAt)
+  VALUES (@id, @username, @ip, @succeeded, @createdAt)
+`);
+const selectAuthIpBlockStmt = db.prepare(
+  "SELECT ip, lockedUntil FROM auth_ip_blocks WHERE ip = ? AND lockedUntil > ?",
+);
+const upsertAuthIpBlockStmt = db.prepare(`
+  INSERT INTO auth_ip_blocks (ip, lockedUntil, updatedAt)
+  VALUES (@ip, @lockedUntil, @updatedAt)
+  ON CONFLICT (ip) DO UPDATE SET
+    lockedUntil = excluded.lockedUntil,
+    updatedAt = excluded.updatedAt
+`);
+const selectAuthIpFailureStatsStmt = db.prepare(`
+  SELECT COUNT(*) AS failedCount, COUNT(DISTINCT username) AS usernameCount
+  FROM auth_login_attempts
+  WHERE ip = ?
+    AND succeeded = false
+    AND createdAt >= ?
+`);
+const selectAuthUsernameFailureCountStmt = db.prepare(`
+  SELECT COUNT(*) AS failedCount
+  FROM auth_login_attempts
+  WHERE username = ?
+    AND succeeded = false
+    AND createdAt >= ?
+`);
+const deleteAuthLoginAttemptsForUsernameStmt = db.prepare(
+  "DELETE FROM auth_login_attempts WHERE username = ?",
+);
+const deleteExpiredAuthLoginAttemptsStmt = db.prepare(
+  "DELETE FROM auth_login_attempts WHERE createdAt < ?",
+);
+const deleteExpiredAuthIpBlocksStmt = db.prepare(
+  "DELETE FROM auth_ip_blocks WHERE lockedUntil <= ?",
+);
+const updateUserLoginFailureStmt = db.prepare(`
+  UPDATE users
+  SET failedLoginAttempts = CASE
+        WHEN failedLoginWindowStart IS NULL OR failedLoginWindowStart < @windowStart
+          THEN 1
+        ELSE failedLoginAttempts + 1
+      END,
+      failedLoginWindowStart = CASE
+        WHEN failedLoginWindowStart IS NULL OR failedLoginWindowStart < @windowStart
+          THEN @now
+        ELSE failedLoginWindowStart
+      END,
+      lockedUntil = CASE
+        WHEN (
+          CASE
+            WHEN failedLoginWindowStart IS NULL OR failedLoginWindowStart < @windowStart
+              THEN 1
+            ELSE failedLoginAttempts + 1
+          END
+        ) >= ${authAccountFailureLimit}
+          THEN @lockedUntil
+        ELSE lockedUntil
+      END,
+      updatedAt = @now
+  WHERE id = @id
+  RETURNING failedLoginAttempts, lockedUntil
+`);
+const clearUserLoginFailureStmt = db.prepare(`
+  UPDATE users
+  SET failedLoginAttempts = 0,
+      failedLoginWindowStart = NULL,
+      lockedUntil = NULL,
+      lastLoginAt = @lastLoginAt,
+      updatedAt = @updatedAt
+  WHERE id = @id
+`);
+const updateOwnPasswordStmt = db.prepare(`
+  UPDATE users
+  SET password = @password,
+      mustChangePassword = false,
+      failedLoginAttempts = 0,
+      failedLoginWindowStart = NULL,
+      lockedUntil = NULL,
+      updatedAt = @updatedAt
+  WHERE id = @id
+`);
+const insertCaptchaChallengeStmt = db.prepare(`
+  INSERT INTO auth_captcha_challenges (id, answerHash, expiresAt, createdAt)
+  VALUES (@id, @answerHash, @expiresAt, @createdAt)
+`);
+const selectCaptchaChallengeStmt = db.prepare(
+  "SELECT id, answerHash, expiresAt, usedAt FROM auth_captcha_challenges WHERE id = ?",
+);
+const markCaptchaChallengeUsedStmt = db.prepare(
+  "UPDATE auth_captcha_challenges SET usedAt = ? WHERE id = ? AND usedAt IS NULL",
+);
+const deleteExpiredCaptchaChallengesStmt = db.prepare(
+  "DELETE FROM auth_captcha_challenges WHERE expiresAt <= ? OR usedAt IS NOT NULL",
 );
 const insertImportJobStmt = db.prepare(`
   INSERT INTO import_jobs (
@@ -925,19 +1037,21 @@ const selectScorerUsersPageStmt = db.prepare(`
   ORDER BY createdAt DESC, LOWER(username) ASC, username ASC
   LIMIT ? OFFSET ?
 `);
-const updateUserLoginStmt = db.prepare(`
-  UPDATE users
-  SET lastLoginAt = @lastLoginAt,
-      updatedAt = @updatedAt
-  WHERE id = @id
-`);
 const insertScorerUserStmt = db.prepare(`
-  INSERT INTO users (id, username, password, role, status, lastLoginAt, createdAt, updatedAt)
-  VALUES (@id, @username, @password, 'scorer', 'enabled', @lastLoginAt, @createdAt, @updatedAt)
+  INSERT INTO users (
+    id, username, password, role, status, mustChangePassword,
+    failedLoginAttempts, failedLoginWindowStart, lockedUntil,
+    lastLoginAt, createdAt, updatedAt
+  )
+  VALUES (
+    @id, @username, @password, 'scorer', 'enabled', true,
+    0, NULL, NULL, @lastLoginAt, @createdAt, @updatedAt
+  )
 `);
 const updateScorerUserStmt = db.prepare(`
   UPDATE users
   SET password = COALESCE(@password, password),
+      mustChangePassword = CASE WHEN @password IS NULL THEN mustChangePassword ELSE true END,
       status = COALESCE(@status, status),
       updatedAt = @updatedAt
   WHERE id = @id
@@ -1118,8 +1232,51 @@ const selectProjectTaskStatsStmt = db.prepare(`
   FROM project_task_stats
   WHERE projectId = ? AND taskVersion = ?
 `);
+const deleteProjectTaskStatsStmt = db.prepare(`
+  DELETE FROM project_task_stats
+  WHERE projectId = ? AND taskVersion = ?
+`);
+const insertProjectTaskStatsFromTasksStmt = db.prepare(`
+  INSERT INTO project_task_stats (
+    projectId, taskVersion, total, pending, assigned, completed, updatedAt
+  )
+  SELECT
+    projectId,
+    taskVersion,
+    COUNT(*)::integer,
+    COUNT(*) FILTER (WHERE status = 'pending')::integer,
+    COUNT(*) FILTER (WHERE status = 'assigned')::integer,
+    COUNT(*) FILTER (WHERE status = 'completed')::integer,
+    COALESCE(MAX(updatedAt), ?)
+  FROM rating_tasks
+  WHERE projectId = ? AND taskVersion = ?
+  GROUP BY projectId, taskVersion
+`);
+const deleteScorerTaskStatsStmt = db.prepare(`
+  DELETE FROM scorer_task_stats
+  WHERE projectId = ? AND taskVersion = ?
+`);
+const insertScorerTaskStatsFromTasksStmt = db.prepare(`
+  INSERT INTO scorer_task_stats (
+    scorer, taskVersion, projectId, assigned, completed, updatedAt
+  )
+  SELECT
+    scorer,
+    taskVersion,
+    projectId,
+    COUNT(*) FILTER (WHERE status = 'assigned')::integer,
+    COUNT(*) FILTER (WHERE status = 'completed')::integer,
+    COALESCE(MAX(updatedAt), ?)
+  FROM rating_tasks
+  WHERE projectId = ?
+    AND taskVersion = ?
+    AND scorer IS NOT NULL
+    AND TRIM(scorer) <> ''
+    AND status IN ('assigned', 'completed')
+  GROUP BY scorer, taskVersion, projectId
+`);
 const selectPendingProjectTaskIdsStmt = db.prepare(`
-  SELECT id
+  SELECT id, taskType
   FROM rating_tasks
   WHERE projectId = ?
     AND taskVersion = ?
@@ -1167,7 +1324,7 @@ const selectAvailableSubjectScorersStmt = db.prepare(`
   ORDER BY LOWER(username) ASC, username ASC
 `);
 const selectReassignableTaskIdsStmt = db.prepare(`
-  SELECT id
+  SELECT id, taskType
   FROM rating_tasks
   WHERE projectId = ?
     AND taskVersion = ?
@@ -1177,7 +1334,7 @@ const selectReassignableTaskIdsStmt = db.prepare(`
   LIMIT ?
 `);
 const selectReassignableTaskIdsByScorerStmt = db.prepare(`
-  SELECT id
+  SELECT id, taskType
   FROM rating_tasks
   WHERE projectId = ?
     AND taskVersion = ?
@@ -1251,9 +1408,10 @@ const updateImageScoreStmt = db.prepare(`
   WHERE id = @id
 `);
 
-function httpError(status, message) {
+function httpError(status, message, publicCode = null) {
   const error = new Error(message);
   error.status = status;
+  if (publicCode) error.publicCode = publicCode;
   return error;
 }
 
@@ -3423,6 +3581,29 @@ async function getProjectTaskStats(projectId, version = taskVersion) {
   };
 }
 
+async function beginTaskWriteTransaction() {
+  await db.exec("BEGIN");
+  // The row trigger remains enabled for normal scoring requests. Large task
+  // jobs rebuild these counters once per project instead of once per row.
+  await db.exec("SET LOCAL app.skip_rating_task_stats = 'on'");
+}
+
+async function refreshProjectTaskStats(projectId, version = taskVersion) {
+  const refreshedAt = nowIso();
+  await deleteProjectTaskStatsStmt.run(projectId, version);
+  await insertProjectTaskStatsFromTasksStmt.run(
+    refreshedAt,
+    projectId,
+    version,
+  );
+  await deleteScorerTaskStatsStmt.run(projectId, version);
+  await insertScorerTaskStatsFromTasksStmt.run(
+    refreshedAt,
+    projectId,
+    version,
+  );
+}
+
 function invalidateTaskSummaryCaches(projectId) {
   subjectTaskReportCache.delete(projectId);
 }
@@ -4058,6 +4239,7 @@ async function userDto(row) {
         role: row.role,
         teams: row.role === "scorer" ? (await selectUserTeamsStmt.all(row.id)).map(teamDto) : [],
         status: row.status || "enabled",
+        mustChangePassword: Boolean(row.mustChangePassword),
         disabledByTeam: row.role === "scorer"
           ? Boolean(await selectDisabledTeamForUserStmt.get(row.id))
           : false,
@@ -4076,9 +4258,13 @@ function normalizeUsername(value) {
 }
 
 function parseUserPassword(value) {
-  const text = String(value ?? "").trim();
-  if (!text) return "123456";
-  if (text.length > 100) throw httpError(400, "密码不能超过 100 字");
+  const text = String(value ?? "");
+  if (!text) throw httpError(400, "密码不能为空", "PASSWORD_REQUIRED");
+  if (text.length < 8) throw httpError(400, "密码至少需要 8 位", "PASSWORD_TOO_WEAK");
+  if (text.length > 100) throw httpError(400, "密码不能超过 100 字", "PASSWORD_TOO_WEAK");
+  if (!/[a-z]/.test(text)) throw httpError(400, "密码必须包含小写字母", "PASSWORD_TOO_WEAK");
+  if (!/[A-Z]/.test(text)) throw httpError(400, "密码必须包含大写字母", "PASSWORD_TOO_WEAK");
+  if (!/[^A-Za-z0-9]/.test(text)) throw httpError(400, "密码必须包含特殊字符", "PASSWORD_TOO_WEAK");
   return text;
 }
 
@@ -4137,6 +4323,164 @@ function cookieValue(header, name) {
 
 function sessionTokenHash(token) {
   return crypto.createHash("sha256").update(token).digest("hex");
+}
+
+function loginRequestIp(req) {
+  return String(req.ip || req.socket?.remoteAddress || "unknown").slice(0, 255);
+}
+
+function authCutoff(now, durationMs) {
+  return new Date(new Date(now).getTime() - durationMs).toISOString();
+}
+
+function authLockError(message, retryAfterSeconds, code) {
+  const error = httpError(429, message, code);
+  error.retryAfterSeconds = Math.max(1, Math.ceil(retryAfterSeconds));
+  return error;
+}
+
+function loginFailureWarning(user, failedCount = Number(user?.failedLoginAttempts || 0)) {
+  if (!user?.id || failedCount <= 0) return "";
+  const remaining = Math.max(0, authAccountFailureLimit - failedCount);
+  return `当前账号已失败 ${failedCount} 次，再失败 ${remaining} 次将锁定 10 分钟`;
+}
+
+function captchaHash(challengeId, answer) {
+  return crypto
+    .createHmac("sha256", authCaptchaSecret)
+    .update(`${challengeId}:${String(answer).toUpperCase()}`)
+    .digest("hex");
+}
+
+function randomCaptchaText() {
+  const alphabet = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ";
+  return Array.from({ length: 5 }, () => alphabet[crypto.randomInt(alphabet.length)]).join("");
+}
+
+function escapeXml(value) {
+  return String(value)
+    .replaceAll("&", "&amp;")
+    .replaceAll("<", "&lt;")
+    .replaceAll(">", "&gt;")
+    .replaceAll('"', "&quot;")
+    .replaceAll("'", "&apos;");
+}
+
+function captchaSvg(text) {
+  const lines = Array.from({ length: 6 }, () => {
+    const x1 = crypto.randomInt(0, 180);
+    const y1 = crypto.randomInt(8, 52);
+    const x2 = crypto.randomInt(0, 180);
+    const y2 = crypto.randomInt(8, 52);
+    const color = ["#64748b", "#94a3b8", "#475569", "#c2410c"][crypto.randomInt(4)];
+    return `<line x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${color}" stroke-width="1.2"/>`;
+  }).join("");
+  const chars = [...text].map((char, index) => {
+    const x = 18 + index * 32;
+    const y = crypto.randomInt(35, 45);
+    const rotate = crypto.randomInt(-16, 17);
+    const color = ["#0f172a", "#1d4ed8", "#9a3412", "#166534"][crypto.randomInt(4)];
+    return `<text x="${x}" y="${y}" fill="${color}" transform="rotate(${rotate} ${x} ${y})">${escapeXml(char)}</text>`;
+  }).join("");
+  const svg = `<svg xmlns="http://www.w3.org/2000/svg" width="180" height="56" viewBox="0 0 180 56"><rect width="180" height="56" rx="6" fill="#f8fafc"/>${lines}${chars}</svg>`;
+  return `data:image/svg+xml;base64,${Buffer.from(svg).toString("base64")}`;
+}
+
+async function createLoginCaptcha() {
+  const now = nowIso();
+  await deleteExpiredCaptchaChallengesStmt.run(now);
+  const id = crypto.randomUUID();
+  const answer = randomCaptchaText();
+  const expiresAt = new Date(Date.now() + authCaptchaTtlMs).toISOString();
+  await insertCaptchaChallengeStmt.run({
+    id,
+    answerHash: captchaHash(id, answer),
+    expiresAt,
+    createdAt: now,
+  });
+  return { id, image: captchaSvg(answer), expiresAt };
+}
+
+async function consumeLoginCaptcha(challengeId, answer) {
+  const id = String(challengeId || "").trim();
+  const value = String(answer || "").trim().toUpperCase();
+  if (!id || !value) return false;
+  const challenge = await selectCaptchaChallengeStmt.get(id);
+  if (!challenge || challenge.usedAt || new Date(challenge.expiresAt).getTime() <= Date.now()) {
+    return false;
+  }
+  const used = await markCaptchaChallengeUsedStmt.run(nowIso(), id);
+  if (used.changes !== 1) return false;
+  const expected = Buffer.from(String(challenge.answerHash || ""), "hex");
+  const actual = Buffer.from(captchaHash(id, value), "hex");
+  return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
+}
+
+async function getActiveAuthIpBlock(ip, now) {
+  return await selectAuthIpBlockStmt.get(ip, now);
+}
+
+async function loginCaptchaRequired(username, user, now) {
+  const windowStart = authCutoff(now, authFailureWindowMs);
+  if (
+    user &&
+    Number(user.failedLoginAttempts || 0) >= 1 &&
+    user.failedLoginWindowStart &&
+    new Date(user.failedLoginWindowStart).getTime() >= new Date(windowStart).getTime()
+  ) {
+    return true;
+  }
+  if (user) return false;
+  const row = await selectAuthUsernameFailureCountStmt.get(username, windowStart);
+  return Number(row?.failedCount || 0) >= 1;
+}
+
+async function recordLoginFailure(username, ip, user, now) {
+  const windowStart = authCutoff(now, authFailureWindowMs);
+  const lockedUntil = new Date(Date.now() + authAccountLockMs).toISOString();
+  await insertAuthLoginAttemptStmt.run({
+    id: crypto.randomUUID(),
+    username,
+    ip,
+    succeeded: false,
+    createdAt: now,
+  });
+
+  let accountFailureCount = 0;
+  let accountLockedUntil = null;
+  if (user?.id) {
+    const updated = await updateUserLoginFailureStmt.get({
+      id: user.id,
+      windowStart,
+      lockedUntil,
+      now,
+    });
+    accountFailureCount = Number(updated?.failedLoginAttempts || 0);
+    accountLockedUntil = updated?.lockedUntil || null;
+  } else {
+    const count = await selectAuthUsernameFailureCountStmt.get(username, windowStart);
+    accountFailureCount = Number(count?.failedCount || 0);
+  }
+
+  const ipStats = await selectAuthIpFailureStatsStmt.get(ip, authCutoff(now, authIpWindowMs));
+  const failedCount = Number(ipStats?.failedCount || 0);
+  const usernameCount = Number(ipStats?.usernameCount || 0);
+  let ipLockedUntil = null;
+  if (failedCount >= authIpFailedAttemptLimit && usernameCount >= authIpDistinctUsernameLimit) {
+    ipLockedUntil = new Date(Date.now() + authIpLockMs).toISOString();
+    await upsertAuthIpBlockStmt.run({ ip, lockedUntil: ipLockedUntil, updatedAt: now });
+  }
+
+  return { accountFailureCount, accountLockedUntil, ipLockedUntil };
+}
+
+async function clearLoginFailures(user, username) {
+  await clearUserLoginFailureStmt.run({
+    id: user.id,
+    lastLoginAt: nowIso(),
+    updatedAt: nowIso(),
+  });
+  await deleteAuthLoginAttemptsForUsernameStmt.run(username);
 }
 
 async function createSession(user) {
@@ -4232,6 +4576,14 @@ function requireScorer(req, _res, next) {
   return next();
 }
 
+function requirePasswordChanged(req, _res, next) {
+  if (req.method === "OPTIONS") return next();
+  if (req.auth?.mustChangePassword) {
+    return next(httpError(403, "请先修改密码", "PASSWORD_CHANGE_REQUIRED"));
+  }
+  return next();
+}
+
 async function assertSubjectAccess(subjectId, user) {
   const project = await selectProjectByIdStmt.get(subjectId);
   if (!project) {
@@ -4311,35 +4663,88 @@ async function parseProjectId(value) {
   return (await getProjectOrThrow(text))._id;
 }
 
-async function loginUser(body = {}) {
+async function loginUser(body = {}, { ip = "unknown" } = {}) {
   const username = normalizeUsername(body.username);
   const password = String(body.password ?? "");
-  if (!password) throw httpError(401, "用户名或密码不正确");
 
   const now = nowIso();
-  if (username === "admin") {
-    const admin = await selectUserAuthByUsernameStmt.get(username);
-    if (
-      !admin ||
-      admin.role !== "admin" ||
-      !verifyPassword(password, admin.password)
-    )
-      throw httpError(401, "用户名或密码不正确");
-    await updateUserLoginStmt.run({ id: admin.id, lastLoginAt: now, updatedAt: now });
-    return await userDto(await selectUserByUsernameStmt.get(username));
+  await deleteExpiredAuthIpBlocksStmt.run(now);
+  const ipBlock = await getActiveAuthIpBlock(ip, now);
+  if (ipBlock) {
+    const retryAfterSeconds = Math.max(1, (new Date(ipBlock.lockedUntil).getTime() - Date.now()) / 1000);
+    throw authLockError("当前网络尝试过于频繁，请稍后重试", retryAfterSeconds, "IP_RATE_LIMITED");
   }
 
-  const scorer = await selectScorerByUsernameStmt.get(username);
-  if (
-    !scorer ||
-    scorer.role !== "scorer" ||
-    !verifyPassword(password, scorer.password)
-  )
-    throw httpError(401, "用户名或密码不正确");
-  const availabilityError = await scorerAvailabilityError(scorer);
+  const user = username === "admin"
+    ? await selectUserAuthByUsernameStmt.get(username)
+    : await selectScorerByUsernameStmt.get(username);
+  if (user?.lockedUntil && new Date(user.lockedUntil).getTime() > Date.now()) {
+    const retryAfterSeconds = Math.max(1, (new Date(user.lockedUntil).getTime() - Date.now()) / 1000);
+    throw authLockError("登录失败次数过多，请 10 分钟后重试", retryAfterSeconds, "LOGIN_LOCKED");
+  }
+
+  const captchaRequired = await loginCaptchaRequired(username, user, now);
+  if (captchaRequired) {
+    const validCaptcha = await consumeLoginCaptcha(body.captchaId, body.captchaAnswer);
+    if (!body.captchaId || !body.captchaAnswer) {
+      const warning = loginFailureWarning(user);
+      throw httpError(
+        428,
+        warning ? `请先完成图形验证码。${warning}` : "请先完成图形验证码",
+        "CAPTCHA_REQUIRED",
+      );
+    }
+    if (!validCaptcha) {
+      const warning = loginFailureWarning(user);
+      throw httpError(
+        401,
+        warning ? `图形验证码不正确。${warning}` : "图形验证码不正确",
+        "CAPTCHA_INVALID",
+      );
+    }
+  }
+
+  if (!user || !verifyPassword(password, user.password)) {
+    const failure = await recordLoginFailure(username, ip, user, now);
+    if (failure.ipLockedUntil) {
+      throw authLockError("当前网络尝试过于频繁，请稍后重试", authIpLockMs / 1000, "IP_RATE_LIMITED");
+    }
+    if (failure.accountLockedUntil) {
+      throw authLockError("登录失败次数过多，请 10 分钟后重试", authAccountLockMs / 1000, "LOGIN_LOCKED");
+    }
+    const warning = loginFailureWarning(user, failure.accountFailureCount);
+    throw httpError(
+      401,
+      warning ? `用户名或密码不正确。${warning}` : "用户名或密码不正确",
+      failure.accountFailureCount >= 1 ? "CAPTCHA_REQUIRED" : "INVALID_CREDENTIALS",
+    );
+  }
+
+  const availabilityError = await scorerAvailabilityError(user);
   if (availabilityError) throw availabilityError;
-  await updateUserLoginStmt.run({ id: scorer.id, lastLoginAt: now, updatedAt: now });
-  return await userDto(await selectUserByIdStmt.get(scorer.id));
+  await clearLoginFailures(user, username);
+  return await userDto(await selectUserByIdStmt.get(user.id));
+}
+
+async function changeOwnPassword(userId, body = {}) {
+  const currentPassword = String(body.currentPassword ?? "");
+  const newPassword = parseUserPassword(body.newPassword);
+  const user = await db
+    .prepare("SELECT id, username, password FROM users WHERE id = ?")
+    .get(userId);
+  if (!user || !verifyPassword(currentPassword, user.password)) {
+    throw httpError(401, "当前密码不正确", "CURRENT_PASSWORD_INVALID");
+  }
+  if (currentPassword === newPassword) {
+    throw httpError(400, "新密码不能与当前密码相同", "PASSWORD_REUSED");
+  }
+  await updateOwnPasswordStmt.run({
+    id: user.id,
+    password: hashPassword(newPassword),
+    updatedAt: nowIso(),
+  });
+  await deleteAuthLoginAttemptsForUsernameStmt.run(user.username);
+  return await userDto(await selectUserByIdStmt.get(user.id));
 }
 
 async function listScorerUsers(query = {}) {
@@ -4508,8 +4913,9 @@ async function createScorerUsers(body = {}) {
 async function updateScorerUser(id, body = {}) {
   const user = await selectUserByIdStmt.get(String(id));
   if (!user || user.role !== "scorer") throw httpError(404, "打分账号不存在");
-  const passwordValue = String(body.password ?? "").trim();
-  if (passwordValue.length > 100) throw httpError(400, "密码不能超过 100 字");
+  const passwordValue = body.password == null || body.password === ""
+    ? null
+    : parseUserPassword(body.password);
   const status = parseEnabledStatus(body.status, "账号", { optional: true });
   const shouldSyncTeams = Object.hasOwn(body, "teamNames");
   const teamNames = shouldSyncTeams ? normalizeTeamNames(body.teamNames) : [];
@@ -4573,7 +4979,11 @@ async function listScorersByTeamIds(teamIds, matchMode = "all") {
 
 async function deleteScorerUser(id) {
   const user = await selectUserByIdStmt.get(String(id));
-  if (!user || user.role !== "scorer") throw httpError(404, "打分账号不存在");
+  if (!user) throw httpError(404, "打分账号不存在");
+  if (user.username === "admin" || user.role === "admin") {
+    throw httpError(403, "管理员账号不可删除", "ADMIN_ACCOUNT_PROTECTED");
+  }
+  if (user.role !== "scorer") throw httpError(404, "打分账号不存在");
   const assignedTaskCount = (await selectAssignedTaskCountByScorerStmt.get(user.username)).total;
   if (assignedTaskCount > 0) {
     throw httpError(
@@ -4806,17 +5216,93 @@ async function bulkInsertRatingTaskItems(itemRows) {
   return (await db.prepare(sql).run(...params)).changes;
 }
 
-function compressTaskAllocations(plan) {
-  const allocations = [];
-  for (const scorer of plan) {
-    const last = allocations[allocations.length - 1];
-    if (last && last.scorer === scorer) {
-      last.taskCount += 1;
-    } else {
-      allocations.push({ scorer, taskCount: 1 });
+function taskDimensionKey(candidate) {
+  if (candidate?.criterion) return String(candidate.criterion);
+  const taskType = String(candidate?.taskType || "");
+  const parts = taskType.split(":");
+  return parts[0] === "dimension" && parts[1] ? parts[1] : taskType || "unknown";
+}
+
+function buildDimensionAwareAssignmentPlan(candidates, allocations) {
+  const normalizedAllocations = allocations.filter((allocation) => allocation.taskCount > 0);
+  const totalTaskCount = normalizedAllocations.reduce(
+    (total, allocation) => total + allocation.taskCount,
+    0,
+  );
+  if (candidates.length !== totalTaskCount) {
+    throw httpError(409, "任务候选数量与分配数量不一致，请刷新后重试");
+  }
+  if (!totalTaskCount) return [];
+
+  const scorerNames = normalizedAllocations.map((allocation) => allocation.scorer);
+  const targetCounts = new Map(
+    normalizedAllocations.map((allocation) => [allocation.scorer, allocation.taskCount]),
+  );
+  const assignedCounts = new Map(scorerNames.map((scorer) => [scorer, 0]));
+  const groups = new Map();
+
+  candidates.forEach((candidate, index) => {
+    const dimension = taskDimensionKey(candidate);
+    const group = groups.get(dimension) || [];
+    group.push(index);
+    groups.set(dimension, group);
+  });
+
+  const plan = Array.from({ length: candidates.length });
+  for (const indexes of groups.values()) {
+    const quotas = new Map();
+    const remainders = new Map();
+    let baseCount = 0;
+
+    for (const scorer of scorerNames) {
+      const ideal = (indexes.length * targetCounts.get(scorer)) / totalTaskCount;
+      const base = Math.floor(ideal);
+      quotas.set(scorer, base);
+      remainders.set(scorer, ideal - base);
+      assignedCounts.set(scorer, assignedCounts.get(scorer) + base);
+      baseCount += base;
+    }
+
+    let remainderCount = indexes.length - baseCount;
+    while (remainderCount > 0) {
+      const scorer = [...scorerNames]
+        .filter((name) => assignedCounts.get(name) < targetCounts.get(name))
+        .sort((left, right) => {
+          const remainderDifference = remainders.get(right) - remainders.get(left);
+          if (remainderDifference) return remainderDifference;
+          return scorerNames.indexOf(left) - scorerNames.indexOf(right);
+        })[0];
+      if (!scorer) throw httpError(409, "维度任务分配失败，请刷新后重试");
+      quotas.set(scorer, quotas.get(scorer) + 1);
+      assignedCounts.set(scorer, assignedCounts.get(scorer) + 1);
+      remainderCount -= 1;
+    }
+
+    const remainingQuotas = new Map(quotas);
+    let nextScorerIndex = 0;
+    for (const candidateIndex of indexes) {
+      let selectedScorer = null;
+      for (let offset = 0; offset < scorerNames.length; offset += 1) {
+        const scorerIndex = (nextScorerIndex + offset) % scorerNames.length;
+        const scorer = scorerNames[scorerIndex];
+        if (remainingQuotas.get(scorer) > 0) {
+          selectedScorer = scorer;
+          nextScorerIndex = (scorerIndex + 1) % scorerNames.length;
+          break;
+        }
+      }
+      if (!selectedScorer) throw httpError(409, "维度任务分配失败，请刷新后重试");
+      plan[candidateIndex] = selectedScorer;
+      remainingQuotas.set(selectedScorer, remainingQuotas.get(selectedScorer) - 1);
     }
   }
-  return allocations;
+
+  for (const scorer of scorerNames) {
+    if (assignedCounts.get(scorer) !== targetCounts.get(scorer)) {
+      throw httpError(409, "维度任务分配数量不一致，请刷新后重试");
+    }
+  }
+  return plan;
 }
 
 function parseTaskPagination(query = {}) {
@@ -6408,7 +6894,7 @@ async function reassignSubjectTasks(subjectId, body = {}) {
   const availableTaskCount = source === "assigned_uncompleted"
     ? (await getProjectTaskStats(subjectId)).pending
     : (await getProjectTaskStats(subjectId)).assigned;
-  let assignmentPlan = null;
+  let targetAllocations = null;
   if (source === "assigned_uncompleted") {
     if (!Array.isArray(body.allocations)) {
       throw httpError(400, "请按打分人分别设置任务数量");
@@ -6439,9 +6925,7 @@ async function reassignSubjectTasks(subjectId, body = {}) {
     if (!taskCount) {
       throw httpError(400, "请至少为一名打分人设置任务数量");
     }
-    assignmentPlan = allocations.flatMap(({ scorer, taskCount: count }) =>
-      Array.from({ length: count }, () => scorer),
-    );
+    targetAllocations = allocations;
   }
   let selectedTasks;
   if (source === "assigned_uncompleted") {
@@ -6496,36 +6980,52 @@ async function reassignSubjectTasks(subjectId, body = {}) {
   if (selectedTasks.length < assignees.names.length) {
     throw httpError(400, "任务数量不能少于所选打分人数");
   }
+  if (!targetAllocations) {
+    const baseCount = Math.floor(selectedTasks.length / assignees.names.length);
+    const remainder = selectedTasks.length % assignees.names.length;
+    targetAllocations = assignees.names.map((scorer, index) => ({
+      scorer,
+      taskCount: baseCount + (index < remainder ? 1 : 0),
+    }));
+  }
+  const assignmentPlan = buildDimensionAwareAssignmentPlan(
+    selectedTasks,
+    targetAllocations,
+  );
   const updatedAt = nowIso();
   const distribution = Object.fromEntries(
     assignees.names.map((name) => [name, 0]),
   );
 
-  await db.exec("BEGIN");
+  await beginTaskWriteTransaction();
   try {
-    await Promise.all(selectedTasks.map(async (task, index) => {
-      const scorer = assignmentPlan?.[index]
-        || assignees.names[index % assignees.names.length];
-      const result = source === "assigned_uncompleted"
-        ? await assignUnassignedTaskStmt.run({
-          id: task.id,
-          projectId: subjectId,
-          taskVersion,
-          scorer,
-          updatedAt,
-        })
-        : await reassignTaskStmt.run({
-          id: task.id,
-          projectId: subjectId,
-          taskVersion,
-          scorer,
-          updatedAt,
-        });
-      if (result.changes !== 1) {
+    for (let start = 0; start < selectedTasks.length; start += TASK_ASSIGN_BATCH_SIZE) {
+      const batch = selectedTasks.slice(start, start + TASK_ASSIGN_BATCH_SIZE);
+      const whenClauses = batch.map(() => "WHEN ? THEN ?");
+      const taskIds = batch.map((task) => task.id);
+      const assignmentParams = [];
+      batch.forEach((task, index) => {
+        assignmentParams.push(task.id, assignmentPlan[start + index]);
+      });
+      assignmentParams.push(updatedAt, subjectId, taskVersion, ...taskIds);
+      const result = await db.prepare(
+        `UPDATE rating_tasks
+         SET scorer = CASE id ${whenClauses.join(" ")} ELSE scorer END,
+             status = ${source === "assigned_uncompleted" ? "'assigned'" : "status"},
+             updatedAt = ?
+         WHERE projectId = ?
+           AND taskVersion = ?
+           AND status = ${source === "assigned_uncompleted" ? "'pending'" : "'assigned'"}
+           AND id IN (${placeholders(batch.length)})`,
+      ).run(...assignmentParams);
+      if (result.changes !== batch.length) {
         throw httpError(409, "任务状态已变更，请刷新后重试");
       }
-      distribution[scorer]++;
-    }));
+      batch.forEach((task, index) => {
+        distribution[assignmentPlan[start + index]]++;
+      });
+    }
+    await refreshProjectTaskStats(subjectId);
     await db.exec("COMMIT");
   } catch (error) {
     try {
@@ -6543,33 +7043,22 @@ async function reassignSubjectTasks(subjectId, body = {}) {
   };
 }
 
-async function assignGeneratedTasks(projectId, allocations, onProgress) {
-  const requestedTaskCount = allocations.reduce(
-    (total, allocation) => total + allocation.taskCount,
-    0,
-  );
-  if (!requestedTaskCount) {
+async function assignGeneratedTasks(projectId, selectedTasks, assigneePlan, onProgress) {
+  if (!selectedTasks.length) {
     return {
       assignedCount: 0,
       taskIds: [],
     };
   }
-
-  const pendingTasks = await selectPendingProjectTaskIdsStmt.all(projectId, taskVersion, requestedTaskCount);
-  if (requestedTaskCount > pendingTasks.length) {
-    throw httpError(400, `分配数量不能超过 ${pendingTasks.length} 个可用任务`);
+  if (selectedTasks.length !== assigneePlan.length) {
+    throw httpError(409, "待分配任务数量与人员计划不一致，请刷新后重试");
   }
-
-  const selectedTasks = pendingTasks;
-  const assigneePlan = allocations.flatMap(({ scorer, taskCount }) =>
-    Array.from({ length: taskCount }, () => scorer),
-  );
   const updatedAt = nowIso();
   const assignedTaskIds = [];
 
   for (let start = 0; start < selectedTasks.length; start += TASK_ASSIGN_BATCH_SIZE) {
     const batch = selectedTasks.slice(start, start + TASK_ASSIGN_BATCH_SIZE);
-    await db.exec("BEGIN");
+    await beginTaskWriteTransaction();
     try {
       const whenClauses = batch.map(() => "WHEN ? THEN ?");
       const taskIds = batch.map((task) => task.id);
@@ -6616,7 +7105,7 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
   try {
     for (let start = 0; start < assignedTaskIds.length; start += TASK_ASSIGN_BATCH_SIZE) {
       const batch = assignedTaskIds.slice(start, start + TASK_ASSIGN_BATCH_SIZE);
-      await db.exec("BEGIN");
+      await beginTaskWriteTransaction();
       try {
         await db.prepare(
           `UPDATE rating_tasks
@@ -6637,7 +7126,7 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
     }
     for (let start = 0; start < taskIds.length; start += TASK_WRITE_BATCH_SIZE) {
       const batch = taskIds.slice(start, start + TASK_WRITE_BATCH_SIZE);
-      await db.exec("BEGIN");
+      await beginTaskWriteTransaction();
       try {
         await db.prepare(
           `DELETE FROM rating_tasks
@@ -6681,18 +7170,26 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
     let createdCount = 0;
     let assignedCount = 0;
     const pendingBefore = (await getProjectTaskStats(projectId)).pending;
-    const templatesNeeded = Math.max(0, requestedTaskCount - pendingBefore);
+    const pendingTasks = pendingBefore
+      ? await selectPendingProjectTaskIdsStmt.all(
+        projectId,
+        taskVersion,
+        Math.min(requestedTaskCount, pendingBefore),
+      )
+      : [];
+    const templatesNeeded = Math.max(0, requestedTaskCount - pendingTasks.length);
     const templates = templatesNeeded
       ? await loadUnmaterializedProjectTaskTemplates(projectId, templatesNeeded)
       : [];
 
-    if (templates.length < templatesNeeded) {
-      const availableTaskCount = pendingBefore + templates.length;
+    if (pendingTasks.length + templates.length < requestedTaskCount) {
+      const availableTaskCount = pendingTasks.length + templates.length;
       throw httpError(400, `本次最多还能下发 ${availableTaskCount} 个任务`);
     }
 
-    const assigneePlan = assignment.allocations.flatMap(({ scorer, taskCount }) =>
-      Array.from({ length: taskCount }, () => scorer),
+    const assigneePlan = buildDimensionAwareAssignmentPlan(
+      [...templates, ...pendingTasks],
+      assignment.allocations,
     );
     const createdAssigneePlan = assigneePlan.slice(0, templates.length);
     const pendingAssigneePlan = assigneePlan.slice(templates.length);
@@ -6713,7 +7210,7 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       );
       const itemRows = taskRows.flatMap((task) => task.items);
 
-      await db.exec("BEGIN");
+      await beginTaskWriteTransaction();
       try {
         const result = await bulkInsertRatingTasks(taskRows);
         await bulkInsertRatingTaskItems(itemRows);
@@ -6736,10 +7233,10 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
 
     if (pendingAssigneePlan.length) {
       onProgress?.({ stage: "正在分配已有任务", progress: templates.length ? 75 : 70 });
-      const pendingAllocations = compressTaskAllocations(pendingAssigneePlan);
       const assignedResult = await assignGeneratedTasks(
         projectId,
-        pendingAllocations,
+        pendingTasks,
+        pendingAssigneePlan,
         (current, total) => onProgress?.({
           stage: "正在分配已有任务",
           progress: (templates.length ? 75 : 70) + (total ? Math.round((current / total) * 20) : 0),
@@ -6757,6 +7254,16 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       taskStatus: "scoring",
       updatedAt: nowIso(),
     });
+    await db.exec("BEGIN");
+    try {
+      await refreshProjectTaskStats(projectId);
+      await db.exec("COMMIT");
+    } catch (error) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
     invalidateTaskSummaryCaches(projectId);
     const updatedProject = await selectProjectByIdStmt.get(projectId);
     const taskStats = await getProjectTaskStats(projectId);
@@ -7059,10 +7566,19 @@ app.use(
 
 app.post("/api/auth/login", async (req, res, next) => {
   try {
-    const user = await loginUser(req.body);
+    const user = await loginUser(req.body, { ip: loginRequestIp(req) });
     const session = await createSession(user);
     setSessionCookie(res, session.token, session.expiresAt);
     res.json({ user });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/auth/captcha", async (_req, res, next) => {
+  try {
+    const captcha = await createLoginCaptcha();
+    res.json({ captchaId: captcha.id, image: captcha.image, expiresAt: captcha.expiresAt });
   } catch (error) {
     next(error);
   }
@@ -7072,6 +7588,15 @@ app.use("/api", requireAuth);
 
 app.get("/api/auth/session", (req, res) => {
   res.json({ user: req.auth });
+});
+
+app.post("/api/auth/change-password", async (req, res, next) => {
+  try {
+    const user = await changeOwnPassword(req.auth.id, req.body);
+    res.json({ user });
+  } catch (error) {
+    next(error);
+  }
 });
 
 app.post("/api/auth/logout", async (req, res) => {
@@ -7085,6 +7610,7 @@ app.post("/api/auth/logout", async (req, res) => {
   res.status(204).end();
 });
 
+app.use("/api", requirePasswordChanged);
 app.use("/api/admin", requireAdmin);
 app.use("/api/users", requireAdmin);
 app.use("/api/import", requireAdmin);
@@ -8246,7 +8772,7 @@ app.use((error, req, res, _next) => {
     ? "QUERY_TIMEOUT"
     : poolQueueTimedOut
       ? "QUERY_QUEUE_TIMEOUT"
-      : error.code || "REQUEST_FAILED";
+      : error.publicCode || error.code || "REQUEST_FAILED";
 
   if (error instanceof multer.MulterError) {
     status = 400;
@@ -8270,9 +8796,12 @@ if (!isTaskGenerationWorker) {
     .all();
   for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
 
-  const startupNow = nowIso();
-  await deleteExpiredSessionsStmt.run(startupNow);
-  await deleteExpiredImportJobsStmt.run(startupNow);
+const startupNow = nowIso();
+await deleteExpiredSessionsStmt.run(startupNow);
+await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
+await deleteExpiredAuthIpBlocksStmt.run(startupNow);
+await deleteExpiredCaptchaChallengesStmt.run(startupNow);
+await deleteExpiredImportJobsStmt.run(startupNow);
   await deleteExpiredTaskGenerationJobsStmt.run(startupNow);
   await sweepResumableUploadSessions();
   await db.prepare(

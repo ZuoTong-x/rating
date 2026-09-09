@@ -22,11 +22,11 @@ export const projectSelectColumns = `
   projects.deletionRequestedAt, projects.createdAt, projects.updatedAt, subjects.name AS packageName,
   subjects.originalFilename AS packageFilename, subjects.imageCount, subjects.categoryCount, subjects.status AS packageStatus`;
 export const imageSelectColumns = `id AS _id, subjectId, filename, originalPath, storagePath, thumbnailPath, mimeType, category, directory, isInfographic, prompt, catalogData, importBatch, scorer, ${scoreNumericFields.join(", ")}, ${scoreStateFields.join(", ")}, discomfort, comment, ratedAt, createdAt, updatedAt`;
-export const userSelectColumns = "id, username, role, status, lastLoginAt, createdAt, updatedAt";
+export const userSelectColumns = "id, username, role, status, mustChangePassword, lastLoginAt, createdAt, updatedAt";
 
 const defaultPoolMax = 24;
 const configuredPoolMax = Number.parseInt(process.env.PG_POOL_MAX || "", 10);
-const defaultStatementTimeout = 15000;
+const defaultStatementTimeout = 60000;
 const configuredStatementTimeout = Number.parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "", 10);
 const statementTimeout = Number.isInteger(configuredStatementTimeout) && configuredStatementTimeout > 0
   ? configuredStatementTimeout

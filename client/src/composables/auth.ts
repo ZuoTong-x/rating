@@ -41,6 +41,7 @@ const storedUser = readStoredUser();
 export const currentUser = ref<AuthUser | null>(storedUser);
 export const isLoggedIn = computed(() => Boolean(currentUser.value));
 export const isAdminUser = computed(() => currentUser.value?.role === 'admin');
+export const changePasswordModalVisible = ref(false);
 
 syncScorerName(storedUser);
 
@@ -52,8 +53,17 @@ export function setCurrentUser(user: AuthUser) {
 
 export function clearCurrentUser() {
   currentUser.value = null;
+  changePasswordModalVisible.value = false;
   persistUser(null);
   syncScorerName(null);
+}
+
+export function openChangePasswordModal() {
+  changePasswordModalVisible.value = true;
+}
+
+export function closeChangePasswordModal() {
+  changePasswordModalVisible.value = false;
 }
 
 export function defaultRouteForUser(user: AuthUser | null) {

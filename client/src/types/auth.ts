@@ -16,6 +16,7 @@ export interface AuthUser {
   username: string;
   role: UserRole;
   status: AvailabilityStatus;
+  mustChangePassword?: boolean;
   disabledByTeam?: boolean;
   teams?: AccountTeam[];
   lastLoginAt?: string | null;

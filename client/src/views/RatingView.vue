@@ -16,8 +16,7 @@ const taskListState = ref<'loading' | 'ready' | 'stale' | 'unavailable'>('loadin
 const taskStatsState = ref<'loading' | 'ready' | 'stale' | 'unavailable'>('loading');
 const taskPage = ref(1);
 const taskPageSize = ref(5);
-const taskHasMore = ref(false);
-const taskPageCursors = new Map<number, string>();
+const taskTotal = ref(0);
 const activeTask = ref<RatingTask | null>(null);
 const rankingVisible = ref(false);
 const openingTaskId = ref<string | null>(null);
@@ -28,7 +27,6 @@ const taskStats = ref<Pick<ScorerDashboard, 'pendingTasks' | 'completedTasks' | 
   totalTasks: 0,
   projectCount: 0
 });
-const taskTotal = computed(() => taskStats.value.totalTasks);
 const taskStatsRefreshMinIntervalMs = 10_000;
 let taskStatsRefreshTimer: number | null = null;
 let taskStatsLoadPromise: Promise<void> | null = null;
@@ -81,7 +79,6 @@ function changePage(page: number) {
 }
 
 function changePageSize(pageSize: number) {
-  taskPageCursors.clear();
   void loadTasks(1, pageSize);
 }
 
@@ -114,9 +111,6 @@ function scheduleTaskStatsRefresh(force = false) {
 async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
   const scorer = currentUser.value?.username;
   if (!scorer) return;
-  if (page === 1) taskPageCursors.clear();
-  const cursor = page > 1 ? taskPageCursors.get(page - 1) : null;
-  if (page > 1 && !cursor) page = 1;
   loading.value = true;
   taskListState.value = tasks.value.length ? 'stale' : 'loading';
   try {
@@ -124,13 +118,11 @@ async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
       scorer,
       page,
       pageSize,
-      cursor,
+      includeTotal: true,
       ...taskFilters
     });
     tasks.value = result.tasks;
-    if (result.nextCursor) taskPageCursors.set(page, result.nextCursor);
-    else taskPageCursors.delete(page);
-    taskHasMore.value = result.hasMore;
+    taskTotal.value = result.total ?? 0;
     taskPage.value = result.page;
     taskPageSize.value = result.pageSize;
     taskListState.value = 'ready';
@@ -326,7 +318,6 @@ function scheduleTaskLoad() {
   if (taskLoadTimer != null) window.clearTimeout(taskLoadTimer);
   taskLoadTimer = window.setTimeout(() => {
     taskLoadTimer = null;
-    taskPageCursors.clear();
     void loadTasks(1, taskPageSize.value);
   }, 150);
 }
@@ -424,8 +415,8 @@ onBeforeUnmount(() => {
         <div v-else class="empty">暂无任务</div>
       </div>
       <div class="scorer-task-table-footer">
-        <n-pagination v-if="tasks.length || taskHasMore" :page="taskPage" :page-size="taskPageSize"
-          :page-count="taskPage + (taskHasMore ? 1 : 0)" show-size-picker
+        <n-pagination v-if="taskTotal > 0" :page="taskPage" :page-size="taskPageSize"
+          :page-count="Math.ceil(taskTotal / taskPageSize)" show-size-picker
           :page-sizes="[5, 10, 20, 50]" @update:page="changePage"
           @update:page-size="changePageSize" />
       </div>

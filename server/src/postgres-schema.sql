@@ -4,10 +4,19 @@ create table if not exists users (
     password text not null,
     role text not null check (role in ('admin', 'scorer')),
     status text not null default 'enabled' check (status in ('enabled', 'disabled')),
+    mustchangepassword boolean not null default true,
+    failedloginattempts integer not null default 0,
+    failedloginwindowstart timestamptz,
+    lockeduntil timestamptz,
     lastloginat timestamptz,
     createdat timestamptz not null,
     updatedat timestamptz not null
   );
+
+alter table users add column if not exists mustchangepassword boolean not null default true;
+alter table users add column if not exists failedloginattempts integer not null default 0;
+alter table users add column if not exists failedloginwindowstart timestamptz;
+alter table users add column if not exists lockeduntil timestamptz;
 
 create table if not exists user_sessions (
     tokenhash text primary key,
@@ -34,6 +43,28 @@ create table if not exists import_jobs (
     createdat timestamptz not null,
     updatedat timestamptz not null,
     expiresat timestamptz not null
+  );
+
+create table if not exists auth_login_attempts (
+    id text primary key,
+    username text not null,
+    ip text not null,
+    succeeded boolean not null default false,
+    createdat timestamptz not null
+  );
+
+create table if not exists auth_ip_blocks (
+    ip text primary key,
+    lockeduntil timestamptz not null,
+    updatedat timestamptz not null
+  );
+
+create table if not exists auth_captcha_challenges (
+    id text primary key,
+    answerhash text not null,
+    expiresat timestamptz not null,
+    usedat timestamptz,
+    createdat timestamptz not null
   );
 
 alter table import_jobs
@@ -367,6 +398,13 @@ create index if not exists idx_images_ratedat on images(ratedat);
 create index if not exists idx_users_role_username on users(role, username);
 create index if not exists idx_users_role_lastloginat on users(role, lastloginat);
 create index if not exists idx_user_sessions_expiresat on user_sessions(expiresat);
+create index if not exists idx_auth_login_attempts_username_created
+    on auth_login_attempts(username, createdat desc);
+create index if not exists idx_auth_login_attempts_ip_created
+    on auth_login_attempts(ip, createdat desc);
+create index if not exists idx_auth_ip_blocks_lockeduntil on auth_ip_blocks(lockeduntil);
+create index if not exists idx_auth_captcha_challenges_expiresat
+    on auth_captcha_challenges(expiresat);
 create index if not exists idx_import_jobs_expiresat on import_jobs(expiresat);
 create index if not exists idx_task_generation_jobs_subject_status
     on task_generation_jobs(subjectid, status, updatedat desc);
@@ -443,6 +481,13 @@ create unique index if not exists idx_projects_active_name_ci on projects(lower(
 -- Keep the denormalized dashboard counters in sync with rating_tasks.
 create or replace function sync_rating_task_stats() returns trigger language plpgsql as $$
 begin
+  -- Bulk task jobs rebuild the counters once after their write batches. Keep
+  -- the trigger enabled for normal scoring requests and other task updates.
+  if coalesce(current_setting('app.skip_rating_task_stats', true), 'off') = 'on' then
+    if tg_op = 'DELETE' then return old; end if;
+    return new;
+  end if;
+
   if tg_op in ('DELETE', 'UPDATE') and old.projectid is not null then
     update project_task_stats
        set total = greatest(0, total - 1),

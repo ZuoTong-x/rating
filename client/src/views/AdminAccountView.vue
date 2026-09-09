@@ -14,7 +14,9 @@ const createVisible = ref(false);
 const batchCreating = ref(false);
 const batchVisible = ref(false);
 const editVisible = ref(false);
+const passwordVisible = ref(false);
 const editingUser = ref<AuthUser | null>(null);
+const passwordUser = ref<AuthUser | null>(null);
 const users = ref<AuthUser[]>([]);
 const teamOptions = ref<Array<{ label: string; value: string }>>([]);
 const teamFilterOptions = ref<Array<{ label: string; value: string }>>([]);
@@ -37,8 +39,10 @@ const batchForm = reactive({
   teamName: null as string | null
 });
 const editForm = reactive({
-  password: '',
   teamNames: [] as string[]
+});
+const passwordForm = reactive({
+  newPassword: ''
 });
 
 function errorMessage(error: unknown) {
@@ -150,9 +154,56 @@ function openBatchModal() {
 
 function openEditModal(user: AuthUser) {
   editingUser.value = user;
-  editForm.password = '';
   editForm.teamNames = (user.teams || []).map(team => team.name);
   editVisible.value = true;
+}
+
+function openPasswordModal(user: AuthUser) {
+  passwordUser.value = user;
+  passwordForm.newPassword = '';
+  passwordVisible.value = true;
+}
+
+function strongPassword(value: string) {
+  return value.length >= 8 && value.length <= 100
+    && /[a-z]/.test(value)
+    && /[A-Z]/.test(value)
+    && /[^A-Za-z0-9]/.test(value);
+}
+
+function randomIndex(maxExclusive: number) {
+  const values = new Uint32Array(1);
+  const limit = Math.floor(0x100000000 / maxExclusive) * maxExclusive;
+  do {
+    window.crypto.getRandomValues(values);
+  } while (values[0] >= limit);
+  return values[0] % maxExclusive;
+}
+
+function randomCharacter(characters: string) {
+  return characters[randomIndex(characters.length)];
+}
+
+function shuffleCharacters(characters: string[]) {
+  for (let index = characters.length - 1; index > 0; index -= 1) {
+    const swapIndex = randomIndex(index + 1);
+    [characters[index], characters[swapIndex]] = [characters[swapIndex], characters[index]];
+  }
+  return characters.join('');
+}
+
+function generateRandomPassword() {
+  const groups = [
+    'ABCDEFGHIJKLMNOPQRSTUVWXYZ',
+    'abcdefghijklmnopqrstuvwxyz',
+    '0123456789',
+    '!@#$%^&*_-+=?'
+  ];
+  const allCharacters = groups.join('');
+  const characters = groups.map(group => randomCharacter(group));
+  while (characters.length < 16) characters.push(randomCharacter(allCharacters));
+  passwordForm.newPassword = shuffleCharacters(characters);
+  message.success('已生成 16 位随机密码，可点击输入框右侧图标查看');
 }
 
 async function createUser() {
@@ -161,9 +212,13 @@ async function createUser() {
     message.error('请输入打分人');
     return;
   }
+  if (!createForm.password) {
+    message.error('请输入符合规则的密码');
+    return;
+  }
   creating.value = true;
   try {
-    const result = await authApi.createScorerUser(username, createForm.password.trim() || undefined, createForm.teamNames);
+    const result = await authApi.createScorerUser(username, createForm.password || undefined, createForm.teamNames);
     createVisible.value = false;
     message.success(`已创建“${result.user.username}”`);
     await Promise.all([loadUsers(1, userPageSize.value), loadTeamOptions()]);
@@ -179,11 +234,15 @@ async function createUsersInBatch() {
     message.error('请先粘贴或输入至少一个打分人');
     return;
   }
+  if (!batchForm.password) {
+    message.error('请输入符合规则的统一密码');
+    return;
+  }
   batchCreating.value = true;
   try {
     const result = await authApi.createScorerUsers({
       usernames: batchForm.usernames,
-      password: batchForm.password.trim() || undefined,
+      password: batchForm.password || undefined,
       teamNames: batchForm.teamName ? [batchForm.teamName] : []
     });
     batchVisible.value = false;
@@ -205,12 +264,35 @@ async function updateUser() {
   creating.value = true;
   try {
     const result = await authApi.updateScorerUser(user.id, {
-      password: editForm.password.trim() || undefined,
       teamNames: editForm.teamNames
     });
     editVisible.value = false;
     message.success(`已更新“${result.user.username}”`);
     await Promise.all([loadUsers(userPage.value, userPageSize.value), loadTeamOptions()]);
+  } catch (error) {
+    message.error(errorMessage(error));
+  } finally {
+    creating.value = false;
+  }
+}
+
+async function updatePassword() {
+  const user = passwordUser.value;
+  if (!user) return;
+  if (!passwordForm.newPassword) {
+    message.error('请输入新密码');
+    return;
+  }
+  if (!strongPassword(passwordForm.newPassword)) {
+    message.error('密码至少 8 位，并包含大写字母、小写字母和特殊字符');
+    return;
+  }
+  creating.value = true;
+  try {
+    await authApi.updateScorerUser(user.id, { password: passwordForm.newPassword });
+    passwordVisible.value = false;
+    message.success(`已更新“${user.username}”的密码，下次登录需修改密码`);
+    await loadUsers(userPage.value, userPageSize.value);
   } catch (error) {
     message.error(errorMessage(error));
   } finally {
@@ -281,6 +363,15 @@ const columns: DataTableColumns<AuthUser> = [
     render: row => h(NTag, { size: 'small', type: accountStatusType(row) }, { default: () => accountStatusLabel(row) })
   },
   {
+    title: '密码状态',
+    key: 'passwordStatus',
+    width: 130,
+    render: row => h(NTag, {
+      size: 'small',
+      type: row.mustChangePassword ? 'warning' : 'success'
+    }, { default: () => row.mustChangePassword ? '待首次修改' : '已设置' })
+  },
+  {
     title: '角色',
     key: 'role',
     width: 160,
@@ -291,7 +382,7 @@ const columns: DataTableColumns<AuthUser> = [
   {
     title: '操作',
     key: 'actions',
-    width: 180,
+    width: 300,
     fixed: 'right',
     render: row => h('div', { class: 'table-actions' }, [
       h(NButton, {
@@ -299,6 +390,11 @@ const columns: DataTableColumns<AuthUser> = [
         secondary: true,
         onClick: () => openEditModal(row)
       }, { default: () => '编辑' }),
+      h(NButton, {
+        size: 'small',
+        secondary: true,
+        onClick: () => openPasswordModal(row)
+      }, { default: () => '密码管理' }),
       h(NButton, {
         size: 'small',
         tertiary: true,
@@ -346,7 +442,7 @@ onMounted(() => void initialize());
       </div>
       <div class="account-table-body">
         <n-data-table v-if="users.length" class="account-data-table" :columns="columns" :data="users" :loading="loading"
-          :bordered="false" remote :scroll-x="860" />
+          :bordered="false" remote :scroll-x="1110" />
         <div v-else class="empty">{{ loading ? '正在加载...' : (hasFilters ? '没有符合条件的账号' : '暂无打分账号') }}</div>
       </div>
       <div class="account-table-footer">
@@ -367,7 +463,7 @@ onMounted(() => void initialize());
             type="password"
             show-password-on="click"
             maxlength="100"
-            placeholder="不输入默认 123456"
+            placeholder="至少 8 位，含大小写字母和特殊字符"
           />
         </n-form-item>
         <n-form-item label="统一所属团队">
@@ -400,7 +496,7 @@ onMounted(() => void initialize());
             type="password"
             show-password-on="click"
             maxlength="100"
-            placeholder="不输入默认 123456"
+            placeholder="至少 8 位，含大小写字母和特殊字符"
             @keyup.enter="createUser"
           />
         </n-form-item>
@@ -420,10 +516,6 @@ onMounted(() => void initialize());
         <n-form-item label="打分人">
           <n-input :value="editingUser?.username || ''" disabled />
         </n-form-item>
-        <n-form-item label="重置密码">
-          <n-input v-model:value="editForm.password" type="password" show-password-on="click" maxlength="100"
-            placeholder="留空则不修改密码" @keyup.enter="updateUser" />
-        </n-form-item>
         <n-form-item label="所属团队">
           <n-select v-model:value="editForm.teamNames" multiple filterable tag clearable :options="teamOptions"
             placeholder="选择或输入团队名称" />
@@ -432,6 +524,34 @@ onMounted(() => void initialize());
       <n-space justify="end">
         <n-button @click="editVisible = false">取消</n-button>
         <n-button type="primary" :loading="creating" @click="updateUser">保存</n-button>
+      </n-space>
+    </n-modal>
+
+    <n-modal v-model:show="passwordVisible" preset="card" class="account-password-modal" title="密码管理" :bordered="false">
+      <n-alert type="info" :bordered="false" class="account-password-notice">
+        系统只保存密码哈希，无法查看旧密码明文。你可以在这里查看密码状态并设置新密码。
+      </n-alert>
+      <n-form label-placement="top">
+        <n-form-item label="打分人">
+          <n-input :value="passwordUser?.username || ''" readonly />
+        </n-form-item>
+        <n-form-item label="当前密码状态">
+          <n-tag :type="passwordUser?.mustChangePassword ? 'warning' : 'success'">
+            {{ passwordUser?.mustChangePassword ? '待首次修改' : '已设置' }}
+          </n-tag>
+        </n-form-item>
+        <n-form-item label="设置新密码">
+          <div class="account-password-input-row">
+            <n-input v-model:value="passwordForm.newPassword" type="password" show-password-on="click"
+              maxlength="100" placeholder="至少 8 位，含大小写字母和特殊字符" @keyup.enter="updatePassword" />
+            <n-button secondary @click="generateRandomPassword">生成随机密码</n-button>
+          </div>
+        </n-form-item>
+      </n-form>
+      <n-text depth="3">重置后，该打分人下次登录必须修改密码。</n-text>
+      <n-space justify="end" class="account-password-actions">
+        <n-button @click="passwordVisible = false">取消</n-button>
+        <n-button type="primary" :loading="creating" @click="updatePassword">保存新密码</n-button>
       </n-space>
     </n-modal>
   </div>

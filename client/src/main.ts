@@ -68,6 +68,7 @@ async function bootstrap() {
   try {
     const { user } = await authApi.session();
     setCurrentUser(user);
+    if (user.mustChangePassword) await router.replace(defaultRouteForUser(user));
   } catch {
     clearCurrentUser();
   }

@@ -2,6 +2,7 @@
 import { computed } from 'vue';
 import { darkTheme, type GlobalThemeOverrides } from 'naive-ui';
 import { useAppTheme } from '../composables/theme';
+import ChangePasswordModal from '../components/ChangePasswordModal.vue';
 
 const { isDark } = useAppTheme();
 const naiveTheme = computed(() => isDark.value ? darkTheme : null);
@@ -47,6 +48,7 @@ const naiveThemeOverrides = computed<GlobalThemeOverrides | undefined>(() => isD
         <n-layout class="app">
           <router-view />
         </n-layout>
+        <ChangePasswordModal />
       </n-dialog-provider>
     </n-message-provider>
   </n-config-provider>
