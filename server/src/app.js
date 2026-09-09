@@ -114,6 +114,14 @@ const imageImportConcurrency = Math.min(
   16,
   Math.max(1, Math.floor(positiveLimit("IMAGE_IMPORT_CONCURRENCY", 4))),
 );
+const importDbBatchSize = Math.min(
+  4000,
+  Math.max(100, Math.floor(positiveLimit("IMPORT_DB_BATCH_SIZE", 1000))),
+);
+const importDbItemBatchSize = Math.min(
+  10000,
+  Math.max(500, Math.floor(positiveLimit("IMPORT_DB_ITEM_BATCH_SIZE", 5000))),
+);
 
 const upload = multer({
   dest: zipUploadDir,
@@ -1094,17 +1102,6 @@ const insertRatingTaskItemStmt = db.prepare(`
   VALUES (@taskId, @imageId, @position, @role)
   ON CONFLICT DO NOTHING
 `);
-const insertSubjectTaskTemplateStmt = db.prepare(`
-  INSERT INTO subject_task_templates (
-    id, subjectId, sourceTaskId, round, criterion, imageKey, selectionKey, createdAt
-  ) VALUES (
-    @id, @subjectId, @sourceTaskId, @round, @criterion, @imageKey, @selectionKey, @createdAt
-  )
-`);
-const insertSubjectTaskTemplateItemStmt = db.prepare(`
-  INSERT INTO subject_task_template_items (templateId, imageId, position, role)
-  VALUES (@templateId, @imageId, @position, @role)
-`);
 const selectSubjectTaskTemplatesStmt = db.prepare(`
   SELECT id, subjectId, sourceTaskId, round, criterion, imageKey, selectionKey
   FROM subject_task_templates
@@ -1224,20 +1221,6 @@ const selectSubjectStoragePathsStmt = db.prepare(
 const deleteQueuedSubjectStmt = db.prepare(
   "DELETE FROM subjects WHERE id = ? AND deletionRequestedAt IS NOT NULL",
 );
-const insertImageStmt = db.prepare(`
-  INSERT INTO images (
-    id, subjectId, filename, originalPath, storagePath, thumbnailPath, mimeType, category, directory, isInfographic, prompt, catalogData, importBatch,
-    overall, creativity, mood, composition, color, lighting, realism, detail, discomfort,
-    promptAlignment, textCorrectness, anatomyNormality, informationClarity, designQuality, typography,
-    comment, ratedAt, createdAt, updatedAt
-  ) VALUES (
-    @id, @subjectId, @filename, @originalPath, @storagePath, @thumbnailPath, @mimeType, @category, @directory, @isInfographic, @prompt, @catalogData, @importBatch,
-    NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, NULL, NULL, NULL, NULL,
-    NULL, NULL, @createdAt, @updatedAt
-  )
-  ON CONFLICT DO NOTHING
-`);
 const updateImageScoreStmt = db.prepare(`
   UPDATE images
   SET overall = @overall,
@@ -1589,6 +1572,29 @@ function resolveTaskImage(imageReferenceIndex, reference) {
   return imageReferenceIndex.filenameIndex.get(normalizedFilename);
 }
 
+function buildArchiveImageReferenceRecords(imageEntries) {
+  const records = [];
+  const seenPaths = new Set();
+  for (const entry of imageEntries) {
+    const relative = cleanRelative(decodeZipEntryPath(entry));
+    if (
+      !relative ||
+      isMacMetadataEntry(relative) ||
+      !imageExts.has(path.extname(relative).toLowerCase()) ||
+      seenPaths.has(relative)
+    ) {
+      continue;
+    }
+    seenPaths.add(relative);
+    records.push({
+      id: relative,
+      filename: path.posix.basename(relative),
+      originalPath: relative,
+    });
+  }
+  return records;
+}
+
 function taskItemRole(value) {
   const role = String(value?.role ?? "target");
   if (!taskTemplateRoles.has(role)) {
@@ -1597,8 +1603,8 @@ function taskItemRole(value) {
   return role;
 }
 
-function buildTaskTemplateRecords(subjectId, taskManifest, imageRecords, createdAt) {
-  if (!taskManifest) return [];
+function validateTaskManifest(taskManifest, imageRecords) {
+  if (!taskManifest) return { validatedTasks: [], failedTasks: [] };
   if (!taskManifest.tasks.length) {
     throw archiveImportError(422, "tasks.json does not contain any tasks");
   }
@@ -1608,66 +1614,61 @@ function buildTaskTemplateRecords(subjectId, taskManifest, imageRecords, created
   const taskKeys = new Set();
   const failedTasks = [];
 
-  const taskTemplates = taskManifest.tasks.map((rawTask, index) => {
+  const validatedTasks = taskManifest.tasks.map((rawTask, index) => {
     try {
-    if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask)) {
-      throw archiveImportError(422, `tasks[${index}] must be an object`);
-    }
-
-    const sourceTaskId = String(rawTask.id ?? `task-${index + 1}`).trim();
-    if (!sourceTaskId || sourceTaskId.length > 160 || sourceTaskIds.has(sourceTaskId)) {
-      throw archiveImportError(422, `tasks[${index}] has an invalid or duplicate id`);
-    }
-    sourceTaskIds.add(sourceTaskId);
-
-    const criterion = String(rawTask.criterion ?? "").trim();
-    if (!taskCriteria.includes(criterion)) {
-      throw archiveImportError(422, `tasks[${index}].criterion is not supported`);
-    }
-
-    if (!Array.isArray(rawTask.images) || rawTask.images.length < 1 || rawTask.images.length > 5) {
-      throw archiveImportError(422, `tasks[${index}].images must contain 1 to 5 images`);
-    }
-
-    const usedImageIds = new Set();
-    const items = rawTask.images.map((rawItem, itemIndex) => {
-      const reference = String(taskImageReference(rawItem) ?? "").trim();
-      const image = resolveTaskImage(imageReferenceIndex, reference);
-      if (!image) {
-        const label = reference || `images[${itemIndex}]`;
-        throw archiveImportError(
-          422,
-          `tasks[${index}] references an unknown or ambiguous image: ${label}`,
-        );
+      if (!rawTask || typeof rawTask !== "object" || Array.isArray(rawTask)) {
+        throw archiveImportError(422, `tasks[${index}] must be an object`);
       }
-      if (usedImageIds.has(image.id)) {
-        throw archiveImportError(422, `tasks[${index}] contains the same image more than once`);
+
+      const sourceTaskId = String(rawTask.id ?? `task-${index + 1}`).trim();
+      if (!sourceTaskId || sourceTaskId.length > 160 || sourceTaskIds.has(sourceTaskId)) {
+        throw archiveImportError(422, `tasks[${index}] has an invalid or duplicate id`);
       }
-      usedImageIds.add(image.id);
-      return {
-        imageId: image.id,
-        position: itemIndex,
-        role: taskItemRole(rawItem),
-      };
-    });
+      sourceTaskIds.add(sourceTaskId);
 
-    const imageKey = items.map((item) => item.imageId).sort().join("|");
-    const taskKey = `${criterion}|${imageKey}`;
-    if (taskKeys.has(taskKey)) {
-      throw archiveImportError(422, `tasks[${index}] duplicates another task group`);
-    }
-    taskKeys.add(taskKey);
+      const criterion = String(rawTask.criterion ?? "").trim();
+      if (!taskCriteria.includes(criterion)) {
+        throw archiveImportError(422, `tasks[${index}].criterion is not supported`);
+      }
+
+      if (!Array.isArray(rawTask.images) || rawTask.images.length < 1 || rawTask.images.length > 5) {
+        throw archiveImportError(422, `tasks[${index}].images must contain 1 to 5 images`);
+      }
+
+      const usedImageIds = new Set();
+      const items = rawTask.images.map((rawItem, itemIndex) => {
+        const reference = String(taskImageReference(rawItem) ?? "").trim();
+        const image = resolveTaskImage(imageReferenceIndex, reference);
+        if (!image) {
+          const label = reference || `images[${itemIndex}]`;
+          throw archiveImportError(
+            422,
+            `tasks[${index}] references an unknown or ambiguous image: ${label}`,
+          );
+        }
+        if (usedImageIds.has(image.id)) {
+          throw archiveImportError(422, `tasks[${index}] contains the same image more than once`);
+        }
+        usedImageIds.add(image.id);
+        return {
+          image,
+          position: itemIndex,
+          role: taskItemRole(rawItem),
+        };
+      });
+
+      const imageKey = items.map((item) => item.image.id).sort().join("|");
+      const taskKey = `${criterion}|${imageKey}`;
+      if (taskKeys.has(taskKey)) {
+        throw archiveImportError(422, `tasks[${index}] duplicates another task group`);
+      }
+      taskKeys.add(taskKey);
 
       return {
-      id: crypto.randomUUID(),
-      subjectId,
-      sourceTaskId,
-      round: 1,
-      criterion,
-      imageKey,
-      selectionKey: crypto.randomInt(1, 2147483647),
-      createdAt,
-      items,
+        sourceTaskId,
+        criterion,
+        imageKey,
+        items,
       };
     } catch (error) {
       const sourceTaskId = rawTask?.id ?? `task-${index + 1}`;
@@ -1682,7 +1683,42 @@ function buildTaskTemplateRecords(subjectId, taskManifest, imageRecords, created
     }
   }).filter(Boolean);
 
-  return { taskTemplates, failedTasks };
+  return { validatedTasks, failedTasks };
+}
+
+function buildTaskTemplateRecords(subjectId, taskManifest, imageRecords, createdAt) {
+  const validation = validateTaskManifest(taskManifest, imageRecords);
+  if (!taskManifest) return { taskTemplates: [], failedTasks: [] };
+  const taskTemplates = validation.validatedTasks.map((task) => ({
+    id: crypto.randomUUID(),
+    subjectId,
+    sourceTaskId: task.sourceTaskId,
+    round: 1,
+    criterion: task.criterion,
+    imageKey: task.imageKey,
+    selectionKey: crypto.randomInt(1, 2147483647),
+    createdAt,
+    items: task.items.map((item) => ({
+      imageId: item.image.id,
+      position: item.position,
+      role: item.role,
+    })),
+  }));
+
+  return {
+    taskTemplates,
+    failedTasks: validation.failedTasks,
+  };
+}
+
+function assertTaskManifestValid(failedTasks) {
+  if (!failedTasks.length) return;
+  const taskError = archiveImportError(
+    422,
+    `tasks.json 中有 ${failedTasks.length} 条任务校验失败，首条错误：${failedTasks[0].message}；请修正后补充上传`,
+  );
+  taskError.taskFailures = failedTasks;
+  throw taskError;
 }
 
 function catalogPrompt(entry) {
@@ -2268,6 +2304,16 @@ async function importZipArchive(
     } catch (error) {
       throw markSupplementableJsonError(error);
     }
+    try {
+      // Validate task references against the ZIP directory before extracting
+      // images. Invalid JSON should not spend time writing images or thumbnails.
+      const archiveImageRecords = buildArchiveImageReferenceRecords(imageEntries);
+      const validation = validateTaskManifest(archiveTaskManifest, archiveImageRecords);
+      assertTaskManifestValid(validation.failedTasks);
+    } catch (error) {
+      throw markSupplementableJsonError(error);
+    }
+    await onProgress?.({ stage: "正在校验 JSON", progress: 5, current: 1, total: 1 });
     const catalogIndex = await loadImageCatalogIndex(archiveManifests);
     const storageRoot = await allocateSubjectStorageRoot(
       subjectName,
@@ -2388,6 +2434,8 @@ async function importZipArchive(
         imported++;
       }
       await onProgress?.({
+        stage: "正在解压图片并生成缩略图",
+        progress: 5 + Math.round((Math.min(start + imageImportConcurrency, imageEntries.length) / imageEntries.length) * 80),
         current: Math.min(start + imageImportConcurrency, imageEntries.length),
         total: imageEntries.length,
       });
@@ -2409,14 +2457,12 @@ async function importZipArchive(
       throw markSupplementableJsonError(error);
     }
     const { taskTemplates, failedTasks } = taskTemplateResult;
-    if (failedTasks.length) {
-      const taskError = archiveImportError(
-        422,
-        `tasks.json 中有 ${failedTasks.length} 条任务校验失败，首条错误：${failedTasks[0].message}；请修正后补充上传`,
-      );
-      taskError.taskFailures = failedTasks;
-      throw markSupplementableJsonError(taskError);
+    try {
+      assertTaskManifestValid(failedTasks);
+    } catch (error) {
+      throw markSupplementableJsonError(error);
     }
+    await onProgress?.({ stage: "正在准备数据库写入", progress: 90, current: 1, total: 1 });
 
     // All archive I/O and image validation has completed before this write
     // transaction. Keep read indexes in place so imports do not rebuild the
@@ -2433,25 +2479,11 @@ async function importZipArchive(
       createdAt,
       updatedAt: createdAt,
     });
-    for (const imageRecord of imageRecords) {
-      const result = await insertImageStmt.run(imageRecord);
-      if (result.changes === 0) {
-        throw archiveImportError(
-          409,
-          `图片“${imageRecord.originalPath}”重复，无法导入`,
-        );
-      }
-    }
-    for (const taskTemplate of taskTemplates) {
-      const { items: _items, ...templateRecord } = taskTemplate;
-      await insertSubjectTaskTemplateStmt.run(templateRecord);
-      for (const item of taskTemplate.items) {
-        await insertSubjectTaskTemplateItemStmt.run({
-          templateId: taskTemplate.id,
-          ...item,
-        });
-      }
-    }
+    await bulkInsertImageRecords(imageRecords);
+    await onProgress?.({ stage: "正在写入图片数据", progress: 95, current: imageRecords.length, total: imageRecords.length });
+    await bulkInsertSubjectTaskTemplates(taskTemplates);
+    await bulkInsertSubjectTaskTemplateItems(taskTemplates);
+    await onProgress?.({ stage: "正在写入任务模板", progress: 98, current: taskTemplates.length, total: taskTemplates.length });
 
     const updatedAt = nowIso();
     await updateSubjectCountsStmt.run({
@@ -2510,8 +2542,11 @@ async function runResumableImportJob(job) {
 
     job.result = await importZipArchive(job.zipPath, job.originalFilename, {
       removeSource: false,
-      onProgress: async ({ current, total }) => {
-        job.progress = Math.min(99, Math.round((current / total) * 100));
+      onProgress: async ({ stage, progress, current, total }) => {
+        if (stage) job.stage = stage;
+        job.progress = Number.isFinite(progress)
+          ? Math.min(99, Math.max(0, Math.round(progress)))
+          : Math.min(99, Math.round((current / total) * 100));
         if (job.progress !== job.lastPersistedProgress) {
           job.lastPersistedProgress = job.progress;
           await persistImportJob(job);
@@ -2688,8 +2723,12 @@ async function runChunkedImportJob(job) {
     await persistImportJob(job);
     job.result = await importZipArchive(job.zipPath, job.originalFilename, {
       removeSource: false,
-      onProgress: async ({ current, total }) => {
-        job.progress = Math.min(99, 15 + Math.round((current / total) * 84));
+      onProgress: async ({ stage, progress, current, total }) => {
+        if (stage) job.stage = stage;
+        const importProgress = Number.isFinite(progress)
+          ? progress
+          : Math.round((current / total) * 100);
+        job.progress = Math.min(99, 15 + Math.round((importProgress / 100) * 84));
         if (job.progress !== job.lastPersistedProgress) {
           job.lastPersistedProgress = job.progress;
           await persistImportJob(job);
@@ -2757,8 +2796,11 @@ async function runSupplementalJsonImportJob(job, supplementalZipPath) {
     job.result = await importZipArchive(job.zipPath, job.originalFilename, {
       removeSource: false,
       supplementalJson,
-      onProgress: async ({ current, total }) => {
-        job.progress = Math.min(99, Math.round((current / total) * 100));
+      onProgress: async ({ stage, progress, current, total }) => {
+        if (stage) job.stage = stage;
+        job.progress = Number.isFinite(progress)
+          ? Math.min(99, Math.max(0, Math.round(progress)))
+          : Math.min(99, Math.round((current / total) * 100));
         if (job.progress !== job.lastPersistedProgress) {
           job.lastPersistedProgress = job.progress;
           await persistImportJob(job);
@@ -2799,6 +2841,90 @@ async function runSupplementalJsonImportJob(job, supplementalZipPath) {
       },
       24 * 60 * 60 * 1000,
     ).unref();
+  }
+}
+
+async function bulkInsertImageRecords(imageRows) {
+  for (let start = 0; start < imageRows.length; start += importDbBatchSize) {
+    const batch = imageRows.slice(start, start + importDbBatchSize);
+    const sql = `
+      INSERT INTO images (
+        id, subjectId, filename, originalPath, storagePath, thumbnailPath, mimeType,
+        category, directory, isInfographic, prompt, catalogData, importBatch,
+        createdAt, updatedAt
+      ) VALUES ${batch.map(() => `(${placeholders(15)})`).join(", ")}
+      ON CONFLICT DO NOTHING
+    `;
+    const params = [];
+    batch.forEach((row) => {
+      params.push(
+        row.id,
+        row.subjectId,
+        row.filename,
+        row.originalPath,
+        row.storagePath,
+        row.thumbnailPath,
+        row.mimeType,
+        row.category,
+        row.directory,
+        row.isInfographic,
+        row.prompt,
+        row.catalogData,
+        row.importBatch,
+        row.createdAt,
+        row.updatedAt,
+      );
+    });
+    const result = await db.prepare(sql).run(...params);
+    if (result.changes !== batch.length) {
+      throw archiveImportError(409, "图片记录重复，无法导入");
+    }
+  }
+}
+
+async function bulkInsertSubjectTaskTemplates(taskTemplates) {
+  for (let start = 0; start < taskTemplates.length; start += importDbBatchSize) {
+    const batch = taskTemplates.slice(start, start + importDbBatchSize);
+    const sql = `
+      INSERT INTO subject_task_templates (
+        id, subjectId, sourceTaskId, round, criterion, imageKey, selectionKey, createdAt
+      ) VALUES ${batch.map(() => `(${placeholders(8)})`).join(", ")}
+    `;
+    const params = [];
+    batch.forEach((row) => {
+      params.push(
+        row.id,
+        row.subjectId,
+        row.sourceTaskId,
+        row.round,
+        row.criterion,
+        row.imageKey,
+        row.selectionKey,
+        row.createdAt,
+      );
+    });
+    await db.prepare(sql).run(...params);
+  }
+}
+
+async function bulkInsertSubjectTaskTemplateItems(taskTemplates) {
+  const itemRows = taskTemplates.flatMap((template) =>
+    template.items.map((item) => ({
+      templateId: template.id,
+      ...item,
+    })),
+  );
+  for (let start = 0; start < itemRows.length; start += importDbItemBatchSize) {
+    const batch = itemRows.slice(start, start + importDbItemBatchSize);
+    const sql = `
+      INSERT INTO subject_task_template_items (templateId, imageId, position, role)
+      VALUES ${batch.map(() => "(?, ?, ?, ?)").join(", ")}
+    `;
+    const params = [];
+    batch.forEach((row) => {
+      params.push(row.templateId, row.imageId, row.position, row.role);
+    });
+    await db.prepare(sql).run(...params);
   }
 }
 
