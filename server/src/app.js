@@ -280,10 +280,6 @@ const sessionDurationMs = 7 * 24 * 60 * 60 * 1000;
 const authFailureWindowMs = 15 * 60 * 1000;
 const authAccountFailureLimit = 5;
 const authAccountLockMs = 10 * 60 * 1000;
-const authIpWindowMs = 10 * 60 * 1000;
-const authIpLockMs = 10 * 60 * 1000;
-const authIpFailedAttemptLimit = 10;
-const authIpDistinctUsernameLimit = 3;
 const authCaptchaTtlMs = 5 * 60 * 1000;
 const authCaptchaSecret = process.env.AUTH_CAPTCHA_SECRET || crypto.randomBytes(32).toString("hex");
 
@@ -855,23 +851,6 @@ const insertAuthLoginAttemptStmt = db.prepare(`
   INSERT INTO auth_login_attempts (id, username, ip, succeeded, createdAt)
   VALUES (@id, @username, @ip, @succeeded, @createdAt)
 `);
-const selectAuthIpBlockStmt = db.prepare(
-  "SELECT ip, lockedUntil FROM auth_ip_blocks WHERE ip = ? AND lockedUntil > ?",
-);
-const upsertAuthIpBlockStmt = db.prepare(`
-  INSERT INTO auth_ip_blocks (ip, lockedUntil, updatedAt)
-  VALUES (@ip, @lockedUntil, @updatedAt)
-  ON CONFLICT (ip) DO UPDATE SET
-    lockedUntil = excluded.lockedUntil,
-    updatedAt = excluded.updatedAt
-`);
-const selectAuthIpFailureStatsStmt = db.prepare(`
-  SELECT COUNT(*) AS failedCount, COUNT(DISTINCT username) AS usernameCount
-  FROM auth_login_attempts
-  WHERE ip = ?
-    AND succeeded = false
-    AND createdAt >= ?
-`);
 const selectAuthUsernameFailureCountStmt = db.prepare(`
   SELECT COUNT(*) AS failedCount
   FROM auth_login_attempts
@@ -884,9 +863,6 @@ const deleteAuthLoginAttemptsForUsernameStmt = db.prepare(
 );
 const deleteExpiredAuthLoginAttemptsStmt = db.prepare(
   "DELETE FROM auth_login_attempts WHERE createdAt < ?",
-);
-const deleteExpiredAuthIpBlocksStmt = db.prepare(
-  "DELETE FROM auth_ip_blocks WHERE lockedUntil <= ?",
 );
 const updateUserLoginFailureStmt = db.prepare(`
   UPDATE users
@@ -4416,10 +4392,6 @@ async function consumeLoginCaptcha(challengeId, answer) {
   return expected.length === actual.length && crypto.timingSafeEqual(expected, actual);
 }
 
-async function getActiveAuthIpBlock(ip, now) {
-  return await selectAuthIpBlockStmt.get(ip, now);
-}
-
 async function loginCaptchaRequired(username, user, now) {
   const windowStart = authCutoff(now, authFailureWindowMs);
   if (
@@ -4437,7 +4409,6 @@ async function loginCaptchaRequired(username, user, now) {
 
 async function recordLoginFailure(username, ip, user, now) {
   const windowStart = authCutoff(now, authFailureWindowMs);
-  const lockedUntil = new Date(Date.now() + authAccountLockMs).toISOString();
   await insertAuthLoginAttemptStmt.run({
     id: crypto.randomUUID(),
     username,
@@ -4452,7 +4423,7 @@ async function recordLoginFailure(username, ip, user, now) {
     const updated = await updateUserLoginFailureStmt.get({
       id: user.id,
       windowStart,
-      lockedUntil,
+      lockedUntil: new Date(Date.now() + authAccountLockMs).toISOString(),
       now,
     });
     accountFailureCount = Number(updated?.failedLoginAttempts || 0);
@@ -4462,16 +4433,7 @@ async function recordLoginFailure(username, ip, user, now) {
     accountFailureCount = Number(count?.failedCount || 0);
   }
 
-  const ipStats = await selectAuthIpFailureStatsStmt.get(ip, authCutoff(now, authIpWindowMs));
-  const failedCount = Number(ipStats?.failedCount || 0);
-  const usernameCount = Number(ipStats?.usernameCount || 0);
-  let ipLockedUntil = null;
-  if (failedCount >= authIpFailedAttemptLimit && usernameCount >= authIpDistinctUsernameLimit) {
-    ipLockedUntil = new Date(Date.now() + authIpLockMs).toISOString();
-    await upsertAuthIpBlockStmt.run({ ip, lockedUntil: ipLockedUntil, updatedAt: now });
-  }
-
-  return { accountFailureCount, accountLockedUntil, ipLockedUntil };
+  return { accountFailureCount, accountLockedUntil };
 }
 
 async function clearLoginFailures(user, username) {
@@ -4664,16 +4626,25 @@ async function parseProjectId(value) {
 }
 
 async function loginUser(body = {}, { ip = "unknown" } = {}) {
+  // When a captcha is submitted, validate it before looking up the account or
+  // checking the password. Invalid captcha attempts must not affect account
+  // failure counters.
+  const captchaId = String(body.captchaId ?? "").trim();
+  const captchaAnswer = String(body.captchaAnswer ?? "").trim();
+  const captchaProvided = Boolean(captchaId || captchaAnswer);
+  if (captchaProvided) {
+    const validCaptcha = captchaId && captchaAnswer
+      ? await consumeLoginCaptcha(captchaId, captchaAnswer)
+      : false;
+    if (!validCaptcha) {
+      throw httpError(401, "图形验证码不正确", "CAPTCHA_INVALID");
+    }
+  }
+
   const username = normalizeUsername(body.username);
   const password = String(body.password ?? "");
 
   const now = nowIso();
-  await deleteExpiredAuthIpBlocksStmt.run(now);
-  const ipBlock = await getActiveAuthIpBlock(ip, now);
-  if (ipBlock) {
-    const retryAfterSeconds = Math.max(1, (new Date(ipBlock.lockedUntil).getTime() - Date.now()) / 1000);
-    throw authLockError("当前网络尝试过于频繁，请稍后重试", retryAfterSeconds, "IP_RATE_LIMITED");
-  }
 
   const user = username === "admin"
     ? await selectUserAuthByUsernameStmt.get(username)
@@ -4684,31 +4655,17 @@ async function loginUser(body = {}, { ip = "unknown" } = {}) {
   }
 
   const captchaRequired = await loginCaptchaRequired(username, user, now);
-  if (captchaRequired) {
-    const validCaptcha = await consumeLoginCaptcha(body.captchaId, body.captchaAnswer);
-    if (!body.captchaId || !body.captchaAnswer) {
-      const warning = loginFailureWarning(user);
-      throw httpError(
-        428,
-        warning ? `请先完成图形验证码。${warning}` : "请先完成图形验证码",
-        "CAPTCHA_REQUIRED",
-      );
-    }
-    if (!validCaptcha) {
-      const warning = loginFailureWarning(user);
-      throw httpError(
-        401,
-        warning ? `图形验证码不正确。${warning}` : "图形验证码不正确",
-        "CAPTCHA_INVALID",
-      );
-    }
+  if (captchaRequired && !captchaProvided) {
+    const warning = loginFailureWarning(user);
+    throw httpError(
+      428,
+      warning ? `请先完成图形验证码。${warning}` : "请先完成图形验证码",
+      "CAPTCHA_REQUIRED",
+    );
   }
 
   if (!user || !verifyPassword(password, user.password)) {
     const failure = await recordLoginFailure(username, ip, user, now);
-    if (failure.ipLockedUntil) {
-      throw authLockError("当前网络尝试过于频繁，请稍后重试", authIpLockMs / 1000, "IP_RATE_LIMITED");
-    }
     if (failure.accountLockedUntil) {
       throw authLockError("登录失败次数过多，请 10 分钟后重试", authAccountLockMs / 1000, "LOGIN_LOCKED");
     }
@@ -8799,7 +8756,6 @@ if (!isTaskGenerationWorker) {
 const startupNow = nowIso();
 await deleteExpiredSessionsStmt.run(startupNow);
 await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
-await deleteExpiredAuthIpBlocksStmt.run(startupNow);
 await deleteExpiredCaptchaChallengesStmt.run(startupNow);
 await deleteExpiredImportJobsStmt.run(startupNow);
   await deleteExpiredTaskGenerationJobsStmt.run(startupNow);

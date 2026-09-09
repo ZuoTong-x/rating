@@ -450,27 +450,49 @@ body {
   flex-direction: column;
 }
 
-.change-password-rules {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 8px 14px;
-  margin: -2px 0 18px;
-  color: var(--text-soft-color);
-  font-size: 12px;
+.change-password-field {
+  width: 100%;
 }
 
-.change-password-rules span::before {
-  content: '○';
-  display: inline-block;
-  margin-right: 4px;
+.change-password-rules {
+  display: flex;
+  flex-wrap: nowrap;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 8px 0 6px;
+  color: var(--text-soft-color);
+  font-size: 12px;
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+.change-password-rules span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  transition: color 160ms ease;
 }
 
 .change-password-rules span.is-valid {
   color: #16a34a;
 }
 
-.change-password-rules span.is-valid::before {
-  content: '✓';
+.change-password-rule-bars {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 5px;
+}
+
+.change-password-rule-bar {
+  display: block;
+  height: 4px;
+  border-radius: 2px;
+  background: var(--border-color);
+  transition: background-color 160ms ease;
+}
+
+.change-password-rule-bar.is-valid {
+  background: #16a34a;
 }
 
 /* .login-form .n-input-wrapper {

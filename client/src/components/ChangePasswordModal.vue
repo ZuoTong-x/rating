@@ -33,6 +33,12 @@ const passwordRules = computed(() => ({
   uppercase: /[A-Z]/.test(form.newPassword),
   special: /[^A-Za-z0-9]/.test(form.newPassword)
 }));
+const passwordRuleItems = computed(() => [
+  { key: 'length', label: '至少 8 位', valid: passwordRules.value.length },
+  { key: 'uppercase', label: '大写字母', valid: passwordRules.value.uppercase },
+  { key: 'lowercase', label: '小写字母', valid: passwordRules.value.lowercase },
+  { key: 'special', label: '特殊字符', valid: passwordRules.value.special }
+]);
 const passwordValid = computed(() => Object.values(passwordRules.value).every(Boolean));
 
 function resetForm() {
@@ -108,21 +114,37 @@ async function submit() {
           placeholder="请输入旧密码" @keyup.enter="submit" />
       </n-form-item>
       <n-form-item label="新密码">
-        <n-input v-model:value="form.newPassword" type="password" show-password-on="click"
-          maxlength="100" placeholder="请输入新密码" @keyup.enter="submit" />
+        <div class="change-password-field">
+          <n-input v-model:value="form.newPassword" type="password" show-password-on="click"
+            maxlength="100" placeholder="请输入新密码" @keyup.enter="submit" />
+          <div class="change-password-rules" aria-label="密码强度规则">
+            <span v-for="rule in passwordRuleItems" :key="rule.key" :class="{ 'is-valid': rule.valid }">
+              <n-icon size="14" aria-hidden="true">
+                <svg v-if="rule.valid" viewBox="0 0 24 24" fill="none"
+                  xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" />
+                  <path d="m8 12 2.5 2.5L16.5 8.5" stroke="currentColor" stroke-width="2"
+                    stroke-linecap="round" stroke-linejoin="round" />
+                </svg>
+                <svg v-else viewBox="0 0 24 24" fill="none"
+                  xmlns="http://www.w3.org/2000/svg">
+                  <circle cx="12" cy="12" r="9" stroke="currentColor" stroke-width="2" />
+                </svg>
+              </n-icon>
+              {{ rule.label }}
+            </span>
+          </div>
+          <div class="change-password-rule-bars" aria-label="密码规则符合数量">
+            <i v-for="rule in passwordRuleItems" :key="`${rule.key}-bar`"
+              class="change-password-rule-bar" :class="{ 'is-valid': rule.valid }" />
+          </div>
+        </div>
       </n-form-item>
       <n-form-item label="确认新密码">
         <n-input v-model:value="form.confirmPassword" type="password" show-password-on="click"
           maxlength="100" placeholder="请再次输入新密码" @keyup.enter="submit" />
       </n-form-item>
     </n-form>
-
-    <div class="change-password-rules">
-      <span :class="{ 'is-valid': passwordRules.length }">至少 8 位</span>
-      <span :class="{ 'is-valid': passwordRules.uppercase }">大写字母</span>
-      <span :class="{ 'is-valid': passwordRules.lowercase }">小写字母</span>
-      <span :class="{ 'is-valid': passwordRules.special }">特殊字符</span>
-    </div>
 
     <template #footer>
       <n-button type="primary" block :loading="loading" @click="submit">确认修改</n-button>
