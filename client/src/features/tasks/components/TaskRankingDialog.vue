@@ -32,7 +32,12 @@ const excludedImageIds = ref<string[]>([]);
 const correctImageIds = ref<string[]>([]);
 const equalPairKeys = ref<string[]>([]);
 const rankingActionCount = ref(0);
+const dragActionCount = ref(0);
+const orderChanged = ref(false);
 const largeImageOpened = ref(false);
+const largeImageOpenCount = ref(0);
+const firstActionAt = ref<number | null>(null);
+const pageBlurCount = ref(0);
 const draggingIndex = ref<number | null>(null);
 const openedAt = ref(0);
 const detailItem = ref<RatingTaskItem | null>(null);
@@ -103,10 +108,12 @@ function handlePreviewImageClick(event: MouseEvent) {
 onMounted(() => {
   window.addEventListener('keydown', handlePreviewEscape, true);
   document.addEventListener('click', handlePreviewImageClick, true);
+  document.addEventListener('visibilitychange', handleVisibilityChange);
 });
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', handlePreviewEscape, true);
   document.removeEventListener('click', handlePreviewImageClick, true);
+  document.removeEventListener('visibilitychange', handleVisibilityChange);
 });
 
 const visible = computed({
@@ -187,7 +194,12 @@ function resetOrder() {
     correctImageIds.value = [];
     equalPairKeys.value = [];
     rankingActionCount.value = 0;
+    dragActionCount.value = 0;
+    orderChanged.value = false;
     largeImageOpened.value = false;
+    largeImageOpenCount.value = 0;
+    firstActionAt.value = null;
+    pageBlurCount.value = 0;
     return;
   }
   const storedExclusions = supportsExclusion.value
@@ -233,14 +245,29 @@ function resetOrder() {
     return pairs;
   }, []);
   rankingActionCount.value = 0;
+  dragActionCount.value = 0;
+  orderChanged.value = false;
   largeImageOpened.value = Boolean(task.largeImageOpened);
+  largeImageOpenCount.value = task.largeImageOpenCount || (task.largeImageOpened ? 1 : 0);
+  firstActionAt.value = null;
+  pageBlurCount.value = 0;
   draggingIndex.value = null;
   openedAt.value = Date.now();
   scheduleLargeImagePrefetch(task.items);
 }
 
-function markRankingAction() {
+function markFirstAction() {
+  if (firstActionAt.value == null) firstActionAt.value = Date.now();
+}
+
+function markRankingAction(isDrag = false) {
+  markFirstAction();
   rankingActionCount.value += 1;
+  if (isDrag) dragActionCount.value += 1;
+}
+
+function handleVisibilityChange() {
+  if (visible.value && document.hidden) pageBlurCount.value += 1;
 }
 
 watch(() => [props.show, props.task], ([show]) => {
@@ -253,6 +280,7 @@ watch(() => [props.show, props.task], ([show]) => {
 
 function startDrag(index: number, event: DragEvent) {
   draggingIndex.value = index;
+  markFirstAction();
   event.dataTransfer?.setData('text/plain', String(index));
   if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move';
 }
@@ -266,7 +294,8 @@ function moveItem(targetIndex: number) {
   next.splice(targetIndex, 0, item);
   orderedItems.value = next;
   draggingIndex.value = targetIndex;
-  markRankingAction();
+  orderChanged.value = true;
+  markRankingAction(true);
 }
 
 function endDrag() {
@@ -303,24 +332,30 @@ function toggleRelation(index: number) {
 }
 
 function openDetail(item: RatingTaskItem) {
+  markFirstAction();
   detailItem.value = item;
   detailVisible.value = true;
 }
 
 function openImagePreview(item: RatingTaskItem) {
+  markFirstAction();
   largeImageOpened.value = true;
+  largeImageOpenCount.value += 1;
   imagePreviewSrc.value = item.image.imageUrl;
   imagePreviewVisible.value = true;
 }
 
 function markLargeImageOpened() {
+  markFirstAction();
   largeImageOpened.value = true;
+  largeImageOpenCount.value += 1;
 }
 
 function toggleExclusion(item: RatingTaskItem) {
   if (!supportsExclusion.value) return;
 
   if (excludedIdSet.value.has(item.imageId)) {
+    markFirstAction();
     excludedImageIds.value = excludedImageIds.value.filter(imageId => imageId !== item.imageId);
     if (!orderedItems.value.some(orderedItem => orderedItem.imageId === item.imageId)) {
       orderedItems.value = [...orderedItems.value, item];
@@ -328,6 +363,7 @@ function toggleExclusion(item: RatingTaskItem) {
     return;
   }
 
+  markFirstAction();
   correctImageIds.value = correctImageIds.value.filter(imageId => imageId !== item.imageId);
   excludedImageIds.value = Array.from(new Set([...excludedImageIds.value, item.imageId]));
   orderedItems.value = orderedItems.value.filter(orderedItem => orderedItem.imageId !== item.imageId);
@@ -337,6 +373,7 @@ function toggleExclusion(item: RatingTaskItem) {
 
 function toggleCorrect(item: RatingTaskItem) {
   if (!isCorrectnessCriterion.value) return;
+  markFirstAction();
   if (correctIdSet.value.has(item.imageId)) {
     correctImageIds.value = correctImageIds.value.filter(imageId => imageId !== item.imageId);
     return;
@@ -408,7 +445,12 @@ async function submit(advance = false) {
       excludedImageIds: excludedImageIds.value,
       correctImageIds: isCorrectnessCriterion.value ? correctImageIds.value : [],
       ...trackingPayload,
+      dragActionCount: dragActionCount.value,
+      orderChanged: orderChanged.value,
       largeImageOpened: largeImageOpened.value,
+      largeImageOpenCount: largeImageOpenCount.value,
+      firstActionMs: firstActionAt.value == null ? null : Math.max(firstActionAt.value - openedAt.value, 0),
+      pageBlurCount: pageBlurCount.value,
       durationMs: Math.max(Date.now() - openedAt.value, 0)
     };
     const result = isEditing.value

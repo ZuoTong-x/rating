@@ -543,6 +543,15 @@ function adminExportJobConfig(type) {
       stage: "等待导出打分操作记录",
     };
   }
+  if (type === "scoring-risk-report") {
+    return {
+      fallbackName: "打分人",
+      title: "风险报告",
+      extension: ".json",
+      contentType: "application/json; charset=utf-8",
+      stage: "等待导出打分风险报告",
+    };
+  }
   if (type === "team-task-summary") {
     return {
       fallbackName: "团队",
@@ -567,6 +576,9 @@ function adminExportJobConfig(type) {
 async function adminExportEntityNames(type, query = {}) {
   if (type === "scoring-operation-log") {
     return ["筛选结果"];
+  }
+  if (type === "scoring-risk-report") {
+    return parseQueryList(query.scorers);
   }
   if (type === "project-completed-tasks") {
     const ids = parseQueryList(query.projectIds ?? query.projectId);
@@ -626,6 +638,9 @@ function normalizeAdminExportRequest(body = {}) {
   ) {
     throw httpError(400, "请选择需要导出的打分人");
   }
+  if (type === "scoring-risk-report" && !parseQueryList(body.scorers).length) {
+    throw httpError(400, "请选择需要导出风险报告的打分人");
+  }
   if (
     type === "team-task-summary" &&
     !parseQueryList(body.teamIds ?? body.teamId).length
@@ -643,6 +658,7 @@ function normalizeAdminExportRequest(body = {}) {
       scorer: body.scorer,
       scorerId: body.scorerId,
       scorerIds: body.scorerIds,
+      scorers: body.scorers,
       teamId: body.teamId,
       teamIds: body.teamIds,
       completedFrom,
@@ -1158,7 +1174,8 @@ const taskCriterionLabels = {
 
 const selectTaskRowsPageStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
-         submissionMode, rankingActionCount, largeImageOpened, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
+         submissionMode, rankingActionCount, dragActionCount, orderChanged, largeImageOpened, largeImageOpenCount,
+         firstActionMs, pageBlurCount, behaviorTracked, riskScore, riskFlags, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
          rollbackCount, lastRolledBackAt, lastRolledBackBy, imageKey, createdAt, updatedAt
   FROM rating_tasks
   WHERE projectId = ? AND taskVersion = ?
@@ -1168,7 +1185,9 @@ const selectTaskRowsPageStmt = db.prepare(`
 const selectAssignedTaskRowsPageStmt = db.prepare(`
   SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId, rating_tasks.taskVersion,
          rating_tasks.taskType, rating_tasks.status, rating_tasks.scorer, rating_tasks.ranking, rating_tasks.excludedImageIds, rating_tasks.correctImageIds, rating_tasks.rankingRelations,
-         rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.largeImageOpened,
+         rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.dragActionCount,
+         rating_tasks.orderChanged, rating_tasks.largeImageOpened, rating_tasks.largeImageOpenCount,
+         rating_tasks.firstActionMs, rating_tasks.pageBlurCount, rating_tasks.behaviorTracked, rating_tasks.riskScore, rating_tasks.riskFlags,
          rating_tasks.isBacktest, rating_tasks.backtestSourceId,
          rating_tasks.startedAt, rating_tasks.completedAt, rating_tasks.durationMs, rating_tasks.editedAt, rating_tasks.editCount,
          rating_tasks.rollbackCount, rating_tasks.lastRolledBackAt, rating_tasks.lastRolledBackBy,
@@ -1210,7 +1229,8 @@ const selectScorerProjectCountStmt = db.prepare(`
 `);
 const selectTaskByIdStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
-         submissionMode, rankingActionCount, largeImageOpened, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
+         submissionMode, rankingActionCount, dragActionCount, orderChanged, largeImageOpened, largeImageOpenCount,
+         firstActionMs, pageBlurCount, behaviorTracked, riskScore, riskFlags, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
          rollbackCount, lastRolledBackAt, lastRolledBackBy, imageKey, createdAt, updatedAt
   FROM rating_tasks
   WHERE id = ?
@@ -1230,10 +1250,18 @@ const completeAssignedTaskStmt = db.prepare(`
       rankingRelations = @rankingRelations,
       submissionMode = @submissionMode,
       rankingActionCount = @rankingActionCount,
+      dragActionCount = @dragActionCount,
+      orderChanged = @orderChanged,
       largeImageOpened = @largeImageOpened,
+      largeImageOpenCount = @largeImageOpenCount,
       startedAt = @startedAt,
       completedAt = @completedAt,
       durationMs = @durationMs,
+      firstActionMs = @firstActionMs,
+      pageBlurCount = @pageBlurCount,
+      behaviorTracked = @behaviorTracked,
+      riskScore = @riskScore,
+      riskFlags = @riskFlags,
       updatedAt = @updatedAt
   WHERE id = @id
     AND status = 'assigned'
@@ -1247,7 +1275,15 @@ const updateCompletedTaskStmt = db.prepare(`
       rankingRelations = @rankingRelations,
       submissionMode = @submissionMode,
       rankingActionCount = @rankingActionCount,
+      dragActionCount = @dragActionCount,
+      orderChanged = @orderChanged,
       largeImageOpened = @largeImageOpened,
+      largeImageOpenCount = @largeImageOpenCount,
+      firstActionMs = @firstActionMs,
+      pageBlurCount = @pageBlurCount,
+      behaviorTracked = @behaviorTracked,
+      riskScore = @riskScore,
+      riskFlags = @riskFlags,
       editedAt = @editedAt,
       editCount = COALESCE(editCount, 0) + 1,
       updatedAt = @updatedAt
@@ -5791,10 +5827,18 @@ async function hydrateTaskRows(rows, options = {}) {
       rankingRelations: parseStoredTaskRankingRelations(row.rankingRelations),
       submissionMode: row.submissionMode || null,
       rankingActionCount: Number(row.rankingActionCount || 0),
+      dragActionCount: Number(row.dragActionCount || 0),
+      orderChanged: Boolean(row.orderChanged),
       largeImageOpened: Boolean(row.largeImageOpened),
+      largeImageOpenCount: Number(row.largeImageOpenCount || 0),
       startedAt: row.startedAt ?? null,
       completedAt: row.completedAt ?? null,
       durationMs: row.durationMs ?? null,
+      firstActionMs: row.firstActionMs ?? null,
+      pageBlurCount: Number(row.pageBlurCount || 0),
+      behaviorTracked: Boolean(row.behaviorTracked),
+      riskScore: Number(row.riskScore || 0),
+      riskFlags: parseStoredTaskImageIds(row.riskFlags),
       editedAt: row.editedAt ?? null,
       editCount: Number(row.editCount || 0),
       rollbackCount: Number(row.rollbackCount || 0),
@@ -5858,6 +5902,7 @@ const {
   listScoringTaskRecords,
   listScoringOptions,
   writeScoringOperationsExport,
+  writeScoringRiskReport,
   invalidateSummaryCache,
   previewRollback,
   startRollbackJob,
@@ -6419,6 +6464,8 @@ async function runAdminExportJob(job) {
       job.result = await runJsonAdminExport(job, writeScorerCompletedTasksExport);
     } else if (job.type === "scoring-operation-log") {
       job.result = await runJsonAdminExport(job, writeScoringOperationsExport);
+    } else if (job.type === "scoring-risk-report") {
+      job.result = await runJsonAdminExport(job, writeScoringRiskReport);
     } else if (job.type === "team-task-summary") {
       job.result = await runJsonAdminExport(job, writeTeamTaskSummaryExport);
     } else if (job.type === "project-task-report") {
@@ -6822,6 +6869,77 @@ function parseLargeImageOpened(value) {
   throw httpError(400, "大图查看记录格式不正确");
 }
 
+function parseTaskBehaviorCount(value, label, fallback = 0, max = 100000) {
+  if (value === null || value === undefined || value === "") return fallback;
+  const count = Math.floor(Number(value));
+  if (!Number.isFinite(count) || count < 0) throw httpError(400, `${label}不正确`);
+  return Math.min(count, max);
+}
+
+function parseTaskBehaviorBoolean(value, label, fallback = false) {
+  if (value === null || value === undefined || value === "") return fallback;
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === "1" || value === "true") return true;
+  if (value === 0 || value === "0" || value === "false") return false;
+  throw httpError(400, `${label}格式不正确`);
+}
+
+function parseFirstActionMs(value, durationMs) {
+  if (value === null || value === undefined || value === "") return null;
+  const firstActionMs = Math.floor(Number(value));
+  if (!Number.isFinite(firstActionMs) || firstActionMs < 0)
+    throw httpError(400, "首次操作时间不正确");
+  return Math.min(firstActionMs, durationMs);
+}
+
+function hasTaskBehaviorTracking(body = {}) {
+  return [
+    "dragActionCount",
+    "orderChanged",
+    "largeImageOpenCount",
+    "firstActionMs",
+    "pageBlurCount",
+  ].some((key) => Object.hasOwn(body, key));
+}
+
+function calculateTaskRisk({
+  durationMs,
+  rankingActionCount,
+  dragActionCount,
+  orderChanged,
+  largeImageOpened,
+  largeImageOpenCount,
+  firstActionMs,
+  pageBlurCount,
+}) {
+  let score = 0;
+  const flags = [];
+  if (!orderChanged && rankingActionCount <= 0 && dragActionCount <= 0) {
+    score += 20;
+    flags.push("no_order_change");
+  }
+  if (!largeImageOpened && largeImageOpenCount <= 0) {
+    score += 10;
+    flags.push("no_large_image");
+  }
+  if (durationMs < 3000) {
+    score += 30;
+    flags.push("fast_submit");
+  }
+  if (firstActionMs === null || (durationMs >= 1000 && firstActionMs > durationMs * 0.8)) {
+    score += 5;
+    flags.push("late_first_action");
+  }
+  if (pageBlurCount >= 3) {
+    score += 10;
+    flags.push("frequent_page_blur");
+  }
+  return {
+    score: Math.min(score, 100),
+    flags,
+  };
+}
+
 function parseTaskSubmissionMode(value, rankingActionCount, trackingProvided = false) {
   const requested = String(value || "").trim();
   if (requested && !["direct", "ranked"].includes(requested)) {
@@ -6872,9 +6990,45 @@ async function completeAssignedTask(taskId, body = {}) {
   );
   const durationMs = parseTaskDuration(body.durationMs);
   const rankingActionCount = parseRankingActionCount(body.rankingActionCount);
+  const behaviorTracked = hasTaskBehaviorTracking(body) || Boolean(task.behaviorTracked);
+  const dragActionCount = parseTaskBehaviorCount(
+    body.dragActionCount,
+    "拖动次数",
+    Number(task.dragActionCount || rankingActionCount),
+  );
+  const orderChanged = parseTaskBehaviorBoolean(
+    body.orderChanged,
+    "排序变化记录",
+    Boolean(task.orderChanged) || rankingActionCount > 0 || dragActionCount > 0,
+  );
   const largeImageOpened = Object.hasOwn(body, "largeImageOpened")
     ? parseLargeImageOpened(body.largeImageOpened)
     : Boolean(task.largeImageOpened);
+  const largeImageOpenCount = parseTaskBehaviorCount(
+    body.largeImageOpenCount,
+    "大图查看次数",
+    Number(task.largeImageOpenCount || (largeImageOpened ? 1 : 0)),
+    10000,
+  );
+  const firstActionMs = Object.hasOwn(body, "firstActionMs")
+    ? parseFirstActionMs(body.firstActionMs, durationMs)
+    : task.firstActionMs ?? null;
+  const pageBlurCount = parseTaskBehaviorCount(
+    body.pageBlurCount,
+    "页面失焦次数",
+    Number(task.pageBlurCount || 0),
+    10000,
+  );
+  const risk = behaviorTracked ? calculateTaskRisk({
+    durationMs,
+    rankingActionCount,
+    dragActionCount,
+    orderChanged,
+    largeImageOpened,
+    largeImageOpenCount,
+    firstActionMs,
+    pageBlurCount,
+  }) : { score: 0, flags: [] };
   const submissionMode = parseTaskSubmissionMode(
     body.submissionMode,
     rankingActionCount,
@@ -6896,10 +7050,18 @@ async function completeAssignedTask(taskId, body = {}) {
       rankingRelations: JSON.stringify(rankingRelations),
       submissionMode,
       rankingActionCount,
+      dragActionCount,
+      orderChanged,
       largeImageOpened,
+      largeImageOpenCount,
       startedAt,
       completedAt,
       durationMs,
+      firstActionMs,
+      pageBlurCount,
+      behaviorTracked,
+      riskScore: risk.score,
+      riskFlags: JSON.stringify(risk.flags),
       updatedAt: completedAt,
     });
     if (result.changes === 0)
@@ -6953,11 +7115,47 @@ async function updateCompletedTask(taskId, body = {}) {
     body.rankingRelations,
     ranking,
   );
-  parseTaskDuration(body.durationMs);
   const rankingActionCount = parseRankingActionCount(body.rankingActionCount);
+  const durationMs = parseTaskDuration(body.durationMs);
+  const behaviorTracked = hasTaskBehaviorTracking(body) || Boolean(task.behaviorTracked);
+  const dragActionCount = parseTaskBehaviorCount(
+    body.dragActionCount,
+    "拖动次数",
+    Number(task.dragActionCount || rankingActionCount),
+  );
+  const orderChanged = parseTaskBehaviorBoolean(
+    body.orderChanged,
+    "排序变化记录",
+    Boolean(task.orderChanged) || rankingActionCount > 0 || dragActionCount > 0,
+  );
   const largeImageOpened = Object.hasOwn(body, "largeImageOpened")
     ? parseLargeImageOpened(body.largeImageOpened)
     : Boolean(task.largeImageOpened);
+  const largeImageOpenCount = parseTaskBehaviorCount(
+    body.largeImageOpenCount,
+    "大图查看次数",
+    Number(task.largeImageOpenCount || (largeImageOpened ? 1 : 0)),
+    10000,
+  );
+  const firstActionMs = Object.hasOwn(body, "firstActionMs")
+    ? parseFirstActionMs(body.firstActionMs, durationMs)
+    : task.firstActionMs ?? null;
+  const pageBlurCount = parseTaskBehaviorCount(
+    body.pageBlurCount,
+    "页面失焦次数",
+    Number(task.pageBlurCount || 0),
+    10000,
+  );
+  const risk = behaviorTracked ? calculateTaskRisk({
+    durationMs,
+    rankingActionCount,
+    dragActionCount,
+    orderChanged,
+    largeImageOpened,
+    largeImageOpenCount,
+    firstActionMs,
+    pageBlurCount,
+  }) : { score: 0, flags: [] };
   const submissionMode = parseTaskSubmissionMode(
     body.submissionMode,
     rankingActionCount,
@@ -6977,7 +7175,15 @@ async function updateCompletedTask(taskId, body = {}) {
       rankingRelations: JSON.stringify(rankingRelations),
       submissionMode,
       rankingActionCount,
+      dragActionCount,
+      orderChanged,
       largeImageOpened,
+      largeImageOpenCount,
+      firstActionMs,
+      pageBlurCount,
+      behaviorTracked,
+      riskScore: risk.score,
+      riskFlags: JSON.stringify(risk.flags),
       editedAt,
       updatedAt: editedAt,
     });

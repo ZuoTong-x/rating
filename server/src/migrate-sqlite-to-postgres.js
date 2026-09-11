@@ -166,7 +166,9 @@ async function rebuildTaskStats() {
   await client.query(`
     INSERT INTO scorer_scoring_stats
       (scorer, taskversion, projectid, submissionmode, taskcount,
-       largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax,
+       largeimageopenedcount, trackedlargeimageopenedcount, largeimageopencounttotal, dragactioncounttotal,
+       orderchangedcount, fastsubmitcount, highriskcount, behaviortrackedcount, riskscoretotal, riskscoremax,
+       pageblurcounttotal, durationtotal, durationcount, durationmin, durationmax,
        rollbackcount, updatedat)
     SELECT scorer,
            taskversion,
@@ -174,6 +176,16 @@ async function rebuildTaskStats() {
            COALESCE(submissionmode, 'untracked'),
            COUNT(*),
            SUM(CASE WHEN COALESCE(largeimageopened, false) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) AND COALESCE(largeimageopened, false) THEN 1 ELSE 0 END),
+           SUM(GREATEST(COALESCE(largeimageopencount, 0), 0)),
+           SUM(GREATEST(COALESCE(dragactioncount, 0), 0)),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) AND COALESCE(orderchanged, false) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) AND durationms IS NOT NULL AND durationms >= 0 AND durationms < 3000 THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) AND COALESCE(riskscore, 0) >= 60 THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) THEN GREATEST(COALESCE(riskscore, 0), 0) ELSE 0 END),
+           MAX(CASE WHEN COALESCE(behaviortracked, false) THEN GREATEST(COALESCE(riskscore, 0), 0) ELSE 0 END),
+           SUM(CASE WHEN COALESCE(behaviortracked, false) THEN GREATEST(COALESCE(pageblurcount, 0), 0) ELSE 0 END),
            SUM(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN durationms ELSE 0 END),
            SUM(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN 1 ELSE 0 END),
            MIN(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN durationms ELSE NULL END),

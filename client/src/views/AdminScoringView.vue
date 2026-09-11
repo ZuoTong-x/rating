@@ -1,38 +1,31 @@
 <script setup lang="ts">
 import { computed, h, onMounted, reactive, ref } from 'vue';
 import { NButton, NTag, useDialog, useMessage, type DataTableColumns, type DataTableRowKey, type UploadFileInfo } from 'naive-ui';
-import { taskCriteria, type TaskCriterionKey } from '../constants/scoreCriteria';
 import { imageApi } from '../services/images';
 import { useTaskStackStore } from '../stores/taskStack';
 import type {
   ScoringManagementSummary,
   ScoringRollbackPreview,
   ScoringSummaryScorer,
-  ScoringTaskRecord,
   TaskSubmissionModeFilter
 } from '../types/image';
-import { formatDateTime } from '../utils/time';
 
 const message = useMessage();
 const dialog = useDialog();
 const taskStack = useTaskStackStore();
 const loading = ref(false);
-const detailLoading = ref(false);
 const previewing = ref(false);
 const rollbackSubmitting = ref(false);
 const scorerRollbackPreviewing = ref(false);
 const scorerRollbackSubmitting = ref(false);
 const exporting = ref(false);
+const riskReportExporting = ref(false);
 const projects = ref<Array<{ _id: string; name: string }>>([]);
 const scorerOptions = ref<Array<{ label: string; value: string }>>([]);
 const scorersLoading = ref(false);
 const summary = ref<ScoringManagementSummary | null>(null);
 const detailVisible = ref(false);
 const detailScorer = ref<ScoringSummaryScorer | null>(null);
-const detailRecords = ref<ScoringTaskRecord[]>([]);
-const detailTotal = ref(0);
-const detailPage = ref(1);
-const detailPageSize = ref(20);
 const scorerPage = ref(1);
 const scorerPageSize = ref(10);
 const rollbackVisible = ref(false);
@@ -44,11 +37,13 @@ const scorerRollbackPreview = ref<ScoringRollbackPreview | null>(null);
 const rollbackReturnMode = ref<'original' | 'reassign'>('original');
 const rollbackRecipientScorers = ref<string[]>([]);
 const rollbackRecipientAllocations = ref<Record<string, number | null>>({});
+type ScoringRiskFilter = 'high' | 'fast' | 'no_large_image' | 'no_order_change' | 'page_blur';
 
 const filters = reactive({
   scorer: null as string | null,
   projectId: null as string | null,
-  submissionMode: null as TaskSubmissionModeFilter | null
+  submissionMode: null as TaskSubmissionModeFilter | null,
+  riskFilter: null as ScoringRiskFilter | null
 });
 
 const submissionModeOptions = [
@@ -57,12 +52,20 @@ const submissionModeOptions = [
   { label: '未记录', value: 'untracked' }
 ];
 
+const riskFilterOptions = [
+  { label: '高风险', value: 'high' },
+  { label: '提交过快', value: 'fast' },
+  { label: '未看大图', value: 'no_large_image' },
+  { label: '排序未变化', value: 'no_order_change' },
+  { label: '频繁切页', value: 'page_blur' }
+];
+
 const projectOptions = computed(() => projects.value.map(project => ({
   label: project.name,
   value: project._id
 })));
 
-const hasFilters = computed(() => Boolean(filters.scorer || filters.projectId || filters.submissionMode));
+const hasFilters = computed(() => Boolean(filters.scorer || filters.projectId || filters.submissionMode || filters.riskFilter));
 const rollbackUsesRecipients = computed(() => rollbackReturnMode.value === 'reassign');
 const selectedRollbackScorerSet = computed(() => new Set(selectedRollbackScorers.value));
 const rollbackRecipientOptions = computed(() => scorerOptions.value.filter(option =>
@@ -89,7 +92,50 @@ const scorerRollbackReady = computed(() => Boolean(
   scorerRollbackPreview.value?.rollbackTaskCount &&
   (!rollbackUsesRecipients.value || rollbackRecipientAllocationValid.value)
 ));
+const detailRiskConclusion = computed(() => {
+  const scorer = detailScorer.value;
+  if (!scorer) return { type: 'default' as const, title: '', text: '' };
+  if (!scorer.behaviorTrackedCount) {
+    return {
+      type: 'default' as const,
+      title: '暂无行为样本',
+      text: '当前打分记录没有可用于行为风险判断的采集数据。'
+    };
+  }
+  if (scorer.averageRiskScore >= 60 || scorer.highRiskRate >= 0.2) {
+    return {
+      type: 'error' as const,
+      title: '高风险',
+      text: `平均风险分 ${formatRiskScore(scorer.averageRiskScore)}，高风险任务占行为样本 ${formatPercent(scorer.highRiskRate)}，建议复核。`
+    };
+  }
+  if (
+    scorer.fastSubmitRate >= 0.1 ||
+    scorer.noLargeImageRate >= 0.5 ||
+    scorer.orderUnchangedRate >= 0.5
+  ) {
+    return {
+      type: 'warning' as const,
+      title: '需要关注',
+      text: `存在提交过快、未查看大图或排序未变化行为，建议结合任务抽查。`
+    };
+  }
+  return {
+    type: 'success' as const,
+    title: '行为正常',
+    text: '当前已采集行为未发现明显异常集中趋势。'
+  };
+});
 const scorerRollbackScopeText = computed(() => {
+  const parts = [];
+  if (filters.projectId) {
+    parts.push(projects.value.find(project => project._id === filters.projectId)?.name || '当前项目');
+  }
+  if (filters.submissionMode) parts.push(submissionModeLabel(filters.submissionMode));
+  if (filters.riskFilter) parts.push(riskFilterLabel(filters.riskFilter));
+  return parts.length ? `范围：${parts.join(' / ')}` : '范围：全部项目和提交方式';
+});
+const riskReportScopeText = computed(() => {
   const parts = [];
   if (filters.projectId) {
     parts.push(projects.value.find(project => project._id === filters.projectId)?.name || '当前项目');
@@ -118,24 +164,24 @@ function formatDuration(seconds: number | null | undefined) {
   return `${minutes} 分 ${rest} 秒`;
 }
 
-function formatDate(value: string | null | undefined) {
-  return formatDateTime(value);
-}
-
-function criterionLabel(key: TaskCriterionKey | null | undefined) {
-  return taskCriteria.find(item => item.key === key)?.label || key || '-';
-}
-
-function submissionModeLabel(mode: TaskSubmissionModeFilter | ScoringTaskRecord['submissionMode']) {
+function submissionModeLabel(mode: TaskSubmissionModeFilter | null | undefined) {
   if (mode === 'direct') return '未拖动排序';
   if (mode === 'ranked') return '已操作排序';
   return '未记录';
 }
 
-function submissionModeType(mode: ScoringTaskRecord['submissionMode']) {
-  if (mode === 'direct') return 'error';
-  if (mode === 'ranked') return 'success';
-  return 'default';
+function riskTagType(score: number) {
+  if (score >= 60) return 'error';
+  if (score >= 30) return 'warning';
+  return 'success';
+}
+
+function formatRiskScore(score: number | null | undefined) {
+  return Math.round(Number(score || 0));
+}
+
+function riskFilterLabel(value: ScoringRiskFilter | null | undefined) {
+  return riskFilterOptions.find(option => option.value === value)?.label || '';
 }
 
 function taskIdFromItem(item: unknown) {
@@ -185,7 +231,8 @@ async function loadSummary(page = scorerPage.value, pageSize = scorerPageSize.va
       pageSize,
       scorer: filters.scorer,
       projectId: filters.projectId,
-      submissionMode: filters.submissionMode
+      submissionMode: filters.submissionMode,
+      riskFilter: filters.riskFilter
     });
     scorerPage.value = summary.value.page;
     scorerPageSize.value = summary.value.pageSize;
@@ -196,36 +243,11 @@ async function loadSummary(page = scorerPage.value, pageSize = scorerPageSize.va
   }
 }
 
-async function loadDetail(page = detailPage.value, pageSize = detailPageSize.value) {
-  const scorer = detailScorer.value?.scorer;
-  if (!scorer) return;
-  detailLoading.value = true;
-  try {
-    const result = await imageApi.adminScoringTasks({
-      page,
-      pageSize,
-      includeTotal: true,
-      scorer,
-      projectId: filters.projectId,
-      submissionMode: filters.submissionMode
-    });
-    detailRecords.value = result.tasks;
-    detailTotal.value = result.total ?? 0;
-    detailPage.value = result.page;
-    detailPageSize.value = result.pageSize;
-  } catch (error) {
-    message.error(errorMessage(error));
-  } finally {
-    detailLoading.value = false;
-  }
-}
-
 async function reloadSummary() {
   await loadSummary();
   if (detailVisible.value && detailScorer.value) {
     const nextScorer = summary.value?.scorers.find(item => item.scorer === detailScorer.value?.scorer);
     detailScorer.value = nextScorer || detailScorer.value;
-    await loadDetail(detailPage.value, detailPageSize.value);
   }
 }
 
@@ -243,7 +265,8 @@ async function exportScoringOperations() {
     await imageApi.exportScoringOperations({
       scorer: filters.scorer,
       projectId: filters.projectId,
-      submissionMode: filters.submissionMode
+      submissionMode: filters.submissionMode,
+      riskFilter: filters.riskFilter
     }, {
       onProgress: job => taskStack.updateTask(taskId, {
         progress: job.progress,
@@ -260,10 +283,44 @@ async function exportScoringOperations() {
   }
 }
 
+async function exportScoringRiskReport() {
+  if (!selectedRollbackScorers.value.length) {
+    message.error('请先勾选需要导出风险报告的打分人');
+    return;
+  }
+  riskReportExporting.value = true;
+  let taskId = '';
+  try {
+    taskId = taskStack.addTask({
+      kind: 'export',
+      title: '导出打分风险报告',
+      description: `${selectedRollbackScorers.value.length} 位打分人 / ${riskReportScopeText.value}`,
+      stage: '正在提交导出作业',
+      progress: 0
+    });
+    await imageApi.exportScoringRiskReport({
+      scorers: selectedRollbackScorers.value,
+      projectId: filters.projectId,
+      submissionMode: filters.submissionMode
+    }, {
+      onProgress: job => taskStack.updateTask(taskId, {
+        progress: job.progress,
+        stage: job.stage || '正在导出打分风险报告'
+      })
+    });
+    taskStack.finishTask(taskId);
+    message.success('打分风险报告 JSON 已导出');
+  } catch (error) {
+    if (taskId) taskStack.failTask(taskId, error);
+    message.error(errorMessage(error));
+  } finally {
+    riskReportExporting.value = false;
+  }
+}
+
 function applyFilters() {
   selectedRollbackScorers.value = [];
   scorerPage.value = 1;
-  detailPage.value = 1;
   void reloadSummary();
 }
 
@@ -271,9 +328,9 @@ function resetFilters() {
   filters.scorer = null;
   filters.projectId = null;
   filters.submissionMode = null;
+  filters.riskFilter = null;
   selectedRollbackScorers.value = [];
   scorerPage.value = 1;
-  detailPage.value = 1;
   void reloadSummary();
 }
 
@@ -368,31 +425,12 @@ async function openScorerRollback() {
 
 function openScorerDetails(row: ScoringSummaryScorer) {
   detailScorer.value = row;
-  detailRecords.value = [];
-  detailTotal.value = 0;
-  detailPage.value = 1;
   detailVisible.value = true;
-  void loadDetail(1, detailPageSize.value);
 }
 
 function closeScorerDetails() {
   detailVisible.value = false;
   detailScorer.value = null;
-  detailRecords.value = [];
-}
-
-function changeDetailPage(page: number) {
-  void loadDetail(page, detailPageSize.value);
-}
-
-function changeDetailPageSize(pageSize: number) {
-  void loadDetail(1, pageSize);
-}
-
-function detailPaginationPrefix({ itemCount }: { itemCount?: number }) {
-  return detailTotal.value
-    ? `共 ${itemCount ?? detailTotal.value} 条任务`
-    : `第 ${detailPage.value} 页`;
 }
 
 function wait(milliseconds: number) {
@@ -588,6 +626,31 @@ const scorerColumns: DataTableColumns<ScoringSummaryScorer> = [
     ])
   },
   {
+    title: '行为风险',
+    key: 'averageRiskScore',
+    width: 120,
+    render: row => !row.behaviorTrackedCount
+      ? h('span', { class: 'table-muted' }, '暂无样本')
+      : h(NTag, {
+      size: 'small',
+      type: riskTagType(row.averageRiskScore),
+      bordered: false
+    }, { default: () => `${formatRiskScore(row.averageRiskScore)} / ${formatNumber(row.highRiskCount)}` })
+  },
+  {
+    title: '过快提交',
+    key: 'fastSubmitCount',
+    width: 120,
+    render: row => h('div', { class: 'scoring-inline-tags' }, [
+      h(NTag, {
+        size: 'small',
+        type: row.fastSubmitCount ? 'warning' : 'default',
+        bordered: false
+      }, { default: () => formatNumber(row.fastSubmitCount) }),
+      h('span', { class: 'table-muted' }, formatPercent(row.fastSubmitRate))
+    ])
+  },
+  {
     title: '平均打分时间',
     key: 'averageDurationSeconds',
     width: 150,
@@ -605,43 +668,6 @@ const scorerColumns: DataTableColumns<ScoringSummaryScorer> = [
       onClick: () => openScorerDetails(row)
     }, { default: () => '详情' })
   }
-];
-
-const detailColumns: DataTableColumns<ScoringTaskRecord> = [
-  { title: '项目', key: 'projectName', minWidth: 180 },
-  { title: '评分维度', key: 'criterion', minWidth: 150, render: row => criterionLabel(row.criterion) },
-  {
-    title: '提交方式',
-    key: 'submissionMode',
-    width: 150,
-    render: row => h(NTag, {
-      size: 'small',
-      type: submissionModeType(row.submissionMode),
-      bordered: false
-    }, { default: () => submissionModeLabel(row.submissionMode) })
-  },
-  { title: '排序操作', key: 'rankingActionCount', width: 100 },
-  {
-    title: '查看大图',
-    key: 'largeImageOpened',
-    width: 100,
-    render: row => h(NTag, {
-      size: 'small',
-      type: row.largeImageOpened ? 'info' : 'default',
-      bordered: false
-    }, { default: () => (row.largeImageOpened ? '是' : '否') })
-  },
-  {
-    title: '回测',
-    key: 'isBacktest',
-    width: 90,
-    render: row => row.isBacktest
-      ? h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '回测' })
-      : h('span', { class: 'table-muted' }, '普通')
-  },
-  { title: '打分时长', key: 'durationSeconds', width: 120, render: row => formatDuration(row.durationSeconds) },
-  { title: '完成时间', key: 'completedAt', width: 180, render: row => formatDate(row.completedAt) },
-  { title: '回退次数', key: 'rollbackCount', width: 100 }
 ];
 
 async function initialize() {
@@ -669,6 +695,10 @@ onMounted(() => void initialize());
             @click="openScorerRollback">
             人员全量回退
           </n-button>
+          <n-button type="warning" secondary :loading="riskReportExporting" :disabled="!selectedRollbackScorers.length"
+            @click="exportScoringRiskReport">
+            导出风险报告
+          </n-button>
           <n-button type="primary" secondary :loading="exporting" @click="exportScoringOperations">
             导出 JSON
           </n-button>
@@ -685,6 +715,7 @@ onMounted(() => void initialize());
         <n-select v-model:value="filters.projectId" clearable filterable :options="projectOptions" placeholder="按项目筛选" />
         <n-select v-model:value="filters.submissionMode" clearable :options="submissionModeOptions"
           placeholder="按提交方式筛选" />
+        <n-select v-model:value="filters.riskFilter" clearable :options="riskFilterOptions" placeholder="风险筛选" />
         <div class="account-filter-actions">
           <n-button type="primary" @click="applyFilters">查询</n-button>
           <n-button :disabled="!hasFilters" @click="resetFilters">重置</n-button>
@@ -732,21 +763,29 @@ onMounted(() => void initialize());
             <span>平均打分时间</span>
             <strong>{{ formatDuration(detailScorer.averageDurationSeconds) }}</strong>
           </div>
+          <div>
+            <span>高风险任务</span>
+            <strong class="is-danger">{{ formatNumber(detailScorer.highRiskCount) }}</strong>
+          </div>
+          <div>
+            <span>平均风险分</span>
+            <strong>{{ detailScorer.behaviorTrackedCount ? formatRiskScore(detailScorer.averageRiskScore) : '-' }}</strong>
+          </div>
         </div>
-
-        <n-data-table :columns="detailColumns" :data="detailRecords" :loading="detailLoading" :bordered="false" remote
-          :scroll-x="1040" :max-height="520">
-          <template #empty>
-            <div class="scoring-table-empty">
-              {{ detailLoading ? '正在加载任务明细...' : '暂无任务明细' }}
-            </div>
-          </template>
-        </n-data-table>
-        <div class="scoring-detail-footer">
-          <n-pagination v-if="detailTotal > 0" :page="detailPage" :page-size="detailPageSize"
-            :page-count="Math.ceil(detailTotal / detailPageSize)"
-            show-size-picker :page-sizes="[10, 20, 50, 100]" :prefix="detailPaginationPrefix"
-            @update:page="changeDetailPage" @update:page-size="changeDetailPageSize" />
+        <div class="scoring-detail-conclusion">
+          <div class="scoring-detail-conclusion-header">
+            <span>行为结论</span>
+            <n-tag :type="detailRiskConclusion.type" size="small" :bordered="false">
+              {{ detailRiskConclusion.title }}
+            </n-tag>
+          </div>
+          <n-text depth="3">{{ detailRiskConclusion.text }}</n-text>
+          <div v-if="detailScorer.behaviorTrackedCount" class="scoring-detail-rates">
+            <span>过快提交 {{ formatPercent(detailScorer.fastSubmitRate) }}</span>
+            <span>未看大图 {{ formatPercent(detailScorer.noLargeImageRate) }}</span>
+            <span>排序未变化 {{ formatPercent(detailScorer.orderUnchangedRate) }}</span>
+            <span>频繁切页 {{ formatNumber(detailScorer.pageBlurCountTotal ?? 0) }} 次</span>
+          </div>
         </div>
       </template>
     </n-modal>

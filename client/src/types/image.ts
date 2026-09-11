@@ -164,12 +164,20 @@ export interface RatingTask {
   correctImageIds?: string[] | null;
   submissionMode?: TaskSubmissionMode | null;
   rankingActionCount?: number;
+  dragActionCount?: number;
+  orderChanged?: boolean;
   largeImageOpened?: boolean;
+  largeImageOpenCount?: number;
+  behaviorTracked?: boolean;
   isBacktest?: boolean;
   backtestSourceTaskId?: string | null;
   startedAt?: string | null;
   completedAt?: string | null;
   durationMs?: number | null;
+  firstActionMs?: number | null;
+  pageBlurCount?: number;
+  riskScore?: number;
+  riskFlags?: string[];
   imageKey: string;
   rollbackCount?: number;
   lastRolledBackAt?: string | null;
@@ -191,6 +199,18 @@ export interface ScoringSummaryScorer {
   directSubmitRate: number;
   largeImageOpenedCount: number;
   largeImageOpenedRate: number;
+  highRiskCount: number;
+  highRiskRate: number;
+  fastSubmitCount: number;
+  fastSubmitRate: number;
+  noLargeImageCount: number;
+  noLargeImageRate: number;
+  orderUnchangedCount: number;
+  orderUnchangedRate: number;
+  behaviorTrackedCount: number;
+  pageBlurCountTotal: number;
+  averageRiskScore: number;
+  maxRiskScore: number;
   averageDurationMs: number | null;
   averageDurationSeconds: number | null;
   minDurationMs: number | null;
@@ -213,6 +233,18 @@ export interface ScoringManagementSummary {
   directSubmitRate: number;
   largeImageOpenedCount: number;
   largeImageOpenedRate: number;
+  highRiskCount: number;
+  highRiskRate: number;
+  fastSubmitCount: number;
+  fastSubmitRate: number;
+  noLargeImageCount: number;
+  noLargeImageRate: number;
+  orderUnchangedCount: number;
+  orderUnchangedRate: number;
+  behaviorTrackedCount: number;
+  pageBlurCountTotal: number;
+  averageRiskScore: number;
+  maxRiskScore: number;
   scorers: ScoringSummaryScorer[];
 }
 
@@ -225,11 +257,20 @@ export interface ScoringTaskRecord {
   scorer: string;
   submissionMode?: TaskSubmissionMode | null;
   rankingActionCount: number;
+  dragActionCount: number;
+  orderChanged: boolean;
   largeImageOpened: boolean;
+  largeImageOpenCount: number;
+  behaviorTracked: boolean;
   isBacktest?: boolean;
   backtestSourceTaskId?: string | null;
   durationMs: number | null;
   durationSeconds: number | null;
+  firstActionMs: number | null;
+  firstActionSeconds: number | null;
+  pageBlurCount: number;
+  riskScore: number;
+  riskFlags: string[];
   completedAt: string | null;
   editedAt: string | null;
   editCount: number;
@@ -299,6 +340,7 @@ export type AdminExportType =
   | 'project-completed-tasks'
   | 'scorer-completed-tasks'
   | 'scoring-operation-log'
+  | 'scoring-risk-report'
   | 'team-task-summary'
   | 'project-task-report';
 

@@ -271,10 +271,18 @@ create table if not exists rating_tasks (
     backtestsourceid text,
     submissionmode text check (submissionmode in ('direct', 'ranked')),
     rankingactioncount integer not null default 0,
+    dragactioncount integer not null default 0,
+    orderchanged boolean not null default false,
     largeimageopened boolean not null default false,
+    largeimageopencount integer not null default 0,
     startedat timestamptz,
     completedat timestamptz,
     durationms integer,
+    firstactionms integer,
+    pageblurcount integer not null default 0,
+    behaviortracked boolean not null default false,
+    riskscore integer not null default 0,
+    riskflags text,
     editedat timestamptz,
     editcount integer not null default 0,
     rollbackcount integer not null default 0,
@@ -289,6 +297,30 @@ create table if not exists rating_tasks (
 
 alter table rating_tasks
     add column if not exists largeimageopened boolean not null default false;
+
+alter table rating_tasks
+    add column if not exists dragactioncount integer not null default 0;
+
+alter table rating_tasks
+    add column if not exists orderchanged boolean not null default false;
+
+alter table rating_tasks
+    add column if not exists largeimageopencount integer not null default 0;
+
+alter table rating_tasks
+    add column if not exists firstactionms integer;
+
+alter table rating_tasks
+    add column if not exists pageblurcount integer not null default 0;
+
+alter table rating_tasks
+    add column if not exists behaviortracked boolean not null default false;
+
+alter table rating_tasks
+    add column if not exists riskscore integer not null default 0;
+
+alter table rating_tasks
+    add column if not exists riskflags text;
 
 alter table rating_tasks
     add column if not exists isbacktest boolean not null default false;
@@ -335,6 +367,16 @@ create table if not exists scorer_scoring_stats (
     submissionmode text not null check (submissionmode in ('direct', 'ranked', 'untracked')),
     taskcount bigint not null default 0,
     largeimageopenedcount bigint not null default 0,
+    trackedlargeimageopenedcount bigint not null default 0,
+    largeimageopencounttotal bigint not null default 0,
+    dragactioncounttotal bigint not null default 0,
+    orderchangedcount bigint not null default 0,
+    fastsubmitcount bigint not null default 0,
+    highriskcount bigint not null default 0,
+    behaviortrackedcount bigint not null default 0,
+    riskscoretotal bigint not null default 0,
+    riskscoremax integer not null default 0,
+    pageblurcounttotal bigint not null default 0,
     durationtotal bigint not null default 0,
     durationcount bigint not null default 0,
     durationmin bigint,
@@ -356,6 +398,26 @@ alter table scorer_scoring_stats
     add column if not exists durationmin bigint;
 alter table scorer_scoring_stats
     add column if not exists durationmax bigint;
+alter table scorer_scoring_stats
+    add column if not exists largeimageopencounttotal bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists trackedlargeimageopenedcount bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists dragactioncounttotal bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists orderchangedcount bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists fastsubmitcount bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists highriskcount bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists behaviortrackedcount bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists riskscoretotal bigint not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists riskscoremax integer not null default 0;
+alter table scorer_scoring_stats
+    add column if not exists pageblurcounttotal bigint not null default 0;
 
 create table if not exists subject_task_templates (
     id text primary key,
@@ -482,6 +544,12 @@ create index if not exists idx_rating_tasks_export_scorer_id
 create index if not exists idx_rating_tasks_completed_scorer_time
     on rating_tasks(taskversion, scorer, completedat, id)
     where status = 'completed';
+create index if not exists idx_rating_tasks_scoring_risk
+    on rating_tasks(taskversion, status, riskscore desc, completedat desc nulls last, id)
+    where status = 'completed';
+create index if not exists idx_rating_tasks_scoring_behavior
+    on rating_tasks(taskversion, status, submissionmode, orderchanged, largeimageopened, completedat desc nulls last, id)
+    where status = 'completed';
 create index if not exists idx_rating_tasks_scorer_version_status on rating_tasks(scorer, taskversion, status, subjectid);
 create index if not exists idx_rating_tasks_scorer_version_status_updated
     on rating_tasks(scorer, taskversion, status, updatedat desc, id);
@@ -536,18 +604,18 @@ create or replace function refresh_scorer_scoring_duration(
 begin
   update scorer_scoring_stats stats
      set durationmin = duration_values.durationmin,
-         durationmax = duration_values.durationmax
+         durationmax = duration_values.durationmax,
+         riskscoremax = coalesce(duration_values.riskscoremax, 0)
     from (
-      select min(durationms)::bigint as durationmin,
-             max(durationms)::bigint as durationmax
+      select min(case when durationms is not null and durationms >= 0 then durationms else null end)::bigint as durationmin,
+             max(case when durationms is not null and durationms >= 0 then durationms else null end)::bigint as durationmax,
+             max(coalesce(riskscore, 0))::integer as riskscoremax
       from rating_tasks
       where status = 'completed'
         and scorer = target_scorer
         and taskversion = target_task_version
         and coalesce(projectid, '') = target_project_id
         and coalesce(submissionmode, 'untracked') = target_submission_mode
-        and durationms is not null
-        and durationms >= 0
     ) duration_values
    where stats.scorer = target_scorer
      and stats.taskversion = target_task_version
@@ -623,6 +691,63 @@ begin
              0,
              largeimageopenedcount - case when coalesce(old.largeimageopened, false) then 1 else 0 end
            ),
+           largeimageopencounttotal = greatest(
+             0,
+             largeimageopencounttotal - greatest(coalesce(old.largeimageopencount, 0), 0)
+           ),
+           trackedlargeimageopenedcount = greatest(
+             0,
+             trackedlargeimageopenedcount - case
+               when coalesce(old.behaviortracked, false) and coalesce(old.largeimageopened, false) then 1
+               else 0
+             end
+           ),
+           dragactioncounttotal = greatest(
+             0,
+             dragactioncounttotal - greatest(coalesce(old.dragactioncount, 0), 0)
+           ),
+           orderchangedcount = greatest(
+             0,
+             orderchangedcount - case
+               when coalesce(old.behaviortracked, false) and coalesce(old.orderchanged, false) then 1
+               else 0
+             end
+           ),
+           fastsubmitcount = greatest(
+             0,
+             fastsubmitcount - case
+               when coalesce(old.behaviortracked, false)
+                 and old.durationms is not null
+                 and old.durationms >= 0
+                 and old.durationms < 3000 then 1
+               else 0
+             end
+           ),
+           highriskcount = greatest(
+             0,
+             highriskcount - case
+               when coalesce(old.behaviortracked, false) and coalesce(old.riskscore, 0) >= 60 then 1
+               else 0
+             end
+           ),
+           behaviortrackedcount = greatest(
+             0,
+             behaviortrackedcount - case when coalesce(old.behaviortracked, false) then 1 else 0 end
+           ),
+           riskscoretotal = greatest(
+             0,
+             riskscoretotal - case
+               when coalesce(old.behaviortracked, false) then greatest(coalesce(old.riskscore, 0), 0)
+               else 0
+             end
+           ),
+           pageblurcounttotal = greatest(
+             0,
+             pageblurcounttotal - case
+               when coalesce(old.behaviortracked, false) then greatest(coalesce(old.pageblurcount, 0), 0)
+               else 0
+             end
+           ),
            durationtotal = greatest(
              0,
              durationtotal - case when old.durationms is not null and old.durationms >= 0 then old.durationms else 0 end
@@ -651,7 +776,9 @@ begin
      and new.status = 'completed' then
     insert into scorer_scoring_stats(
       scorer, taskversion, projectid, submissionmode, taskcount,
-      largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax,
+      largeimageopenedcount, trackedlargeimageopenedcount, largeimageopencounttotal, dragactioncounttotal,
+      orderchangedcount, fastsubmitcount, highriskcount, behaviortrackedcount, riskscoretotal, riskscoremax,
+      pageblurcounttotal, durationtotal, durationcount, durationmin, durationmax,
       rollbackcount, updatedat
     )
     values (
@@ -661,6 +788,16 @@ begin
       coalesce(new.submissionmode, 'untracked'),
       1,
       case when coalesce(new.largeimageopened, false) then 1 else 0 end,
+      case when coalesce(new.behaviortracked, false) and coalesce(new.largeimageopened, false) then 1 else 0 end,
+      greatest(coalesce(new.largeimageopencount, 0), 0),
+      greatest(coalesce(new.dragactioncount, 0), 0),
+      case when coalesce(new.behaviortracked, false) and coalesce(new.orderchanged, false) then 1 else 0 end,
+      case when coalesce(new.behaviortracked, false) and new.durationms is not null and new.durationms >= 0 and new.durationms < 3000 then 1 else 0 end,
+      case when coalesce(new.behaviortracked, false) and coalesce(new.riskscore, 0) >= 60 then 1 else 0 end,
+      case when coalesce(new.behaviortracked, false) then 1 else 0 end,
+      greatest(coalesce(new.riskscore, 0), 0),
+      greatest(coalesce(new.riskscore, 0), 0),
+      greatest(coalesce(new.pageblurcount, 0), 0),
       case when new.durationms is not null and new.durationms >= 0 then new.durationms else 0 end,
       case when new.durationms is not null and new.durationms >= 0 then 1 else 0 end,
       case when new.durationms is not null and new.durationms >= 0 then new.durationms else null end,
@@ -671,6 +808,16 @@ begin
     on conflict (scorer, taskversion, projectid, submissionmode) do update set
       taskcount = scorer_scoring_stats.taskcount + excluded.taskcount,
       largeimageopenedcount = scorer_scoring_stats.largeimageopenedcount + excluded.largeimageopenedcount,
+      trackedlargeimageopenedcount = scorer_scoring_stats.trackedlargeimageopenedcount + excluded.trackedlargeimageopenedcount,
+      largeimageopencounttotal = scorer_scoring_stats.largeimageopencounttotal + excluded.largeimageopencounttotal,
+      dragactioncounttotal = scorer_scoring_stats.dragactioncounttotal + excluded.dragactioncounttotal,
+      orderchangedcount = scorer_scoring_stats.orderchangedcount + excluded.orderchangedcount,
+      fastsubmitcount = scorer_scoring_stats.fastsubmitcount + excluded.fastsubmitcount,
+      highriskcount = scorer_scoring_stats.highriskcount + excluded.highriskcount,
+      behaviortrackedcount = scorer_scoring_stats.behaviortrackedcount + excluded.behaviortrackedcount,
+      riskscoretotal = scorer_scoring_stats.riskscoretotal + excluded.riskscoretotal,
+      riskscoremax = greatest(scorer_scoring_stats.riskscoremax, excluded.riskscoremax),
+      pageblurcounttotal = scorer_scoring_stats.pageblurcounttotal + excluded.pageblurcounttotal,
       durationtotal = scorer_scoring_stats.durationtotal + excluded.durationtotal,
       durationcount = scorer_scoring_stats.durationcount + excluded.durationcount,
       durationmin = case
@@ -757,7 +904,10 @@ begin
   if not exists (select 1 from scorer_scoring_stats limit 1) then
     insert into scorer_scoring_stats(
       scorer, taskversion, projectid, submissionmode, taskcount,
-      largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax, rollbackcount, updatedat
+      largeimageopenedcount, trackedlargeimageopenedcount, largeimageopencounttotal, dragactioncounttotal,
+      orderchangedcount, fastsubmitcount, highriskcount, behaviortrackedcount, riskscoretotal, riskscoremax,
+      pageblurcounttotal, durationtotal, durationcount, durationmin, durationmax,
+      rollbackcount, updatedat
     )
     select scorer,
            taskversion,
@@ -765,6 +915,16 @@ begin
            coalesce(submissionmode, 'untracked'),
            count(*)::bigint,
            sum(case when coalesce(largeimageopened, false) then 1 else 0 end)::bigint,
+           sum(case when coalesce(behaviortracked, false) and coalesce(largeimageopened, false) then 1 else 0 end)::bigint,
+           sum(greatest(coalesce(largeimageopencount, 0), 0))::bigint,
+           sum(greatest(coalesce(dragactioncount, 0), 0))::bigint,
+           sum(case when coalesce(behaviortracked, false) and coalesce(orderchanged, false) then 1 else 0 end)::bigint,
+           sum(case when coalesce(behaviortracked, false) and durationms is not null and durationms >= 0 and durationms < 3000 then 1 else 0 end)::bigint,
+           sum(case when coalesce(behaviortracked, false) and coalesce(riskscore, 0) >= 60 then 1 else 0 end)::bigint,
+           sum(case when coalesce(behaviortracked, false) then 1 else 0 end)::bigint,
+           sum(case when coalesce(behaviortracked, false) then greatest(coalesce(riskscore, 0), 0) else 0 end)::bigint,
+           max(case when coalesce(behaviortracked, false) then greatest(coalesce(riskscore, 0), 0) else 0 end)::integer,
+           sum(case when coalesce(behaviortracked, false) then greatest(coalesce(pageblurcount, 0), 0) else 0 end)::bigint,
            sum(case when durationms is not null and durationms >= 0 then durationms else 0 end)::bigint,
            sum(case when durationms is not null and durationms >= 0 then 1 else 0 end)::bigint,
            min(case when durationms is not null and durationms >= 0 then durationms else null end)::bigint,

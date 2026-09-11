@@ -20,6 +20,18 @@ function reportRate(count, total) {
   return total ? count / total : 0;
 }
 
+function parseRiskFlags(value) {
+  if (!value) return [];
+  try {
+    const parsed = JSON.parse(value);
+    return Array.isArray(parsed)
+      ? [...new Set(parsed.map((item) => String(item ?? "").trim()).filter(Boolean))]
+      : [];
+  } catch {
+    return [];
+  }
+}
+
 async function writeResponseChunk(stream, chunk) {
   if (!stream.write(chunk)) await once(stream, "drain");
 }
@@ -223,11 +235,20 @@ function taskRecordDto(row) {
     scorer: row.scorer || "未分配",
     submissionMode: row.submissionMode || null,
     rankingActionCount: Number(row.rankingActionCount || 0),
+    dragActionCount: Number(row.dragActionCount || 0),
+    orderChanged: Boolean(row.orderChanged),
     largeImageOpened: Boolean(row.largeImageOpened),
+    largeImageOpenCount: Number(row.largeImageOpenCount || 0),
+    behaviorTracked: Boolean(row.behaviorTracked),
     isBacktest: Boolean(row.isBacktest),
     backtestSourceTaskId: row.backtestSourceId || null,
     durationMs,
     durationSeconds: durationMs == null ? null : durationMs / 1000,
+    firstActionMs: row.firstActionMs == null ? null : Number(row.firstActionMs),
+    firstActionSeconds: row.firstActionMs == null ? null : Number(row.firstActionMs) / 1000,
+    pageBlurCount: Number(row.pageBlurCount || 0),
+    riskScore: Number(row.riskScore || 0),
+    riskFlags: parseRiskFlags(row.riskFlags),
     completedAt: row.completedAt ?? null,
     editedAt: row.editedAt ?? null,
     editCount: Number(row.editCount || 0),
@@ -304,6 +325,10 @@ export function createAdminScoringService({
     const submissionMode = parseOptionalSubmissionMode(query.submissionMode, httpError);
     const minDurationMs = parseDurationSeconds(query.minDurationSeconds, "最短打分时长", httpError);
     const maxDurationMs = parseDurationSeconds(query.maxDurationSeconds, "最长打分时长", httpError);
+    const riskFilter = String(query.riskFilter ?? "").trim();
+    if (riskFilter && !["high", "fast", "no_large_image", "no_order_change", "page_blur"].includes(riskFilter)) {
+      throw httpError(400, "行为风险筛选不正确");
+    }
 
     if (submissionMode === "untracked") {
       clauses.push("rating_tasks.submissionMode IS NULL");
@@ -319,6 +344,12 @@ export function createAdminScoringService({
       clauses.push("rating_tasks.durationMs <= ?");
       params.push(maxDurationMs);
     }
+    if (riskFilter) clauses.push("rating_tasks.behaviorTracked = true");
+    if (riskFilter === "high") clauses.push("rating_tasks.riskScore >= 60");
+    if (riskFilter === "fast") clauses.push("rating_tasks.durationMs >= 0 AND rating_tasks.durationMs < 3000");
+    if (riskFilter === "no_large_image") clauses.push("rating_tasks.largeImageOpened = false");
+    if (riskFilter === "no_order_change") clauses.push("rating_tasks.orderChanged = false AND rating_tasks.dragActionCount = 0");
+    if (riskFilter === "page_blur") clauses.push("rating_tasks.pageBlurCount >= 3");
     return {
       where: `WHERE ${clauses.join(" AND ")}`,
       params,
@@ -327,6 +358,7 @@ export function createAdminScoringService({
       submissionMode,
       minDurationMs,
       maxDurationMs,
+      riskFilter: riskFilter || null,
     };
   }
 
@@ -338,6 +370,12 @@ export function createAdminScoringService({
       rankedSubmitCount: Number(totalsRow?.rankedSubmitCount || 0),
       untrackedSubmitCount: Number(totalsRow?.untrackedSubmitCount || 0),
       largeImageOpenedCount: Number(totalsRow?.largeImageOpenedCount || 0),
+      highRiskCount: Number(totalsRow?.highRiskCount || 0),
+      fastSubmitCount: Number(totalsRow?.fastSubmitCount || 0),
+      noLargeImageCount: Number(totalsRow?.noLargeImageCount || 0),
+      orderUnchangedCount: Number(totalsRow?.orderUnchangedCount || 0),
+      behaviorTrackedCount: Number(totalsRow?.behaviorTrackedCount || 0),
+      riskScoreTotal: Number(totalsRow?.riskScoreTotal || 0),
     };
     totals.directSubmitCount = totals.undraggedSubmitCount;
 
@@ -348,6 +386,13 @@ export function createAdminScoringService({
       directSubmitRate: reportRate(totals.undraggedSubmitCount, totals.totalTaskCount),
       undraggedSubmitRate: reportRate(totals.undraggedSubmitCount, totals.totalTaskCount),
       largeImageOpenedRate: reportRate(totals.largeImageOpenedCount, totals.totalTaskCount),
+      highRiskRate: reportRate(totals.highRiskCount, totals.behaviorTrackedCount),
+      fastSubmitRate: reportRate(totals.fastSubmitCount, totals.behaviorTrackedCount),
+      noLargeImageRate: reportRate(totals.noLargeImageCount, totals.behaviorTrackedCount),
+      orderUnchangedRate: reportRate(totals.orderUnchangedCount, totals.behaviorTrackedCount),
+      pageBlurCountTotal: Number(totalsRow?.pageBlurCountTotal || 0),
+      averageRiskScore: totals.behaviorTrackedCount ? totals.riskScoreTotal / totals.behaviorTrackedCount : 0,
+      maxRiskScore: rows.reduce((max, row) => Math.max(max, Number(row.maxRiskScore || 0)), 0),
       scorers: rows.map((row) => {
         const totalTaskCount = Number(row.totalTaskCount || 0);
         const undraggedSubmitCount = Number(row.undraggedSubmitCount || 0);
@@ -359,6 +404,12 @@ export function createAdminScoringService({
         const minDurationMs = row.durationMin == null ? null : Number(row.durationMin);
         const maxDurationMs = row.durationMax == null ? null : Number(row.durationMax);
         const largeImageOpenedCount = Number(row.largeImageOpenedCount || 0);
+        const highRiskCount = Number(row.highRiskCount || 0);
+        const fastSubmitCount = Number(row.fastSubmitCount || 0);
+        const noLargeImageCount = Number(row.noLargeImageCount || 0);
+        const orderUnchangedCount = Number(row.orderUnchangedCount || 0);
+        const behaviorTrackedCount = Number(row.behaviorTrackedCount || 0);
+        const riskScoreTotal = Number(row.riskScoreTotal || 0);
         return {
           scorer: row.scorer,
           projectCount: Number(row.projectCount || 0),
@@ -371,6 +422,18 @@ export function createAdminScoringService({
           undraggedSubmitRate: reportRate(undraggedSubmitCount, totalTaskCount),
           largeImageOpenedCount,
           largeImageOpenedRate: reportRate(largeImageOpenedCount, totalTaskCount),
+          highRiskCount,
+          highRiskRate: reportRate(highRiskCount, behaviorTrackedCount),
+          fastSubmitCount,
+          fastSubmitRate: reportRate(fastSubmitCount, behaviorTrackedCount),
+          noLargeImageCount,
+          noLargeImageRate: reportRate(noLargeImageCount, behaviorTrackedCount),
+          orderUnchangedCount,
+          orderUnchangedRate: reportRate(orderUnchangedCount, behaviorTrackedCount),
+          averageRiskScore: behaviorTrackedCount ? riskScoreTotal / behaviorTrackedCount : 0,
+          behaviorTrackedCount,
+          pageBlurCountTotal: Number(row.pageBlurCountTotal || 0),
+          maxRiskScore: Number(row.maxRiskScore || 0),
           averageDurationMs,
           averageDurationSeconds: averageDurationMs == null ? null : averageDurationMs / 1000,
           minDurationMs,
@@ -386,12 +449,16 @@ export function createAdminScoringService({
   async function calculateScoringSummary(query = {}) {
     const { page, pageSize } = parseTaskPagination(query);
     const filter = await buildTaskFilter(query);
-    const hasDurationFilter = filter.minDurationMs != null || filter.maxDurationMs != null;
-    const source = hasDurationFilter ? `
+    const hasTaskLevelFilter = filter.minDurationMs != null || filter.maxDurationMs != null || filter.riskFilter;
+    const source = hasTaskLevelFilter ? `
       SELECT rating_tasks.scorer,
              rating_tasks.projectId,
              rating_tasks.submissionMode,
              rating_tasks.largeImageOpened,
+             rating_tasks.orderChanged,
+             rating_tasks.behaviorTracked,
+             rating_tasks.riskScore,
+             rating_tasks.pageBlurCount,
              rating_tasks.durationMs,
              rating_tasks.rollbackCount
       FROM rating_tasks
@@ -402,6 +469,14 @@ export function createAdminScoringService({
              NULLIF(submissionMode, 'untracked') AS submissionMode,
              taskCount,
              largeImageOpenedCount,
+             trackedlargeimageopenedcount,
+             orderchangedcount,
+             fastsubmitcount,
+             highriskcount,
+             behaviortrackedcount,
+             riskscoretotal,
+             riskscoremax,
+             pageblurcounttotal,
              durationTotal,
              durationCount,
              durationMin,
@@ -413,7 +488,7 @@ export function createAdminScoringService({
         ${filter.projectId ? "AND projectId = ?" : ""}
         ${filter.submissionMode ? "AND submissionMode = ?" : ""}
     `;
-    const sourceParams = hasDurationFilter
+    const sourceParams = hasTaskLevelFilter
       ? filter.params
       : (() => {
         const values = [taskVersion];
@@ -422,13 +497,21 @@ export function createAdminScoringService({
         if (filter.submissionMode) values.push(filter.submissionMode);
         return values;
       })();
-    const groupedSelect = hasDurationFilter ? `
+    const groupedSelect = hasTaskLevelFilter ? `
       COUNT(*) AS totalTaskCount,
       COUNT(DISTINCT projectId) AS projectCount,
       SUM(CASE WHEN submissionMode = 'direct' THEN 1 ELSE 0 END) AS undraggedSubmitCount,
       SUM(CASE WHEN submissionMode = 'ranked' THEN 1 ELSE 0 END) AS rankedSubmitCount,
       SUM(CASE WHEN submissionMode IS NULL THEN 1 ELSE 0 END) AS untrackedSubmitCount,
       SUM(CASE WHEN largeImageOpened THEN 1 ELSE 0 END) AS largeImageOpenedCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) AND COALESCE(orderChanged, false) = false THEN 1 ELSE 0 END) AS orderUnchangedCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) AND COALESCE(riskScore, 0) >= 60 THEN 1 ELSE 0 END) AS highRiskCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) AND durationMs >= 0 AND durationMs < 3000 THEN 1 ELSE 0 END) AS fastSubmitCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) AND largeImageOpened = false THEN 1 ELSE 0 END) AS noLargeImageCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) THEN 1 ELSE 0 END) AS behaviorTrackedCount,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) THEN COALESCE(riskScore, 0) ELSE 0 END) AS riskScoreTotal,
+      MAX(CASE WHEN COALESCE(behaviorTracked, false) THEN COALESCE(riskScore, 0) ELSE 0 END) AS maxRiskScore,
+      SUM(CASE WHEN COALESCE(behaviorTracked, false) THEN COALESCE(pageBlurCount, 0) ELSE 0 END) AS pageBlurCountTotal,
       SUM(CASE WHEN durationMs >= 0 THEN durationMs ELSE 0 END) AS durationTotal,
       SUM(CASE WHEN durationMs >= 0 THEN 1 ELSE 0 END) AS durationCount,
       SUM(CASE WHEN durationMs >= 0 THEN durationMs ELSE 0 END)::double precision
@@ -443,6 +526,14 @@ export function createAdminScoringService({
       SUM(CASE WHEN submissionMode = 'ranked' THEN taskCount ELSE 0 END) AS rankedSubmitCount,
       SUM(CASE WHEN submissionMode IS NULL THEN taskCount ELSE 0 END) AS untrackedSubmitCount,
       SUM(largeImageOpenedCount) AS largeImageOpenedCount,
+      SUM(behaviortrackedcount - orderchangedcount) AS orderUnchangedCount,
+      SUM(highriskcount) AS highRiskCount,
+      SUM(fastsubmitcount) AS fastSubmitCount,
+      SUM(behaviortrackedcount - trackedlargeimageopenedcount) AS noLargeImageCount,
+      SUM(behaviortrackedcount) AS behaviorTrackedCount,
+      SUM(riskscoretotal) AS riskScoreTotal,
+      MAX(riskscoremax) AS maxRiskScore,
+      SUM(pageblurcounttotal) AS pageBlurCountTotal,
       SUM(durationTotal) AS durationTotal,
       SUM(durationCount) AS durationCount,
       SUM(durationTotal)::double precision / NULLIF(SUM(durationCount), 0) AS averageDurationMs,
@@ -467,6 +558,13 @@ export function createAdminScoringService({
       rankedSubmitCount: totals.rankedSubmitCount + Number(row.rankedSubmitCount || 0),
       untrackedSubmitCount: totals.untrackedSubmitCount + Number(row.untrackedSubmitCount || 0),
       largeImageOpenedCount: totals.largeImageOpenedCount + Number(row.largeImageOpenedCount || 0),
+      highRiskCount: totals.highRiskCount + Number(row.highRiskCount || 0),
+      fastSubmitCount: totals.fastSubmitCount + Number(row.fastSubmitCount || 0),
+      noLargeImageCount: totals.noLargeImageCount + Number(row.noLargeImageCount || 0),
+      orderUnchangedCount: totals.orderUnchangedCount + Number(row.orderUnchangedCount || 0),
+      riskScoreTotal: totals.riskScoreTotal + Number(row.riskScoreTotal || 0),
+      behaviorTrackedCount: totals.behaviorTrackedCount + Number(row.behaviorTrackedCount || 0),
+      pageBlurCountTotal: totals.pageBlurCountTotal + Number(row.pageBlurCountTotal || 0),
     }), {
       scorerCount: 0,
       totalTaskCount: 0,
@@ -474,6 +572,13 @@ export function createAdminScoringService({
       rankedSubmitCount: 0,
       untrackedSubmitCount: 0,
       largeImageOpenedCount: 0,
+      highRiskCount: 0,
+      fastSubmitCount: 0,
+      noLargeImageCount: 0,
+      orderUnchangedCount: 0,
+      riskScoreTotal: 0,
+      behaviorTrackedCount: 0,
+      pageBlurCountTotal: 0,
     });
     return summaryResultFromRows(rows.slice((page - 1) * pageSize, page * pageSize), totalsRow, page, pageSize);
   }
@@ -485,6 +590,7 @@ export function createAdminScoringService({
       scorer: query.scorer || null,
       projectId: query.projectId || null,
       submissionMode: query.submissionMode || null,
+      riskFilter: query.riskFilter || null,
       minDurationSeconds: query.minDurationSeconds || null,
       maxDurationSeconds: query.maxDurationSeconds || null,
     });
@@ -539,10 +645,10 @@ export function createAdminScoringService({
     const { page, pageSize } = parseTaskPagination(query);
     const filter = await buildTaskFilter(query);
     const cursor = parseTaskCursor(query.cursor, httpError);
-    const hasDurationFilter = filter.minDurationMs != null || filter.maxDurationMs != null;
+    const hasTaskLevelFilter = filter.minDurationMs != null || filter.maxDurationMs != null || filter.riskFilter;
     let total = null;
     if (includeTaskTotal(query)) {
-      if (hasDurationFilter) {
+      if (hasTaskLevelFilter) {
         const row = await db
           .prepare(`SELECT COUNT(*) AS total FROM rating_tasks ${filter.where}`)
           .get(...filter.params);
@@ -563,10 +669,13 @@ export function createAdminScoringService({
       .prepare(
         `SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId,
                 rating_tasks.taskType, rating_tasks.status, rating_tasks.scorer,
-                rating_tasks.submissionMode, rating_tasks.rankingActionCount,
-                rating_tasks.largeImageOpened,
+                rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.dragActionCount,
+                rating_tasks.orderChanged, rating_tasks.largeImageOpened, rating_tasks.largeImageOpenCount,
+                rating_tasks.behaviorTracked,
                 rating_tasks.isBacktest, rating_tasks.backtestSourceId,
-                rating_tasks.durationMs, rating_tasks.completedAt, rating_tasks.editedAt,
+                rating_tasks.durationMs, rating_tasks.firstActionMs, rating_tasks.pageBlurCount,
+                rating_tasks.riskScore, rating_tasks.riskFlags,
+                rating_tasks.completedAt, rating_tasks.editedAt,
                 rating_tasks.editCount, rating_tasks.rollbackCount, rating_tasks.updatedAt,
                 projects.name AS projectName
          FROM rating_tasks
@@ -617,8 +726,8 @@ export function createAdminScoringService({
   }
 
   async function scoringOperationExportSummary(filter) {
-    const hasDurationFilter = filter.minDurationMs != null || filter.maxDurationMs != null;
-    if (!hasDurationFilter) {
+    const hasTaskLevelFilter = filter.minDurationMs != null || filter.maxDurationMs != null || filter.riskFilter;
+    if (!hasTaskLevelFilter) {
       const stats = scoringStatsFilter(filter);
       const [totals, scorerRows] = await Promise.all([
         db.prepare(`
@@ -686,6 +795,7 @@ export function createAdminScoringService({
         submissionMode: filter.submissionMode,
         minDurationSeconds: filter.minDurationMs == null ? null : filter.minDurationMs / 1000,
         maxDurationSeconds: filter.maxDurationMs == null ? null : filter.maxDurationMs / 1000,
+        riskFilter: filter.riskFilter,
       },
       taskCount: summary.taskCount,
       scorerCount: summary.scorerCount,
@@ -700,10 +810,13 @@ export function createAdminScoringService({
       const rows = await db.prepare(`
         SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId,
                rating_tasks.taskType, rating_tasks.status, rating_tasks.scorer,
-               rating_tasks.submissionMode, rating_tasks.rankingActionCount,
-               rating_tasks.largeImageOpened,
+               rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.dragActionCount,
+               rating_tasks.orderChanged, rating_tasks.largeImageOpened, rating_tasks.largeImageOpenCount,
+               rating_tasks.behaviorTracked,
                rating_tasks.isBacktest, rating_tasks.backtestSourceId,
-               rating_tasks.durationMs, rating_tasks.completedAt, rating_tasks.editedAt,
+               rating_tasks.durationMs, rating_tasks.firstActionMs, rating_tasks.pageBlurCount,
+               rating_tasks.riskScore, rating_tasks.riskFlags,
+               rating_tasks.completedAt, rating_tasks.editedAt,
                rating_tasks.editCount, rating_tasks.rollbackCount, rating_tasks.updatedAt,
                projects.name AS projectName
         FROM rating_tasks
@@ -737,6 +850,263 @@ export function createAdminScoringService({
     };
   }
 
+  async function buildScoringRiskReportFilter(query = {}) {
+    const scorers = normalizeScorerNameList(query.scorers, "打分人", httpError);
+    const projectId = query.projectId ? await parseProjectId(query.projectId) : null;
+    const submissionMode = parseOptionalSubmissionMode(query.submissionMode, httpError);
+    const clauses = [
+      "rating_tasks.taskVersion = ?",
+      "rating_tasks.status = 'completed'",
+      "rating_tasks.scorer = ?",
+    ];
+    if (projectId) {
+      clauses.push("rating_tasks.projectId = ?");
+    }
+    if (submissionMode === "untracked") {
+      clauses.push("rating_tasks.submissionMode IS NULL");
+    } else if (submissionMode) {
+      clauses.push("rating_tasks.submissionMode = ?");
+    }
+
+    return {
+      scorers,
+      projectId,
+      submissionMode,
+      where: `WHERE ${clauses.join(" AND ")}`,
+      paramsForScorer(scorer) {
+        return [taskVersion, scorer, ...(projectId ? [projectId] : []), ...(submissionMode && submissionMode !== "untracked" ? [submissionMode] : [])];
+      },
+    };
+  }
+
+  function scoringRiskReportSummary(row) {
+    const completedTaskCount = Number(row?.completedTaskCount || 0);
+    const behaviorTrackedTaskCount = Number(row?.behaviorTrackedTaskCount || 0);
+    const riskScoreTotal = Number(row?.riskScoreTotal || 0);
+    const durationCount = Number(row?.durationCount || 0);
+    const firstActionCount = Number(row?.firstActionCount || 0);
+    return {
+      completedTaskCount,
+      behaviorTrackedTaskCount,
+      behaviorUntrackedTaskCount: completedTaskCount - behaviorTrackedTaskCount,
+      projectCount: Number(row?.projectCount || 0),
+      directSubmitCount: Number(row?.directSubmitCount || 0),
+      rankedSubmitCount: Number(row?.rankedSubmitCount || 0),
+      untrackedSubmitCount: Number(row?.untrackedSubmitCount || 0),
+      largeImageOpenedTaskCount: Number(row?.largeImageOpenedTaskCount || 0),
+      largeImageOpenCountTotal: Number(row?.largeImageOpenCountTotal || 0),
+      dragActionCountTotal: Number(row?.dragActionCountTotal || 0),
+      orderChangedTaskCount: Number(row?.orderChangedTaskCount || 0),
+      pageBlurCountTotal: Number(row?.pageBlurCountTotal || 0),
+      averageDurationSeconds: durationCount ? Number(row?.durationTotal || 0) / durationCount / 1000 : null,
+      averageFirstActionSeconds: firstActionCount ? Number(row?.firstActionTotal || 0) / firstActionCount / 1000 : null,
+      averageRiskScore: behaviorTrackedTaskCount ? riskScoreTotal / behaviorTrackedTaskCount : 0,
+      maxRiskScore: Number(row?.maxRiskScore || 0),
+      highRiskTaskCount: Number(row?.highRiskTaskCount || 0),
+      fastSubmitTaskCount: Number(row?.fastSubmitTaskCount || 0),
+      noLargeImageTaskCount: Number(row?.noLargeImageTaskCount || 0),
+      noOrderChangeTaskCount: Number(row?.noOrderChangeTaskCount || 0),
+      lateFirstActionTaskCount: Number(row?.lateFirstActionTaskCount || 0),
+      frequentPageBlurTaskCount: Number(row?.frequentPageBlurTaskCount || 0),
+      riskScoreTotal,
+    };
+  }
+
+  function addScoringRiskReportTotals(totals, summary) {
+    [
+      "completedTaskCount",
+      "behaviorTrackedTaskCount",
+      "behaviorUntrackedTaskCount",
+      "directSubmitCount",
+      "rankedSubmitCount",
+      "untrackedSubmitCount",
+      "largeImageOpenedTaskCount",
+      "largeImageOpenCountTotal",
+      "dragActionCountTotal",
+      "orderChangedTaskCount",
+      "pageBlurCountTotal",
+      "highRiskTaskCount",
+      "fastSubmitTaskCount",
+      "noLargeImageTaskCount",
+      "noOrderChangeTaskCount",
+      "lateFirstActionTaskCount",
+      "frequentPageBlurTaskCount",
+      "riskScoreTotal",
+    ].forEach((key) => {
+      totals[key] += Number(summary[key] || 0);
+    });
+    totals.maxRiskScore = Math.max(totals.maxRiskScore, Number(summary.maxRiskScore || 0));
+  }
+
+  async function writeScoringRiskTaskIds(stream, filter, scorer, condition) {
+    const batchSize = 1000;
+    let written = 0;
+    let lastId = null;
+    await writeResponseChunk(stream, "[");
+    while (true) {
+      const rows = await db.prepare(`
+        SELECT rating_tasks.id
+        FROM rating_tasks
+        ${filter.where}
+          AND rating_tasks.behaviorTracked = true
+          AND (${condition})
+          AND (?::text IS NULL OR rating_tasks.id > ?)
+        ORDER BY rating_tasks.id ASC
+        LIMIT ?
+      `).all(...filter.paramsForScorer(scorer), lastId, lastId, batchSize);
+      if (!rows.length) break;
+      lastId = rows[rows.length - 1].id;
+      await writeResponseChunk(
+        stream,
+        rows.map((row) => `${written++ ? "," : ""}${JSON.stringify(row.id)}`).join(""),
+      );
+    }
+    await writeResponseChunk(stream, "]");
+    return written;
+  }
+
+  async function writeScoringRiskReport(stream, query = {}, onProgress) {
+    exportProgress(onProgress, "正在准备风险报告", 3);
+    const filter = await buildScoringRiskReportFilter(query);
+    const totals = {
+      scorerCount: filter.scorers.length,
+      completedTaskCount: 0,
+      behaviorTrackedTaskCount: 0,
+      behaviorUntrackedTaskCount: 0,
+      directSubmitCount: 0,
+      rankedSubmitCount: 0,
+      untrackedSubmitCount: 0,
+      largeImageOpenedTaskCount: 0,
+      largeImageOpenCountTotal: 0,
+      dragActionCountTotal: 0,
+      orderChangedTaskCount: 0,
+      pageBlurCountTotal: 0,
+      highRiskTaskCount: 0,
+      fastSubmitTaskCount: 0,
+      noLargeImageTaskCount: 0,
+      noOrderChangeTaskCount: 0,
+      lateFirstActionTaskCount: 0,
+      frequentPageBlurTaskCount: 0,
+      riskScoreTotal: 0,
+      maxRiskScore: 0,
+    };
+    const violations = [
+      {
+        key: "highRiskTaskIds",
+        condition: "COALESCE(rating_tasks.riskScore, 0) >= 60",
+      },
+      {
+        key: "fastSubmitTaskIds",
+        condition: "rating_tasks.durationMs >= 0 AND rating_tasks.durationMs < 3000",
+      },
+      {
+        key: "noLargeImageTaskIds",
+        condition: "COALESCE(rating_tasks.largeImageOpened, false) = false AND COALESCE(rating_tasks.largeImageOpenCount, 0) <= 0",
+      },
+      {
+        key: "noOrderChangeTaskIds",
+        condition: "COALESCE(rating_tasks.orderChanged, false) = false AND COALESCE(rating_tasks.rankingActionCount, 0) <= 0 AND COALESCE(rating_tasks.dragActionCount, 0) <= 0",
+      },
+      {
+        key: "lateFirstActionTaskIds",
+        condition: "rating_tasks.firstActionMs IS NULL OR (rating_tasks.durationMs >= 1000 AND rating_tasks.firstActionMs > rating_tasks.durationMs * 0.8)",
+      },
+      {
+        key: "frequentPageBlurTaskIds",
+        condition: "COALESCE(rating_tasks.pageBlurCount, 0) >= 3",
+      },
+    ];
+
+    const header = {
+      exportedAt: nowIso(),
+      taskVersion,
+      filters: {
+        scorers: filter.scorers,
+        projectId: filter.projectId,
+        submissionMode: filter.submissionMode,
+      },
+      riskRules: {
+        highRiskScore: 60,
+        fastSubmitDurationMs: 3000,
+        frequentPageBlurCount: 3,
+      },
+      violationDefinitions: {
+        highRiskTaskIds: "风险分不低于 60",
+        fastSubmitTaskIds: "提交用时少于 3 秒",
+        noLargeImageTaskIds: "未打开大图",
+        noOrderChangeTaskIds: "未发生排序变化",
+        lateFirstActionTaskIds: "首次操作缺失或发生在打分时长后 20% 区间",
+        frequentPageBlurTaskIds: "页面失焦至少 3 次",
+      },
+    };
+    await writeResponseChunk(stream, `${JSON.stringify(header).slice(0, -1)},"scorerReports":[`);
+
+    for (let scorerIndex = 0; scorerIndex < filter.scorers.length; scorerIndex += 1) {
+      const scorer = filter.scorers[scorerIndex];
+      exportProgress(
+        onProgress,
+        `正在汇总 ${scorer} 的风险行为`,
+        5 + (scorerIndex / filter.scorers.length) * 90,
+      );
+      const row = await db.prepare(`
+        SELECT COUNT(*) AS "completedTaskCount",
+               COUNT(DISTINCT rating_tasks.projectId) AS "projectCount",
+               SUM(CASE WHEN rating_tasks.submissionMode = 'direct' THEN 1 ELSE 0 END) AS "directSubmitCount",
+               SUM(CASE WHEN rating_tasks.submissionMode = 'ranked' THEN 1 ELSE 0 END) AS "rankedSubmitCount",
+               SUM(CASE WHEN rating_tasks.submissionMode IS NULL THEN 1 ELSE 0 END) AS "untrackedSubmitCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) THEN 1 ELSE 0 END) AS "behaviorTrackedTaskCount",
+               SUM(CASE WHEN rating_tasks.largeImageOpened THEN 1 ELSE 0 END) AS "largeImageOpenedTaskCount",
+               SUM(COALESCE(rating_tasks.largeImageOpenCount, 0)) AS "largeImageOpenCountTotal",
+               SUM(COALESCE(rating_tasks.dragActionCount, 0)) AS "dragActionCountTotal",
+               SUM(CASE WHEN COALESCE(rating_tasks.orderChanged, false) THEN 1 ELSE 0 END) AS "orderChangedTaskCount",
+               SUM(COALESCE(rating_tasks.pageBlurCount, 0)) AS "pageBlurCountTotal",
+               SUM(CASE WHEN rating_tasks.durationMs >= 0 THEN rating_tasks.durationMs ELSE 0 END) AS "durationTotal",
+               SUM(CASE WHEN rating_tasks.durationMs >= 0 THEN 1 ELSE 0 END) AS "durationCount",
+               SUM(CASE WHEN rating_tasks.firstActionMs >= 0 THEN rating_tasks.firstActionMs ELSE 0 END) AS "firstActionTotal",
+               SUM(CASE WHEN rating_tasks.firstActionMs >= 0 THEN 1 ELSE 0 END) AS "firstActionCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) THEN COALESCE(rating_tasks.riskScore, 0) ELSE 0 END) AS "riskScoreTotal",
+               MAX(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) THEN COALESCE(rating_tasks.riskScore, 0) ELSE 0 END) AS "maxRiskScore",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND COALESCE(rating_tasks.riskScore, 0) >= 60 THEN 1 ELSE 0 END) AS "highRiskTaskCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND rating_tasks.durationMs >= 0 AND rating_tasks.durationMs < 3000 THEN 1 ELSE 0 END) AS "fastSubmitTaskCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND COALESCE(rating_tasks.largeImageOpened, false) = false AND COALESCE(rating_tasks.largeImageOpenCount, 0) <= 0 THEN 1 ELSE 0 END) AS "noLargeImageTaskCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND COALESCE(rating_tasks.orderChanged, false) = false AND COALESCE(rating_tasks.rankingActionCount, 0) <= 0 AND COALESCE(rating_tasks.dragActionCount, 0) <= 0 THEN 1 ELSE 0 END) AS "noOrderChangeTaskCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND (rating_tasks.firstActionMs IS NULL OR (rating_tasks.durationMs >= 1000 AND rating_tasks.firstActionMs > rating_tasks.durationMs * 0.8)) THEN 1 ELSE 0 END) AS "lateFirstActionTaskCount",
+               SUM(CASE WHEN COALESCE(rating_tasks.behaviorTracked, false) AND COALESCE(rating_tasks.pageBlurCount, 0) >= 3 THEN 1 ELSE 0 END) AS "frequentPageBlurTaskCount"
+        FROM rating_tasks
+        ${filter.where}
+      `).get(...filter.paramsForScorer(scorer));
+      const behaviorSummary = scoringRiskReportSummary(row);
+      addScoringRiskReportTotals(totals, behaviorSummary);
+
+      await writeResponseChunk(
+        stream,
+        `${scorerIndex ? "," : ""}${JSON.stringify({ scorer, behaviorSummary }).slice(0, -1)},"violations":{`,
+      );
+      for (let violationIndex = 0; violationIndex < violations.length; violationIndex += 1) {
+        const violation = violations[violationIndex];
+        await writeResponseChunk(stream, `${violationIndex ? "," : ""}${JSON.stringify(violation.key)}:`);
+        await writeScoringRiskTaskIds(stream, filter, scorer, violation.condition);
+        exportProgress(
+          onProgress,
+          `正在写入 ${scorer} 的风险任务 ID`,
+          5 + ((scorerIndex + (violationIndex + 1) / violations.length) / filter.scorers.length) * 90,
+        );
+      }
+      await writeResponseChunk(stream, "}}");
+    }
+
+    const totalSummary = {
+      ...totals,
+      averageRiskScore: totals.behaviorTrackedTaskCount
+        ? totals.riskScoreTotal / totals.behaviorTrackedTaskCount
+        : 0,
+    };
+    delete totalSummary.riskScoreTotal;
+    await endResponseStream(stream, `],"summary":${JSON.stringify(totalSummary)}}`);
+    exportProgress(onProgress, "风险报告 JSON 已写入", 95);
+    return totalSummary;
+  }
+
   async function selectTasksByIds(taskIds) {
     const rows = [];
     for (const ids of chunk(taskIds)) {
@@ -746,9 +1116,12 @@ export function createAdminScoringService({
             `SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId,
                     rating_tasks.taskVersion, rating_tasks.taskType, rating_tasks.status,
                     rating_tasks.scorer, rating_tasks.submissionMode,
-                    rating_tasks.rankingActionCount,
-                    rating_tasks.largeImageOpened, rating_tasks.isBacktest,
-                    rating_tasks.backtestSourceId, rating_tasks.durationMs,
+                    rating_tasks.rankingActionCount, rating_tasks.dragActionCount,
+                    rating_tasks.orderChanged, rating_tasks.largeImageOpened, rating_tasks.largeImageOpenCount,
+                    rating_tasks.behaviorTracked,
+                    rating_tasks.isBacktest, rating_tasks.backtestSourceId, rating_tasks.durationMs,
+                    rating_tasks.firstActionMs, rating_tasks.pageBlurCount,
+                    rating_tasks.riskScore, rating_tasks.riskFlags,
                     rating_tasks.completedAt, rating_tasks.editedAt, rating_tasks.editCount,
                     rating_tasks.rollbackCount, rating_tasks.updatedAt,
                     projects.name AS projectName
@@ -785,9 +1158,12 @@ export function createAdminScoringService({
       SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId,
              rating_tasks.taskVersion, rating_tasks.taskType, rating_tasks.status,
              rating_tasks.scorer, rating_tasks.submissionMode,
-             rating_tasks.rankingActionCount,
-             rating_tasks.largeImageOpened, rating_tasks.isBacktest,
-             rating_tasks.backtestSourceId, rating_tasks.durationMs,
+             rating_tasks.rankingActionCount, rating_tasks.dragActionCount,
+             rating_tasks.orderChanged, rating_tasks.largeImageOpened, rating_tasks.largeImageOpenCount,
+             rating_tasks.behaviorTracked,
+             rating_tasks.isBacktest, rating_tasks.backtestSourceId, rating_tasks.durationMs,
+             rating_tasks.firstActionMs, rating_tasks.pageBlurCount,
+             rating_tasks.riskScore, rating_tasks.riskFlags,
              rating_tasks.completedAt, rating_tasks.editedAt, rating_tasks.editCount,
              rating_tasks.rollbackCount, rating_tasks.updatedAt,
              projects.name AS projectName
@@ -973,10 +1349,18 @@ export function createAdminScoringService({
              rankingRelations = NULL,
              submissionMode = NULL,
              rankingActionCount = 0,
+             dragActionCount = 0,
+             orderChanged = false,
              largeImageOpened = false,
+             largeImageOpenCount = 0,
              startedAt = NULL,
              completedAt = NULL,
              durationMs = NULL,
+             firstActionMs = NULL,
+             pageBlurCount = 0,
+             behaviorTracked = false,
+             riskScore = 0,
+             riskFlags = NULL,
              editedAt = NULL,
              editCount = 0,
              rollbackCount = COALESCE(rollbackCount, 0) + 1,
@@ -1193,6 +1577,7 @@ export function createAdminScoringService({
     listScoringTaskRecords,
     listScoringOptions,
     writeScoringOperationsExport,
+    writeScoringRiskReport,
     invalidateSummaryCache,
     previewRollback,
     rollbackScoringTasks,

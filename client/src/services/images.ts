@@ -59,9 +59,16 @@ type TaskCompletionPayload = {
   correctImageIds?: string[];
   submissionMode?: TaskSubmissionMode;
   rankingActionCount?: number;
+  dragActionCount?: number;
+  orderChanged?: boolean;
   largeImageOpened?: boolean;
+  largeImageOpenCount?: number;
+  firstActionMs?: number | null;
+  pageBlurCount?: number;
   durationMs: number;
 };
+
+type ScoringRiskFilter = 'high' | 'fast' | 'no_large_image' | 'no_order_change' | 'page_blur';
 
 type ScoringRollbackPreviewPayload = {
   taskIds: string[];
@@ -424,6 +431,7 @@ export const imageApi = {
     scorer?: string | null;
     projectId?: string | null;
     submissionMode?: TaskSubmissionModeFilter | null;
+    riskFilter?: ScoringRiskFilter | null;
   } = {}) {
     const params = new URLSearchParams();
     if (query.page) params.set('page', String(query.page));
@@ -431,6 +439,7 @@ export const imageApi = {
     if (query.scorer) params.set('scorer', query.scorer);
     if (query.projectId) params.set('projectId', query.projectId);
     if (query.submissionMode) params.set('submissionMode', query.submissionMode);
+    if (query.riskFilter) params.set('riskFilter', query.riskFilter);
     return requestJson<ScoringManagementSummary>(`/api/admin/scoring/summary${params.toString() ? `?${params}` : ''}`);
   },
   adminScoringOptions() {
@@ -444,6 +453,7 @@ export const imageApi = {
     scorer?: string | null;
     projectId?: string | null;
     submissionMode?: TaskSubmissionModeFilter | null;
+    riskFilter?: ScoringRiskFilter | null;
     minDurationSeconds?: number | null;
     maxDurationSeconds?: number | null;
   } = {}) {
@@ -455,6 +465,7 @@ export const imageApi = {
     if (query.scorer) params.set('scorer', query.scorer);
     if (query.projectId) params.set('projectId', query.projectId);
     if (query.submissionMode) params.set('submissionMode', query.submissionMode);
+    if (query.riskFilter) params.set('riskFilter', query.riskFilter);
     if (query.minDurationSeconds != null) params.set('minDurationSeconds', String(query.minDurationSeconds));
     if (query.maxDurationSeconds != null) params.set('maxDurationSeconds', String(query.maxDurationSeconds));
     return requestJson<ScoringTaskRecordPage>(`/api/admin/scoring/tasks${params.toString() ? `?${params}` : ''}`);
@@ -463,6 +474,7 @@ export const imageApi = {
     scorer?: string | null;
     projectId?: string | null;
     submissionMode?: TaskSubmissionModeFilter | null;
+    riskFilter?: ScoringRiskFilter | null;
     minDurationSeconds?: number | null;
     maxDurationSeconds?: number | null;
   } = {}, options?: AdminExportOptions) {
@@ -470,9 +482,20 @@ export const imageApi = {
     if (filters.scorer) payload.scorer = filters.scorer;
     if (filters.projectId) payload.projectId = filters.projectId;
     if (filters.submissionMode) payload.submissionMode = filters.submissionMode;
+    if (filters.riskFilter) payload.riskFilter = filters.riskFilter;
     if (filters.minDurationSeconds != null) payload.minDurationSeconds = filters.minDurationSeconds;
     if (filters.maxDurationSeconds != null) payload.maxDurationSeconds = filters.maxDurationSeconds;
     return runAdminExport('scoring-operation-log', payload, options);
+  },
+  async exportScoringRiskReport(filters: {
+    scorers: string[];
+    projectId?: string | null;
+    submissionMode?: TaskSubmissionModeFilter | null;
+  }, options?: AdminExportOptions) {
+    const payload: Record<string, unknown> = { scorers: filters.scorers };
+    if (filters.projectId) payload.projectId = filters.projectId;
+    if (filters.submissionMode) payload.submissionMode = filters.submissionMode;
+    return runAdminExport('scoring-risk-report', payload, options);
   },
   previewScoringRollback(payload: ScoringRollbackPreviewPayload) {
     return requestJson<ScoringRollbackPreview>('/api/admin/scoring/rollback/preview', {
