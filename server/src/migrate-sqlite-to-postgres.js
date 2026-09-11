@@ -161,6 +161,31 @@ async function rebuildTaskStats() {
       AND status IN ('assigned', 'completed')
     GROUP BY scorer, taskversion, COALESCE(projectid, '')
   `);
+
+  await client.query("DELETE FROM scorer_scoring_stats");
+  await client.query(`
+    INSERT INTO scorer_scoring_stats
+      (scorer, taskversion, projectid, submissionmode, taskcount,
+       largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax,
+       rollbackcount, updatedat)
+    SELECT scorer,
+           taskversion,
+           COALESCE(projectid, ''),
+           COALESCE(submissionmode, 'untracked'),
+           COUNT(*),
+           SUM(CASE WHEN COALESCE(largeimageopened, false) THEN 1 ELSE 0 END),
+           SUM(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN durationms ELSE 0 END),
+           SUM(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN 1 ELSE 0 END),
+           MIN(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN durationms ELSE NULL END),
+           MAX(CASE WHEN durationms IS NOT NULL AND durationms >= 0 THEN durationms ELSE NULL END),
+           SUM(COALESCE(rollbackcount, 0)),
+           COALESCE(MAX(updatedat), CURRENT_TIMESTAMP)
+    FROM rating_tasks
+    WHERE scorer IS NOT NULL
+      AND BTRIM(scorer) <> ''
+      AND status = 'completed'
+    GROUP BY scorer, taskversion, COALESCE(projectid, ''), COALESCE(submissionmode, 'untracked')
+  `);
 }
 
 await client.connect();

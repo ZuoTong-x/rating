@@ -45,6 +45,7 @@ const taskScorers = ref<Array<{ id: string; username: string }>>([]);
 const selectedTaskScorers = ref<string[]>([]);
 const taskAllocations = ref<Record<string, number | null>>({});
 const perScorerTaskCount = ref<number | null>(null);
+const backtestRatio = ref<number | null>(0);
 const allocationImporting = ref(false);
 const allocationImportFeedback = ref<AllocationImportFeedback | null>(null);
 const taskScorerRequest = ref(0);
@@ -71,7 +72,65 @@ const assignedTaskCount = computed(() => selectedTaskScorers.value.reduce(
   (total, username) => total + Math.max(0, Math.floor(Number(taskAllocations.value[username]) || 0)),
   0
 ));
-const remainingTaskCount = computed(() => Math.max(availableTaskCount.value - assignedTaskCount.value, 0));
+const backtestPercent = computed(() => Math.max(0, Math.min(50, Number(backtestRatio.value) || 0)));
+function backtestTaskCountForTaskCount(taskCount: number) {
+  if (!backtestPercent.value || taskCount <= 1) return 0;
+  const requested = Math.floor((taskCount * backtestPercent.value) / 100);
+  return Math.max(0, Math.min(requested, taskCount - 1));
+}
+function baseTaskCountForTaskCount(taskCount: number) {
+  return Math.max(0, taskCount - backtestTaskCountForTaskCount(taskCount));
+}
+function allocationBaseTaskTotal(allocations: Record<string, number | null>, scorers = selectedTaskScorers.value) {
+  return scorers.reduce((total, username) => {
+    const taskCount = Math.max(0, Math.floor(Number(allocations[username]) || 0));
+    return total + baseTaskCountForTaskCount(taskCount);
+  }, 0);
+}
+const backtestTaskCount = computed(() => selectedTaskScorers.value.reduce((total, username) => {
+  const taskCount = Math.max(0, Math.floor(Number(taskAllocations.value[username]) || 0));
+  return total + backtestTaskCountForTaskCount(taskCount);
+}, 0));
+const baseAssignedTaskCount = computed(() => allocationBaseTaskTotal(taskAllocations.value));
+function maxTaskCountForBaseLimit(baseLimit: number) {
+  const limit = Math.max(0, Math.floor(baseLimit));
+  if (!limit) return 0;
+  if (!backtestPercent.value) return limit;
+  let low = 0;
+  let high = Math.ceil(limit / Math.max(0.01, 1 - backtestPercent.value / 100)) + 4;
+  while (baseTaskCountForTaskCount(high) <= limit) high *= 2;
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (baseTaskCountForTaskCount(middle) <= limit) low = middle;
+    else high = middle - 1;
+  }
+  return low;
+}
+function evenAllocationBaseTaskTotal(totalTaskCount: number, userCount: number) {
+  const count = Math.max(0, Math.floor(totalTaskCount));
+  const users = Math.max(0, Math.floor(userCount));
+  if (!count || !users) return 0;
+  const base = Math.floor(count / users);
+  const remainder = count % users;
+  return ((users - remainder) * baseTaskCountForTaskCount(base))
+    + (remainder * baseTaskCountForTaskCount(base + 1));
+}
+function maxEvenTaskCountForBaseLimit(baseLimit: number, userCount: number) {
+  const limit = Math.max(0, Math.floor(baseLimit));
+  const users = Math.max(0, Math.floor(userCount));
+  if (!limit || !users) return 0;
+  if (!backtestPercent.value) return limit;
+  let low = 0;
+  let high = maxTaskCountForBaseLimit(limit);
+  while (low < high) {
+    const middle = Math.ceil((low + high) / 2);
+    if (evenAllocationBaseTaskTotal(middle, users) <= limit) low = middle;
+    else high = middle - 1;
+  }
+  return low;
+}
+const maxAssignableTaskCount = computed(() => maxTaskCountForBaseLimit(availableTaskCount.value));
+const remainingTaskCount = computed(() => Math.max(availableTaskCount.value - baseAssignedTaskCount.value, 0));
 const allocationPayload = computed(() => selectedTaskScorers.value.map(username => ({
   scorer: username,
   taskCount: Math.max(0, Math.floor(Number(taskAllocations.value[username]) || 0))
@@ -271,7 +330,7 @@ function updateTaskAllocation(username: string, value: number | null) {
 }
 
 function normalizeTaskAllocations(editedUsername: string) {
-  const limit = availableTaskCount.value;
+  const limit = maxAssignableTaskCount.value;
   if (!limit) return;
 
   const selected = taskScorers.value.filter(user => selectedTaskScorerSet.value.has(user.username));
@@ -281,7 +340,7 @@ function normalizeTaskAllocations(editedUsername: string) {
       ? Math.min(limit, Math.max(0, Math.floor(Number(taskAllocations.value[user.username]) || 0)))
       : 0
   ])) as Record<string, number>;
-  let overflow = Object.values(next).reduce((total, count) => total + count, 0) - limit;
+  let overflow = allocationBaseTaskTotal(next) - availableTaskCount.value;
   if (overflow <= 0) {
     taskAllocations.value = next;
     return;
@@ -294,13 +353,14 @@ function normalizeTaskAllocations(editedUsername: string) {
     .sort((left, right) => next[right.username] - next[left.username]);
   for (const user of otherUsers) {
     if (overflow <= 0) break;
-    const reduction = Math.min(next[user.username], overflow);
-    next[user.username] -= reduction;
-    overflow -= reduction;
+    const targetBaseCount = Math.max(0, baseTaskCountForTaskCount(next[user.username]) - overflow);
+    next[user.username] = Math.min(next[user.username], maxTaskCountForBaseLimit(targetBaseCount));
+    overflow = allocationBaseTaskTotal(next) - availableTaskCount.value;
   }
 
   if (overflow > 0) {
-    next[editedUsername] = Math.max(0, next[editedUsername] - overflow);
+    const targetBaseCount = Math.max(0, baseTaskCountForTaskCount(next[editedUsername]) - overflow);
+    next[editedUsername] = Math.min(next[editedUsername], maxTaskCountForBaseLimit(targetBaseCount));
   }
   taskAllocations.value = next;
 }
@@ -312,12 +372,14 @@ function distributeEvenly() {
     return;
   }
   if (!availableTaskCount.value) return;
-  const base = Math.floor(availableTaskCount.value / users.length);
-  const remainder = availableTaskCount.value % users.length;
+  const totalTaskCount = maxEvenTaskCountForBaseLimit(availableTaskCount.value, users.length);
+  const base = Math.floor(totalTaskCount / users.length);
+  const remainder = totalTaskCount % users.length;
+  const userIndexes = new Map(users.map((user, index) => [user.username, index]));
   taskAllocations.value = Object.fromEntries(taskScorers.value.map(user => [
     user.username,
     selectedTaskScorerSet.value.has(user.username)
-      ? base + (users.findIndex(item => item.username === user.username) < remainder ? 1 : 0)
+      ? base + ((userIndexes.get(user.username) ?? users.length) < remainder ? 1 : 0)
       : 0
   ]));
 }
@@ -332,15 +394,16 @@ function assignFixedTaskCount() {
     message.error('请输入每人分配数量');
     return;
   }
-  const total = taskCount * selectedTaskScorerCount.value;
-  if (total > availableTaskCount.value) {
-    message.error(`分配总数不能超过 ${availableTaskCount.value}`);
-    return;
-  }
-  taskAllocations.value = Object.fromEntries(taskScorers.value.map(user => [
+  const nextAllocations = Object.fromEntries(taskScorers.value.map(user => [
     user.username,
     selectedTaskScorerSet.value.has(user.username) ? taskCount : 0
-  ]));
+  ])) as Record<string, number>;
+  const poolTaskCount = allocationBaseTaskTotal(nextAllocations);
+  if (poolTaskCount > availableTaskCount.value) {
+    message.error(`本次占用任务池数量不能超过 ${availableTaskCount.value}`);
+    return;
+  }
+  taskAllocations.value = nextAllocations;
 }
 
 function applyAllocationImport(result: TaskAllocationImportResult) {
@@ -368,6 +431,7 @@ function applyAllocationImport(result: TaskAllocationImportResult) {
   ]));
 
   const totalTaskCount = [...importedAllocations.values()].reduce((total, count) => total + count, 0);
+  const importedBaseTaskCount = allocationBaseTaskTotal(taskAllocations.value, selectedTaskScorers.value);
   allocationImportFeedback.value = {
     filename: result.filename,
     parsedCount: result.rows.length,
@@ -375,7 +439,7 @@ function applyAllocationImport(result: TaskAllocationImportResult) {
     ignoredCount: ignoredScorers.length,
     invalidCount: result.errors.length,
     totalTaskCount,
-    overflow: Math.max(0, totalTaskCount - availableTaskCount.value),
+    overflow: Math.max(0, importedBaseTaskCount - availableTaskCount.value),
     ignoredScorers,
     errors: result.errors
   };
@@ -419,6 +483,7 @@ async function openTaskProject(project: ProjectItem) {
   selectedTaskScorers.value = [];
   taskAllocations.value = {};
   perScorerTaskCount.value = null;
+  backtestRatio.value = 0;
   allocationImportFeedback.value = null;
   taskModalVisible.value = true;
   await loadTaskScorers();
@@ -487,8 +552,8 @@ async function startTask() {
     message.error('请至少为一名打分人设置任务数量');
     return;
   }
-  if (assignedTaskCount.value > availableTaskCount.value) {
-    message.error(`已分配任务数量不能超过 ${availableTaskCount.value}`);
+  if (baseAssignedTaskCount.value > availableTaskCount.value) {
+    message.error(`占用任务池数量不能超过 ${availableTaskCount.value}`);
     return;
   }
   submitting.value = true;
@@ -498,7 +563,7 @@ async function startTask() {
   const taskId = taskStack.addTask({
     kind: 'generate',
     title: `发起任务：${project.name}`,
-    description: `${allocationPayload.value.length} 个打分人 / ${assignedTaskCount.value} 个任务`,
+    description: `${allocationPayload.value.length} 个打分人 / 实际 ${assignedTaskCount.value} 个任务 / 回测 ${backtestTaskCount.value} 个`,
     stage: '等待导入任务模板',
     progress: 0
   });
@@ -506,7 +571,8 @@ async function startTask() {
     const job = await imageApi.generateProjectTasks(project._id, {
       teamIds: taskTeamIds.value,
       teamMatchMode: taskTeamMatchMode.value,
-      allocations: allocationPayload.value
+      allocations: allocationPayload.value,
+      backtestRatio: backtestPercent.value
     });
     taskStack.updateTask(taskId, {
       progress: job.progress,
@@ -520,9 +586,9 @@ async function startTask() {
     if (!result) throw new Error('任务生成完成，但没有返回结果');
     taskStack.finishTask(taskId, {
       stage: '任务创建完成',
-      description: `已生成 ${result.createdCount} 个，已分配 ${result.assignedCount} 个`
+      description: `已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个`
     });
-    message.success(`已生成 ${result.createdCount} 个任务，已分配 ${result.assignedCount} 个，待分配 ${result.unassignedCount} 个`);
+    message.success(`已生成 ${result.createdCount} 个任务，已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个，待分配 ${result.unassignedCount} 个`);
     await loadData();
     await router.push(`/admin/projects/${encodeURIComponent(project._id)}/tasks`);
   } catch (error) {
@@ -693,8 +759,17 @@ onMounted(() => void loadData());
           <n-tag size="small" type="info" :bordered="false">模板任务 {{ taskTemplateCount }}</n-tag>
           <n-tag size="small" :bordered="false">可下发 {{ availableTaskCount }}</n-tag>
           <n-tag size="small" :bordered="false">已选 {{ selectedTaskScorerCount }}</n-tag>
-          <n-tag size="small" type="success" :bordered="false">已分配 {{ assignedTaskCount }}</n-tag>
+          <n-tag size="small" type="success" :bordered="false">实际下发 {{ assignedTaskCount }}</n-tag>
+          <n-tag size="small" :bordered="false">占用任务池 {{ baseAssignedTaskCount }}</n-tag>
+          <n-tag size="small" type="warning" :bordered="false">回测 {{ backtestTaskCount }}</n-tag>
           <n-tag size="small" :bordered="false">待分配 {{ remainingTaskCount }}</n-tag>
+        </div>
+        <div class="task-allocation-backtest">
+          <span>回测比例</span>
+          <n-input-number v-model:value="backtestRatio" size="small" :min="0" :max="50" :precision="2"
+            :show-button="true" />
+          <span>%</span>
+          <n-text depth="3">按每个打分人的实际下发数随机复制任务，回测任务只在管理端标记。</n-text>
         </div>
         <div class="task-allocation-toolbar">
           <div class="task-allocation-toolbar-group">
@@ -706,7 +781,7 @@ onMounted(() => void loadData());
           </div>
           <div class="task-allocation-fixed">
             <span>每人</span>
-            <n-input-number v-model:value="perScorerTaskCount" size="small" :min="1" :max="availableTaskCount"
+            <n-input-number v-model:value="perScorerTaskCount" size="small" :min="1" :max="maxAssignableTaskCount"
               :show-button="true" />
             <span>个</span>
             <n-button size="small" secondary :disabled="!selectedTaskScorerCount"
@@ -734,7 +809,7 @@ onMounted(() => void loadData());
             无效行 {{ allocationImportFeedback.invalidCount }} 条：{{ allocationImportFeedback.errors.slice(0, 3).join('；') }}
           </div>
           <div v-if="allocationImportFeedback.overflow">
-            超出可下发任务 {{ allocationImportFeedback.overflow }} 个，请调整后再创建任务
+            超出可下发任务池 {{ allocationImportFeedback.overflow }} 个，请调整后再创建任务
           </div>
         </n-alert>
         <div v-if="taskScorersLoading" class="task-allocation-empty">正在加载团队成员...</div>
@@ -744,7 +819,7 @@ onMounted(() => void loadData());
             <n-checkbox :checked="selectedTaskScorerSet.has(user.username)"
               @update:checked="(checked: boolean) => updateTaskScorerSelected(user.username, checked)" />
             <span class="task-allocation-scorer">{{ user.username }}</span>
-            <n-input-number :value="taskAllocations[user.username] ?? 0" :min="0" :max="availableTaskCount"
+            <n-input-number :value="taskAllocations[user.username] ?? 0" :min="0" :max="maxAssignableTaskCount"
               :show-button="true" :disabled="!selectedTaskScorerSet.has(user.username)"
               @update:value="(value: number | null) => updateTaskAllocation(user.username, value)"
               @blur="() => normalizeTaskAllocations(user.username)" />

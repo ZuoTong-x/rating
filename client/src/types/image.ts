@@ -164,6 +164,9 @@ export interface RatingTask {
   correctImageIds?: string[] | null;
   submissionMode?: TaskSubmissionMode | null;
   rankingActionCount?: number;
+  largeImageOpened?: boolean;
+  isBacktest?: boolean;
+  backtestSourceTaskId?: string | null;
   startedAt?: string | null;
   completedAt?: string | null;
   durationMs?: number | null;
@@ -180,10 +183,14 @@ export interface ScoringSummaryScorer {
   scorer: string;
   projectCount: number;
   totalTaskCount: number;
+  undraggedSubmitCount: number;
   directSubmitCount: number;
   rankedSubmitCount: number;
   untrackedSubmitCount: number;
+  undraggedSubmitRate: number;
   directSubmitRate: number;
+  largeImageOpenedCount: number;
+  largeImageOpenedRate: number;
   averageDurationMs: number | null;
   averageDurationSeconds: number | null;
   minDurationMs: number | null;
@@ -198,10 +205,14 @@ export interface ScoringManagementSummary {
   page: number;
   pageSize: number;
   totalTaskCount: number;
+  undraggedSubmitCount: number;
   directSubmitCount: number;
   rankedSubmitCount: number;
   untrackedSubmitCount: number;
+  undraggedSubmitRate: number;
   directSubmitRate: number;
+  largeImageOpenedCount: number;
+  largeImageOpenedRate: number;
   scorers: ScoringSummaryScorer[];
 }
 
@@ -214,6 +225,9 @@ export interface ScoringTaskRecord {
   scorer: string;
   submissionMode?: TaskSubmissionMode | null;
   rankingActionCount: number;
+  largeImageOpened: boolean;
+  isBacktest?: boolean;
+  backtestSourceTaskId?: string | null;
   durationMs: number | null;
   durationSeconds: number | null;
   completedAt: string | null;
@@ -239,6 +253,10 @@ export interface ScoringRollbackGroup {
 }
 
 export interface ScoringRollbackPreview {
+  source?: 'task_ids' | 'scorer_full';
+  sourceScorers?: string[];
+  projectId?: string | null;
+  submissionMode?: TaskSubmissionModeFilter | null;
   requestedTaskCount: number;
   uniqueTaskCount: number;
   duplicateTaskCount: number;
@@ -249,6 +267,7 @@ export interface ScoringRollbackPreview {
   taskIds: string[];
   scorers: ScoringRollbackGroup[];
   projects: ScoringRollbackGroup[];
+  assignees?: ScoringRollbackGroup[];
   tasks: ScoringTaskRecord[];
   ignoredTasks: ScoringTaskRecord[];
   missingTaskIds: string[];
@@ -260,6 +279,7 @@ export interface ScoringRollbackPreview {
 
 export interface ScoringRollbackResult extends ScoringRollbackPreview {
   rolledBackTaskCount: number;
+  reassignedTaskCount?: number;
   rolledBackAt: string;
   rolledBackBy: string;
 }
@@ -278,6 +298,7 @@ export interface ScoringRollbackJob {
 export type AdminExportType =
   | 'project-completed-tasks'
   | 'scorer-completed-tasks'
+  | 'scoring-operation-log'
   | 'team-task-summary'
   | 'project-task-report';
 
@@ -321,6 +342,8 @@ export interface AdminTaskListItem {
   criterion?: TaskCriterionKey | null;
   status: 'pending' | 'assigned' | 'completed';
   scorer?: string | null;
+  isBacktest?: boolean;
+  backtestSourceTaskId?: string | null;
   createdAt: string;
   items: TaskListItemImage[];
 }

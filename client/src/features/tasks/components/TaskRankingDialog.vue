@@ -32,12 +32,55 @@ const excludedImageIds = ref<string[]>([]);
 const correctImageIds = ref<string[]>([]);
 const equalPairKeys = ref<string[]>([]);
 const rankingActionCount = ref(0);
+const largeImageOpened = ref(false);
 const draggingIndex = ref<number | null>(null);
 const openedAt = ref(0);
 const detailItem = ref<RatingTaskItem | null>(null);
 const detailVisible = ref(false);
 const imagePreviewVisible = ref(false);
 const imagePreviewSrc = ref('');
+let imagePrefetchRun = 0;
+const prefetchedImageUrls = new Set<string>();
+
+function idleTimeout(callback: () => void, timeout = 600) {
+  const requestIdleCallback = (window as Window & {
+    requestIdleCallback?: (handler: () => void, options?: { timeout?: number }) => void;
+  }).requestIdleCallback;
+  if (requestIdleCallback) {
+    requestIdleCallback(callback, { timeout });
+    return;
+  }
+  window.setTimeout(callback, timeout);
+}
+
+async function prefetchLargeImages(items: RatingTaskItem[], runId: number) {
+  const urls = [...new Set(items
+    .map(item => item.image.imageUrl)
+    .filter((url): url is string => Boolean(url && !prefetchedImageUrls.has(url))))];
+
+  for (const url of urls) {
+    if (runId !== imagePrefetchRun || !visible.value) return;
+    await new Promise<void>(resolve => {
+      const image = new Image();
+      image.decoding = 'async';
+      image.onload = () => {
+        prefetchedImageUrls.add(url);
+        resolve();
+      };
+      image.onerror = () => resolve();
+      image.src = url;
+    });
+  }
+}
+
+function scheduleLargeImagePrefetch(items: RatingTaskItem[]) {
+  imagePrefetchRun += 1;
+  const runId = imagePrefetchRun;
+  if (!items.length) return;
+  idleTimeout(() => {
+    void prefetchLargeImages(items, runId);
+  });
+}
 
 function handlePreviewEscape(event: KeyboardEvent) {
   if (!visible.value || !imagePreviewVisible.value || event.key !== 'Escape') return;
@@ -138,11 +181,13 @@ function resetOrder() {
   lastSavedTask.value = null;
   const task = props.task;
   if (!task) {
+    imagePrefetchRun += 1;
     orderedItems.value = [];
     excludedImageIds.value = [];
     correctImageIds.value = [];
     equalPairKeys.value = [];
     rankingActionCount.value = 0;
+    largeImageOpened.value = false;
     return;
   }
   const storedExclusions = supportsExclusion.value
@@ -188,8 +233,10 @@ function resetOrder() {
     return pairs;
   }, []);
   rankingActionCount.value = 0;
+  largeImageOpened.value = Boolean(task.largeImageOpened);
   draggingIndex.value = null;
   openedAt.value = Date.now();
+  scheduleLargeImagePrefetch(task.items);
 }
 
 function markRankingAction() {
@@ -197,7 +244,11 @@ function markRankingAction() {
 }
 
 watch(() => [props.show, props.task], ([show]) => {
-  if (show) resetOrder();
+  if (!show) {
+    imagePrefetchRun += 1;
+    return;
+  }
+  resetOrder();
 }, { immediate: true });
 
 function startDrag(index: number, event: DragEvent) {
@@ -257,8 +308,13 @@ function openDetail(item: RatingTaskItem) {
 }
 
 function openImagePreview(item: RatingTaskItem) {
+  largeImageOpened.value = true;
   imagePreviewSrc.value = item.image.imageUrl;
   imagePreviewVisible.value = true;
+}
+
+function markLargeImageOpened() {
+  largeImageOpened.value = true;
 }
 
 function toggleExclusion(item: RatingTaskItem) {
@@ -352,6 +408,7 @@ async function submit(advance = false) {
       excludedImageIds: excludedImageIds.value,
       correctImageIds: isCorrectnessCriterion.value ? correctImageIds.value : [],
       ...trackingPayload,
+      largeImageOpened: largeImageOpened.value,
       durationMs: Math.max(Date.now() - openedAt.value, 0)
     };
     const result = isEditing.value
@@ -568,7 +625,7 @@ async function retryNextTask() {
     <div v-if="detailItem" class="task-image-detail-body">
       <n-image class="task-image-detail-preview" :src="detailItem.image.thumbnailUrl || detailItem.image.imageUrl"
         :preview-src="detailItem.image.imageUrl" :alt="detailItem.image.filename" object-fit="contain"
-        show-toolbar-tooltip />
+        show-toolbar-tooltip @click="markLargeImageOpened" />
       <div class="task-image-detail-panel">
         <template v-if="isPromptAlignment">
 

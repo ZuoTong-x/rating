@@ -211,24 +211,31 @@ const activeTaskGenerationBySubject = new Map();
 const isTaskGenerationWorker = process.env.TASK_GENERATION_WORKER === "1";
 const taskGenerationJobTtlMs = 24 * 60 * 60 * 1000;
 const selectTaskGenerationJobStmt = db.prepare(`
-  SELECT jobId, subjectId, status, stage, progress, message, resultJson, createdAt, updatedAt, expiresAt
+  SELECT jobId, subjectId, status, stage, progress, message, requestJson, stageEventsJson, resultJson, createdAt, updatedAt, expiresAt
   FROM task_generation_jobs
   WHERE jobId = ?
 `);
 const selectActiveTaskGenerationJobBySubjectStmt = db.prepare(`
-  SELECT jobId, subjectId, status, stage, progress, message, resultJson, createdAt, updatedAt, expiresAt
+  SELECT jobId, subjectId, status, stage, progress, message, requestJson, stageEventsJson, resultJson, createdAt, updatedAt, expiresAt
   FROM task_generation_jobs
   WHERE subjectId = ?
     AND status IN ('queued', 'running')
   ORDER BY updatedAt DESC, createdAt DESC
   LIMIT 1
 `);
+const selectActiveTaskGenerationJobStmt = db.prepare(`
+  SELECT jobId, subjectId, status, stage, progress, message, requestJson, stageEventsJson, resultJson, createdAt, updatedAt, expiresAt
+  FROM task_generation_jobs
+  WHERE status IN ('queued', 'running')
+  ORDER BY updatedAt DESC, createdAt DESC
+  LIMIT 1
+`);
 const upsertTaskGenerationJobStmt = db.prepare(`
   INSERT INTO task_generation_jobs (
-    jobId, subjectId, status, stage, progress, message, resultJson,
+    jobId, subjectId, status, stage, progress, message, requestJson, stageEventsJson, resultJson,
     createdAt, updatedAt, expiresAt
   ) VALUES (
-    @jobId, @subjectId, @status, @stage, @progress, @message, @resultJson,
+    @jobId, @subjectId, @status, @stage, @progress, @message, @requestJson, @stageEventsJson, @resultJson,
     @createdAt, @updatedAt, @expiresAt
   )
   ON CONFLICT (jobId) DO UPDATE SET
@@ -237,6 +244,8 @@ const upsertTaskGenerationJobStmt = db.prepare(`
     stage = excluded.stage,
     progress = excluded.progress,
     message = excluded.message,
+    requestJson = excluded.requestJson,
+    stageEventsJson = excluded.stageEventsJson,
     resultJson = excluded.resultJson,
     updatedAt = excluded.updatedAt,
     expiresAt = excluded.expiresAt
@@ -283,6 +292,15 @@ const authAccountLockMs = 10 * 60 * 1000;
 const authCaptchaTtlMs = 5 * 60 * 1000;
 const authCaptchaSecret = process.env.AUTH_CAPTCHA_SECRET || crypto.randomBytes(32).toString("hex");
 
+function parseTaskGenerationJobJson(value, fallback = null) {
+  if (!value) return fallback;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
+}
+
 function taskGenerationJobDto(job) {
   const payload = {
     jobId: job.jobId,
@@ -293,18 +311,14 @@ function taskGenerationJobDto(job) {
     progress: job.progress,
     message: job.message || null,
   };
+  if (job.request) payload.request = job.request;
+  if (job.stageEvents?.length) payload.stageEvents = job.stageEvents;
   if (job.result) payload.result = job.result;
   return payload;
 }
 
 function taskGenerationJobFromRow(row) {
   if (!row) return null;
-  let result = null;
-  if (row.resultJson) {
-    try {
-      result = JSON.parse(row.resultJson);
-    } catch {}
-  }
   return {
     jobId: row.jobId,
     subjectId: row.subjectId,
@@ -312,7 +326,9 @@ function taskGenerationJobFromRow(row) {
     stage: row.stage,
     progress: Number(row.progress || 0),
     message: row.message || null,
-    result,
+    request: parseTaskGenerationJobJson(row.requestJson),
+    stageEvents: parseTaskGenerationJobJson(row.stageEventsJson, []),
+    result: parseTaskGenerationJobJson(row.resultJson),
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
     expiresAt: row.expiresAt,
@@ -327,6 +343,8 @@ function taskGenerationJobRecord(job) {
     stage: job.stage,
     progress: Math.max(0, Math.min(100, Number(job.progress) || 0)),
     message: job.message || null,
+    requestJson: job.request ? JSON.stringify(job.request) : null,
+    stageEventsJson: job.stageEvents?.length ? JSON.stringify(job.stageEvents) : null,
     resultJson: job.result ? JSON.stringify(job.result) : null,
     createdAt: job.createdAt,
     updatedAt: job.updatedAt,
@@ -337,6 +355,38 @@ function taskGenerationJobRecord(job) {
 async function persistTaskGenerationJob(job) {
   job.updatedAt = nowIso();
   await upsertTaskGenerationJobStmt.run(taskGenerationJobRecord(job));
+}
+
+function closeTaskGenerationStageEvent(event, endedAt) {
+  if (!event || event.endedAt) return;
+  event.endedAt = endedAt;
+  const startedAt = new Date(event.startedAt).getTime();
+  const endedAtMs = new Date(endedAt).getTime();
+  if (Number.isFinite(startedAt) && Number.isFinite(endedAtMs)) {
+    event.durationMs = Math.max(0, endedAtMs - startedAt);
+  }
+}
+
+function recordTaskGenerationStage(job, stage, progress, terminal = false) {
+  const nextStage = String(stage || job.stage || "任务生成中");
+  const nextProgress = Math.max(0, Math.min(100, Number(progress ?? job.progress) || 0));
+  const timestamp = nowIso();
+  const events = Array.isArray(job.stageEvents) ? job.stageEvents : [];
+  const current = events[events.length - 1];
+  if (!current || current.stage !== nextStage) {
+    closeTaskGenerationStageEvent(current, timestamp);
+    events.push({
+      stage: nextStage,
+      progress: nextProgress,
+      startedAt: timestamp,
+      updatedAt: timestamp,
+    });
+  } else {
+    current.progress = nextProgress;
+    current.updatedAt = timestamp;
+  }
+  if (terminal) closeTaskGenerationStageEvent(events[events.length - 1], timestamp);
+  job.stageEvents = events.slice(-80);
 }
 
 async function getTaskGenerationJob(jobId) {
@@ -368,6 +418,14 @@ async function getActiveTaskGenerationJob(subjectId) {
     activeTaskGenerationBySubject.set(subjectId, persisted.jobId);
   }
   return persisted;
+}
+
+async function getAnyActiveTaskGenerationJob() {
+  const cached = [...taskGenerationJobs.values()]
+    .filter((job) => ["queued", "running"].includes(job.status))
+    .sort((left, right) => new Date(right.updatedAt).getTime() - new Date(left.updatedAt).getTime())[0];
+  if (cached) return cached;
+  return taskGenerationJobFromRow(await selectActiveTaskGenerationJobStmt.get());
 }
 
 function scheduleTaskGenerationJobCleanup(job) {
@@ -476,6 +534,15 @@ function adminExportJobConfig(type) {
       stage: "等待导出打分人任务明细",
     };
   }
+  if (type === "scoring-operation-log") {
+    return {
+      fallbackName: "筛选结果",
+      title: "打分操作记录",
+      extension: ".json",
+      contentType: "application/json; charset=utf-8",
+      stage: "等待导出打分操作记录",
+    };
+  }
   if (type === "team-task-summary") {
     return {
       fallbackName: "团队",
@@ -498,6 +565,9 @@ function adminExportJobConfig(type) {
 }
 
 async function adminExportEntityNames(type, query = {}) {
+  if (type === "scoring-operation-log") {
+    return ["筛选结果"];
+  }
   if (type === "project-completed-tasks") {
     const ids = parseQueryList(query.projectIds ?? query.projectId);
     const projects = await Promise.all(ids.map((id) => getProjectOrThrow(id)));
@@ -577,6 +647,9 @@ function normalizeAdminExportRequest(body = {}) {
       teamIds: body.teamIds,
       completedFrom,
       completedTo,
+      submissionMode: body.submissionMode,
+      minDurationSeconds: body.minDurationSeconds,
+      maxDurationSeconds: body.maxDurationSeconds,
       excludeInactiveScorers: normalizeAdminExportBoolean(body.excludeInactiveScorers),
     },
     ...config,
@@ -1085,7 +1158,7 @@ const taskCriterionLabels = {
 
 const selectTaskRowsPageStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
-         submissionMode, rankingActionCount, startedAt, completedAt, durationMs, editedAt, editCount,
+         submissionMode, rankingActionCount, largeImageOpened, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
          rollbackCount, lastRolledBackAt, lastRolledBackBy, imageKey, createdAt, updatedAt
   FROM rating_tasks
   WHERE projectId = ? AND taskVersion = ?
@@ -1095,7 +1168,8 @@ const selectTaskRowsPageStmt = db.prepare(`
 const selectAssignedTaskRowsPageStmt = db.prepare(`
   SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId, rating_tasks.taskVersion,
          rating_tasks.taskType, rating_tasks.status, rating_tasks.scorer, rating_tasks.ranking, rating_tasks.excludedImageIds, rating_tasks.correctImageIds, rating_tasks.rankingRelations,
-         rating_tasks.submissionMode, rating_tasks.rankingActionCount,
+         rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.largeImageOpened,
+         rating_tasks.isBacktest, rating_tasks.backtestSourceId,
          rating_tasks.startedAt, rating_tasks.completedAt, rating_tasks.durationMs, rating_tasks.editedAt, rating_tasks.editCount,
          rating_tasks.rollbackCount, rating_tasks.lastRolledBackAt, rating_tasks.lastRolledBackBy,
          rating_tasks.imageKey, rating_tasks.createdAt, rating_tasks.updatedAt,
@@ -1136,7 +1210,7 @@ const selectScorerProjectCountStmt = db.prepare(`
 `);
 const selectTaskByIdStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
-         submissionMode, rankingActionCount, startedAt, completedAt, durationMs, editedAt, editCount,
+         submissionMode, rankingActionCount, largeImageOpened, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
          rollbackCount, lastRolledBackAt, lastRolledBackBy, imageKey, createdAt, updatedAt
   FROM rating_tasks
   WHERE id = ?
@@ -1156,6 +1230,7 @@ const completeAssignedTaskStmt = db.prepare(`
       rankingRelations = @rankingRelations,
       submissionMode = @submissionMode,
       rankingActionCount = @rankingActionCount,
+      largeImageOpened = @largeImageOpened,
       startedAt = @startedAt,
       completedAt = @completedAt,
       durationMs = @durationMs,
@@ -1172,6 +1247,7 @@ const updateCompletedTaskStmt = db.prepare(`
       rankingRelations = @rankingRelations,
       submissionMode = @submissionMode,
       rankingActionCount = @rankingActionCount,
+      largeImageOpened = @largeImageOpened,
       editedAt = @editedAt,
       editCount = COALESCE(editCount, 0) + 1,
       updatedAt = @updatedAt
@@ -1181,9 +1257,9 @@ const updateCompletedTaskStmt = db.prepare(`
 `);
 const insertRatingTaskStmt = db.prepare(`
   INSERT INTO rating_tasks (
-    id, subjectId, projectId, taskVersion, round, taskType, status, scorer, ranking, assignmentKey, imageKey, createdAt, updatedAt
+    id, subjectId, projectId, taskVersion, round, taskType, status, scorer, ranking, assignmentKey, imageKey, isBacktest, backtestSourceId, createdAt, updatedAt
   ) VALUES (
-    @id, @subjectId, @projectId, @taskVersion, @round, @taskType, 'pending', NULL, NULL, @assignmentKey, @imageKey, @createdAt, @updatedAt
+    @id, @subjectId, @projectId, @taskVersion, @round, @taskType, 'pending', NULL, NULL, @assignmentKey, @imageKey, false, NULL, @createdAt, @updatedAt
   )
   ON CONFLICT DO NOTHING
 `);
@@ -1258,6 +1334,7 @@ const selectPendingProjectTaskIdsStmt = db.prepare(`
     AND taskVersion = ?
     AND status = 'pending'
     AND scorer IS NULL
+    AND NOT isBacktest
   ORDER BY assignmentKey ASC, id ASC
   LIMIT ?
 `);
@@ -3580,6 +3657,28 @@ async function refreshProjectTaskStats(projectId, version = taskVersion) {
   );
 }
 
+let taskGenerationAnalyzeQueued = false;
+function queueTaskGenerationAnalyze() {
+  if (taskGenerationAnalyzeQueued) return;
+  taskGenerationAnalyzeQueued = true;
+  setImmediate(async () => {
+    try {
+      for (const table of [
+        "rating_tasks",
+        "rating_task_items",
+        "project_task_stats",
+        "scorer_task_stats",
+      ]) {
+        await db.exec(`ANALYZE ${table}`);
+      }
+    } catch (error) {
+      console.error("Task generation analyze failed", error);
+    } finally {
+      taskGenerationAnalyzeQueued = false;
+    }
+  });
+}
+
 function invalidateTaskSummaryCaches(projectId) {
   subjectTaskReportCache.delete(projectId);
 }
@@ -3618,25 +3717,65 @@ function queueProjectTaskSummary(projectId) {
 async function projectStatsByIds(projectIds, version = taskVersion) {
   const ids = [...new Set(projectIds.filter(Boolean))];
   if (!ids.length) return new Map();
-  const rows = await db
-    .prepare(
-      `SELECT projectId, total, pending, assigned, completed
-       FROM project_task_stats
-       WHERE taskVersion = ?
-         AND projectId IN (${placeholders(ids.length)})`,
-    )
-    .all(version, ...ids);
-  return new Map(
-    rows.map((row) => [
-      row.projectId,
-      {
-        total: Number(row.total || 0),
-        pending: Number(row.pending || 0),
-        assigned: Number(row.assigned || 0),
-        completed: Number(row.completed || 0),
-      },
-    ]),
-  );
+  const statsByProjectId = new Map(ids.map((id) => [id, {
+    total: 0,
+    pending: 0,
+    assigned: 0,
+    completed: 0,
+    materializedTotal: 0,
+    materializedPending: 0,
+  }]));
+  const [statRows, materializedRows] = await Promise.all([
+    db
+      .prepare(
+        `SELECT projectId, total, pending, assigned, completed
+         FROM project_task_stats
+         WHERE taskVersion = ?
+           AND projectId IN (${placeholders(ids.length)})`,
+      )
+      .all(version, ...ids),
+    db
+      .prepare(
+        `SELECT projectId,
+                COUNT(*) FILTER (WHERE NOT isBacktest) AS materializedTotal,
+                COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending') AS materializedPending
+         FROM rating_tasks
+         WHERE taskVersion = ?
+           AND projectId IN (${placeholders(ids.length)})
+         GROUP BY projectId`,
+      )
+      .all(version, ...ids),
+  ]);
+  statRows.forEach((row) => {
+    statsByProjectId.set(row.projectId, {
+      ...(statsByProjectId.get(row.projectId) || {}),
+      total: Number(row.total || 0),
+      pending: Number(row.pending || 0),
+      assigned: Number(row.assigned || 0),
+      completed: Number(row.completed || 0),
+    });
+  });
+  materializedRows.forEach((row) => {
+    statsByProjectId.set(row.projectId, {
+      ...(statsByProjectId.get(row.projectId) || {}),
+      materializedTotal: Number(row.materializedTotal || 0),
+      materializedPending: Number(row.materializedPending || 0),
+    });
+  });
+  return statsByProjectId;
+}
+
+async function getProjectMaterializedTaskStats(projectId, version = taskVersion) {
+  const row = await db.prepare(
+    `SELECT COUNT(*) FILTER (WHERE NOT isBacktest) AS materializedTotal,
+            COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending') AS materializedPending
+     FROM rating_tasks
+     WHERE projectId = ? AND taskVersion = ?`,
+  ).get(projectId, version);
+  return {
+    materializedTotal: Number(row?.materializedTotal || 0),
+    materializedPending: Number(row?.materializedPending || 0),
+  };
 }
 
 async function projectRelatedRowsByIds(projectIds) {
@@ -3737,8 +3876,11 @@ async function projectDto(row, taskStats = null, related = null) {
     0,
   );
   const stats = taskStats || (await getProjectTaskStats(row._id));
-  const generatedTaskCount = stats.total;
-  const pendingTaskCount = stats.pending;
+  const materializedStats = stats.materializedTotal == null
+    ? await getProjectMaterializedTaskStats(row._id)
+    : stats;
+  const generatedTaskCount = materializedStats.materializedTotal;
+  const pendingTaskCount = materializedStats.materializedPending;
   const remainingTemplateCount = Math.max(taskTemplateCount - generatedTaskCount, 0);
   return {
     _id: row._id,
@@ -5053,7 +5195,7 @@ async function loadProjectTaskTemplates(projectId) {
   return templates;
 }
 
-async function loadUnmaterializedProjectTaskTemplates(projectId, limit) {
+async function loadUnmaterializedProjectTaskTemplates(projectId, limit, options = {}) {
   const requestedLimit = Math.max(0, Math.floor(Number(limit) || 0));
   if (!requestedLimit) return [];
 
@@ -5062,7 +5204,7 @@ async function loadUnmaterializedProjectTaskTemplates(projectId, limit) {
   const packageIds = await projectPackageIds(project);
   if (!packageIds.length) return [];
 
-  const templates = await db.prepare(`
+  const directTemplateSql = `
     SELECT
       subject_task_templates.id,
       subject_task_templates.subjectId,
@@ -5071,6 +5213,17 @@ async function loadUnmaterializedProjectTaskTemplates(projectId, limit) {
       subject_task_templates.criterion,
       subject_task_templates.imageKey
     FROM subject_task_templates
+  `;
+  const templates = options.materializedBaseCount === 0
+    ? await db.prepare(`
+      ${directTemplateSql}
+      WHERE subject_task_templates.subjectId IN (${placeholders(packageIds.length)})
+      ORDER BY subject_task_templates.selectionKey ASC,
+               subject_task_templates.id ASC
+      LIMIT ?
+    `).all(...packageIds, requestedLimit)
+    : await db.prepare(`
+    ${directTemplateSql}
     LEFT JOIN rating_tasks
       ON rating_tasks.projectId = ?
      AND rating_tasks.taskVersion = ?
@@ -5102,10 +5255,10 @@ async function loadUnmaterializedProjectTaskTemplates(projectId, limit) {
   }));
 }
 
-function buildGeneratedTaskRecord(projectId, template, scorer) {
+function buildGeneratedTaskRecord(projectId, template, scorer, options = {}) {
   const imageIds = template.items.map((item) => item.imageId);
-  const taskType = dimensionTaskType(projectId, template.packageId, template.criterion);
-  const id = deterministicTaskId(projectId, taskType, imageIds);
+  const taskType = options.taskType || dimensionTaskType(projectId, template.packageId, template.criterion);
+  const id = options.id || deterministicTaskId(projectId, taskType, imageIds);
   const now = nowIso();
   return {
     id,
@@ -5119,6 +5272,8 @@ function buildGeneratedTaskRecord(projectId, template, scorer) {
     ranking: null,
     assignmentKey: crypto.randomInt(1, 2147483647),
     imageKey: template.imageKey,
+    isBacktest: Boolean(options.isBacktest),
+    backtestSourceId: options.backtestSourceId || null,
     createdAt: now,
     updatedAt: now,
     items: template.items.map((item) => ({
@@ -5134,8 +5289,8 @@ async function bulkInsertRatingTasks(taskRows) {
   if (!taskRows.length) return 0;
   const sql = `
     INSERT INTO rating_tasks (
-      id, subjectId, projectId, taskVersion, round, taskType, status, scorer, ranking, assignmentKey, imageKey, createdAt, updatedAt
-    ) VALUES ${taskRows.map(() => `(${placeholders(13)})`).join(", ")}
+      id, subjectId, projectId, taskVersion, round, taskType, status, scorer, ranking, assignmentKey, imageKey, isBacktest, backtestSourceId, createdAt, updatedAt
+    ) VALUES ${taskRows.map(() => `(${placeholders(15)})`).join(", ")}
     ON CONFLICT DO NOTHING
   `;
   const params = [];
@@ -5152,6 +5307,8 @@ async function bulkInsertRatingTasks(taskRows) {
       row.ranking,
       row.assignmentKey,
       row.imageKey,
+      Boolean(row.isBacktest),
+      row.backtestSourceId || null,
       row.createdAt,
       row.updatedAt,
     );
@@ -5173,6 +5330,52 @@ async function bulkInsertRatingTaskItems(itemRows) {
   return (await db.prepare(sql).run(...params)).changes;
 }
 
+async function loadTaskRecordsForBacktest(taskIds) {
+  if (!taskIds.length) return [];
+  const taskRows = [];
+  const itemRows = [];
+  for (let start = 0; start < taskIds.length; start += TASK_WRITE_BATCH_SIZE) {
+    const batch = taskIds.slice(start, start + TASK_WRITE_BATCH_SIZE);
+    taskRows.push(
+      ...(await db
+        .prepare(
+          `SELECT id, subjectId, projectId, taskVersion, round, taskType, status,
+                  scorer, assignmentKey, imageKey, isBacktest, backtestSourceId,
+                  createdAt, updatedAt
+           FROM rating_tasks
+           WHERE id IN (${placeholders(batch.length)})`,
+        )
+        .all(...batch)),
+    );
+    itemRows.push(
+      ...(await db
+        .prepare(
+          `SELECT taskId, imageId, position, role
+           FROM rating_task_items
+           WHERE taskId IN (${placeholders(batch.length)})
+           ORDER BY taskId ASC, position ASC, imageId ASC`,
+        )
+        .all(...batch)),
+    );
+  }
+
+  const itemsByTaskId = new Map();
+  itemRows.forEach((item) => {
+    const currentItems = itemsByTaskId.get(item.taskId) || [];
+    currentItems.push({
+      imageId: item.imageId,
+      position: item.position,
+      role: item.role || "target",
+    });
+    itemsByTaskId.set(item.taskId, currentItems);
+  });
+  const taskById = new Map(taskRows.map((row) => [row.id, {
+    ...row,
+    items: itemsByTaskId.get(row.id) || [],
+  }]));
+  return taskIds.map((id) => taskById.get(id)).filter(Boolean);
+}
+
 function taskDimensionKey(candidate) {
   if (candidate?.criterion) return String(candidate.criterion);
   const taskType = String(candidate?.taskType || "");
@@ -5180,10 +5383,106 @@ function taskDimensionKey(candidate) {
   return parts[0] === "dimension" && parts[1] ? parts[1] : taskType || "unknown";
 }
 
+function parseBacktestRatio(value) {
+  if (value === undefined || value === null || value === "") return 0;
+  const ratio = Number(value);
+  if (!Number.isFinite(ratio) || ratio < 0 || ratio > 50) {
+    throw httpError(400, "回测比例必须在 0 到 50 之间");
+  }
+  return Math.round(ratio * 100) / 100;
+}
+
+function backtestCountForAllocation(taskCount, backtestRatio) {
+  if (!backtestRatio || taskCount <= 1) return 0;
+  const requested = Math.floor((taskCount * backtestRatio) / 100);
+  return Math.max(0, Math.min(requested, taskCount - 1));
+}
+
+function expandBacktestAllocations(allocations, backtestRatio) {
+  return allocations.map((allocation) => {
+    const backtestTaskCount = backtestCountForAllocation(
+      allocation.taskCount,
+      backtestRatio,
+    );
+    return {
+      ...allocation,
+      baseTaskCount: allocation.taskCount - backtestTaskCount,
+      backtestTaskCount,
+    };
+  });
+}
+
+function randomShuffle(items) {
+  const shuffled = [...items];
+  for (let index = shuffled.length - 1; index > 0; index -= 1) {
+    const selectedIndex = crypto.randomInt(0, index + 1);
+    [shuffled[index], shuffled[selectedIndex]] = [shuffled[selectedIndex], shuffled[index]];
+  }
+  return shuffled;
+}
+
+function buildBacktestTaskRecord(projectId, sourceTask, scorer) {
+  const id = crypto.randomUUID();
+  const now = nowIso();
+  return {
+    id,
+    subjectId: sourceTask.subjectId,
+    projectId,
+    taskVersion,
+    round: Number(sourceTask.round || 1),
+    taskType: `${sourceTask.taskType}:backtest:${id}`,
+    status: "assigned",
+    scorer,
+    ranking: null,
+    assignmentKey: crypto.randomInt(1, 2147483647),
+    imageKey: sourceTask.imageKey,
+    isBacktest: true,
+    backtestSourceId: sourceTask.id,
+    createdAt: now,
+    updatedAt: now,
+    items: (sourceTask.items || []).map((item) => ({
+      taskId: id,
+      imageId: item.imageId,
+      position: item.position,
+      role: item.role || "target",
+    })),
+  };
+}
+
+function buildBacktestTaskRows(backtestAllocations, baseTasksByScorer, projectId) {
+  const rows = [];
+  for (const allocation of backtestAllocations) {
+    if (!allocation.backtestTaskCount) continue;
+    const sourceTasks = baseTasksByScorer.get(allocation.scorer) || [];
+    if (sourceTasks.length < allocation.backtestTaskCount) {
+      throw httpError(409, `打分人 ${allocation.scorer} 的基础任务不足，无法生成回测任务`);
+    }
+    randomShuffle(sourceTasks)
+      .slice(0, allocation.backtestTaskCount)
+      .forEach((sourceTask) => {
+        if (!sourceTask.items?.length) {
+          throw httpError(409, `任务 ${sourceTask.id} 缺少图片项，无法生成回测任务`);
+        }
+        rows.push(buildBacktestTaskRecord(projectId, sourceTask, allocation.scorer));
+      });
+  }
+  return rows;
+}
+
 function buildDimensionAwareAssignmentPlan(candidates, allocations) {
-  const normalizedAllocations = allocations.filter((allocation) => allocation.taskCount > 0);
-  const totalTaskCount = normalizedAllocations.reduce(
-    (total, allocation) => total + allocation.taskCount,
+  const scorerNames = [];
+  const targetCounts = new Map();
+  allocations.forEach((allocation) => {
+    const taskCount = Math.max(0, Math.floor(Number(allocation.taskCount) || 0));
+    if (!allocation.scorer || taskCount <= 0) return;
+    if (!targetCounts.has(allocation.scorer)) scorerNames.push(allocation.scorer);
+    targetCounts.set(
+      allocation.scorer,
+      (targetCounts.get(allocation.scorer) || 0) + taskCount,
+    );
+  });
+  const totalTaskCount = scorerNames.reduce(
+    (total, scorer) => total + targetCounts.get(scorer),
     0,
   );
   if (candidates.length !== totalTaskCount) {
@@ -5191,13 +5490,7 @@ function buildDimensionAwareAssignmentPlan(candidates, allocations) {
   }
   if (!totalTaskCount) return [];
 
-  const scorerNames = normalizedAllocations.map((allocation) => allocation.scorer);
-  const targetCounts = new Map(
-    normalizedAllocations.map((allocation) => [allocation.scorer, allocation.taskCount]),
-  );
-  const assignedCounts = new Map(scorerNames.map((scorer) => [scorer, 0]));
   const groups = new Map();
-
   candidates.forEach((candidate, index) => {
     const dimension = taskDimensionKey(candidate);
     const group = groups.get(dimension) || [];
@@ -5205,39 +5498,100 @@ function buildDimensionAwareAssignmentPlan(candidates, allocations) {
     groups.set(dimension, group);
   });
 
-  const plan = Array.from({ length: candidates.length });
+  const assignedCounts = new Map(scorerNames.map((scorer) => [scorer, 0]));
+  const groupPlans = [];
+
   for (const indexes of groups.values()) {
-    const quotas = new Map();
-    const remainders = new Map();
-    let baseCount = 0;
+    const quotas = new Map(scorerNames.map((scorer) => [scorer, 0]));
+    const remainders = [];
+    let assignedInGroup = 0;
 
     for (const scorer of scorerNames) {
       const ideal = (indexes.length * targetCounts.get(scorer)) / totalTaskCount;
       const base = Math.floor(ideal);
       quotas.set(scorer, base);
-      remainders.set(scorer, ideal - base);
       assignedCounts.set(scorer, assignedCounts.get(scorer) + base);
-      baseCount += base;
+      assignedInGroup += base;
+      remainders.push({ scorer, remainder: ideal - base });
     }
 
-    let remainderCount = indexes.length - baseCount;
-    while (remainderCount > 0) {
+    groupPlans.push({
+      indexes,
+      quotas,
+      remainders,
+      remaining: indexes.length - assignedInGroup,
+    });
+  }
+
+  const remainingCapacity = new Map(scorerNames.map((scorer) => [
+    scorer,
+    targetCounts.get(scorer) - assignedCounts.get(scorer),
+  ]));
+  const remainderChoices = [];
+  groupPlans.forEach((groupPlan, groupIndex) => {
+    if (groupPlan.remaining <= 0) return;
+    groupPlan.remainders.forEach((item) => {
+      remainderChoices.push({ groupIndex, ...item });
+    });
+  });
+
+  remainderChoices.sort((left, right) => {
+    const remainderDifference = right.remainder - left.remainder;
+    if (Math.abs(remainderDifference) > Number.EPSILON) {
+      return remainderDifference;
+    }
+    const capacityDifference =
+      (remainingCapacity.get(right.scorer) || 0) -
+      (remainingCapacity.get(left.scorer) || 0);
+    if (capacityDifference) return capacityDifference;
+    const targetDifference =
+      (targetCounts.get(right.scorer) || 0) -
+      (targetCounts.get(left.scorer) || 0);
+    if (targetDifference) return targetDifference;
+    const groupDifference = left.groupIndex - right.groupIndex;
+    if (groupDifference) return groupDifference;
+    return scorerNames.indexOf(left.scorer) - scorerNames.indexOf(right.scorer);
+  });
+
+  for (const choice of remainderChoices) {
+    const groupPlan = groupPlans[choice.groupIndex];
+    if (groupPlan.remaining <= 0) continue;
+    const capacity = remainingCapacity.get(choice.scorer) || 0;
+    if (capacity <= 0) continue;
+    groupPlan.quotas.set(choice.scorer, groupPlan.quotas.get(choice.scorer) + 1);
+    groupPlan.remaining -= 1;
+    remainingCapacity.set(choice.scorer, capacity - 1);
+    assignedCounts.set(choice.scorer, assignedCounts.get(choice.scorer) + 1);
+  }
+
+  for (const groupPlan of groupPlans) {
+    while (groupPlan.remaining > 0) {
       const scorer = [...scorerNames]
-        .filter((name) => assignedCounts.get(name) < targetCounts.get(name))
+        .filter((name) => (remainingCapacity.get(name) || 0) > 0)
         .sort((left, right) => {
-          const remainderDifference = remainders.get(right) - remainders.get(left);
-          if (remainderDifference) return remainderDifference;
+          const capacityDifference =
+            (remainingCapacity.get(right) || 0) -
+            (remainingCapacity.get(left) || 0);
+          if (capacityDifference) return capacityDifference;
+          const targetDifference =
+            (targetCounts.get(right) || 0) -
+            (targetCounts.get(left) || 0);
+          if (targetDifference) return targetDifference;
           return scorerNames.indexOf(left) - scorerNames.indexOf(right);
         })[0];
       if (!scorer) throw httpError(409, "维度任务分配失败，请刷新后重试");
-      quotas.set(scorer, quotas.get(scorer) + 1);
+      groupPlan.quotas.set(scorer, groupPlan.quotas.get(scorer) + 1);
+      groupPlan.remaining -= 1;
+      remainingCapacity.set(scorer, remainingCapacity.get(scorer) - 1);
       assignedCounts.set(scorer, assignedCounts.get(scorer) + 1);
-      remainderCount -= 1;
     }
+  }
 
-    const remainingQuotas = new Map(quotas);
+  const plan = Array.from({ length: candidates.length });
+  for (const groupPlan of groupPlans) {
+    const remainingQuotas = new Map(groupPlan.quotas);
     let nextScorerIndex = 0;
-    for (const candidateIndex of indexes) {
+    for (const candidateIndex of groupPlan.indexes) {
       let selectedScorer = null;
       for (let offset = 0; offset < scorerNames.length; offset += 1) {
         const scorerIndex = (nextScorerIndex + offset) % scorerNames.length;
@@ -5287,6 +5641,7 @@ function parseTaskCursor(value) {
   const createdAt = String(parsed?.createdAt ?? "");
   const id = String(parsed?.id ?? "");
   const criterionOrder = Number(parsed?.criterionOrder);
+  const assignmentKey = Number(parsed?.assignmentKey);
   if (!taskType || !createdAt || !id) {
     throw httpError(400, "浠诲姟鍒嗛〉游标格式不正确");
   }
@@ -5295,6 +5650,7 @@ function parseTaskCursor(value) {
     createdAt,
     id,
     criterionOrder: Number.isFinite(criterionOrder) ? criterionOrder : null,
+    assignmentKey: Number.isFinite(assignmentKey) ? Math.floor(assignmentKey) : null,
   };
 }
 
@@ -5304,6 +5660,7 @@ function serializeTaskCursor(row, criterionOrder = null) {
     createdAt: row.createdAt,
     id: row.id,
     ...(criterionOrder == null ? {} : { criterionOrder }),
+    ...(row.assignmentKey == null ? {} : { assignmentKey: Number(row.assignmentKey) }),
   });
 }
 
@@ -5368,7 +5725,8 @@ function parseStoredTaskRankingRelations(value) {
   }
 }
 
-async function hydrateTaskRows(rows) {
+async function hydrateTaskRows(rows, options = {}) {
+  const includeAdminFields = Boolean(options.includeAdminFields);
   const taskIds = rows.map((row) => row.id);
   const itemsByTaskId = new Map();
 
@@ -5416,35 +5774,43 @@ async function hydrateTaskRows(rows) {
     });
   }
 
-  return rows.map((row) => ({
-    id: row.id,
-    subjectId: row.subjectId,
-    projectId: row.projectId || row.subjectId,
-    subjectName: row.subjectName ?? null,
-    taskVersion: row.taskVersion,
-    taskType: row.taskType,
-    criterion: row.taskType.split(":")[1] || null,
-    status: row.status,
-    scorer: row.scorer,
-    ranking: row.ranking ? JSON.parse(row.ranking) : null,
-    excludedImageIds: parseStoredTaskImageIds(row.excludedImageIds),
-    correctImageIds: parseStoredTaskImageIds(row.correctImageIds),
-    rankingRelations: parseStoredTaskRankingRelations(row.rankingRelations),
-    submissionMode: row.submissionMode || null,
-    rankingActionCount: Number(row.rankingActionCount || 0),
-    startedAt: row.startedAt ?? null,
-    completedAt: row.completedAt ?? null,
-    durationMs: row.durationMs ?? null,
-    editedAt: row.editedAt ?? null,
-    editCount: Number(row.editCount || 0),
-    rollbackCount: Number(row.rollbackCount || 0),
-    lastRolledBackAt: row.lastRolledBackAt ?? null,
-    lastRolledBackBy: row.lastRolledBackBy ?? null,
-    imageKey: row.imageKey,
-    createdAt: row.createdAt,
-    updatedAt: row.updatedAt,
-    items: itemsByTaskId.get(row.id) || [],
-  }));
+  return rows.map((row) => {
+    const task = {
+      id: row.id,
+      subjectId: row.subjectId,
+      projectId: row.projectId || row.subjectId,
+      subjectName: row.subjectName ?? null,
+      taskVersion: row.taskVersion,
+      taskType: row.taskType,
+      criterion: row.taskType.split(":")[1] || null,
+      status: row.status,
+      scorer: row.scorer,
+      ranking: row.ranking ? JSON.parse(row.ranking) : null,
+      excludedImageIds: parseStoredTaskImageIds(row.excludedImageIds),
+      correctImageIds: parseStoredTaskImageIds(row.correctImageIds),
+      rankingRelations: parseStoredTaskRankingRelations(row.rankingRelations),
+      submissionMode: row.submissionMode || null,
+      rankingActionCount: Number(row.rankingActionCount || 0),
+      largeImageOpened: Boolean(row.largeImageOpened),
+      startedAt: row.startedAt ?? null,
+      completedAt: row.completedAt ?? null,
+      durationMs: row.durationMs ?? null,
+      editedAt: row.editedAt ?? null,
+      editCount: Number(row.editCount || 0),
+      rollbackCount: Number(row.rollbackCount || 0),
+      lastRolledBackAt: row.lastRolledBackAt ?? null,
+      lastRolledBackBy: row.lastRolledBackBy ?? null,
+      imageKey: row.imageKey,
+      createdAt: row.createdAt,
+      updatedAt: row.updatedAt,
+      items: itemsByTaskId.get(row.id) || [],
+    };
+    if (includeAdminFields) {
+      task.isBacktest = Boolean(row.isBacktest);
+      task.backtestSourceTaskId = row.backtestSourceId || null;
+    }
+    return task;
+  });
 }
 
 const adminDashboardService = createAdminDashboardService({
@@ -5482,11 +5848,17 @@ const adminScoringService = createAdminScoringService({
   nowIso,
   parseProjectId,
   parseTaskPagination,
+  selectScorerByUsernameStmt,
+  assertScorerAssignable,
+  withDatabaseContext: runWithDatabaseContext,
   onTasksChanged: () => invalidateScorerQueryCaches(),
 });
 const {
   listScoringSummary,
   listScoringTaskRecords,
+  listScoringOptions,
+  writeScoringOperationsExport,
+  invalidateSummaryCache,
   previewRollback,
   startRollbackJob,
   getRollbackJob,
@@ -5619,7 +5991,7 @@ async function listSubjectTasks(projectId, query = {}) {
       : null;
   const rows = await db
     .prepare(
-      `SELECT id, taskType, status, scorer, createdAt
+      `SELECT id, taskType, status, scorer, isBacktest, backtestSourceId, createdAt
        FROM rating_tasks
        ${filter.where}
        ${cursorWhere}
@@ -5644,6 +6016,8 @@ async function listSubjectTasks(projectId, query = {}) {
       criterion: row.taskType.split(":")[1] || null,
       status: row.status,
       scorer: row.scorer,
+      isBacktest: Boolean(row.isBacktest),
+      backtestSourceTaskId: row.backtestSourceId || null,
       createdAt: row.createdAt,
       items: row.items,
     })),
@@ -5742,20 +6116,21 @@ async function getSubjectTaskReportSummary(subjectId) {
 
   const dimensionRows = await db
     .prepare(
-      `SELECT taskType, status, COUNT(*) AS count
+      `SELECT COALESCE(NULLIF(split_part(taskType, ':', 2), ''), taskType) AS criterion,
+              status, COUNT(*) AS count
        FROM rating_tasks
        WHERE projectId = ? AND taskVersion = ?
-       GROUP BY taskType, status
-       ORDER BY taskType ASC`,
+       GROUP BY COALESCE(NULLIF(split_part(taskType, ':', 2), ''), taskType), status
+       ORDER BY criterion ASC`,
     )
     .all(subjectId, taskVersion);
   const dimensionMap = new Map();
   dimensionRows.forEach((row) => {
-    const key = row.taskType;
+    const key = row.criterion;
     const item = dimensionMap.get(key) || {
-      key: row.taskType,
-      criterion: String(row.taskType || "").split(":")[1] || "",
-      label: taskCriterionLabel(row.taskType),
+      key,
+      criterion: row.criterion || "",
+      label: taskCriterionLabel(`dimension:${row.criterion}`),
       total: 0,
       pending: 0,
       assigned: 0,
@@ -5779,13 +6154,14 @@ async function getSubjectTaskReportSummary(subjectId) {
   const scorerCriteriaRows = await db
     .prepare(
       `SELECT COALESCE(NULLIF(TRIM(scorer), ''), '未分配') AS scorer,
-              taskType
+              COALESCE(NULLIF(split_part(taskType, ':', 2), ''), taskType) AS criterion
        FROM rating_tasks
        WHERE projectId = ? AND taskVersion = ?
-       GROUP BY COALESCE(NULLIF(TRIM(scorer), ''), '未分配'), taskType
+       GROUP BY COALESCE(NULLIF(TRIM(scorer), ''), '未分配'),
+                COALESCE(NULLIF(split_part(taskType, ':', 2), ''), taskType)
        ORDER BY LOWER(COALESCE(NULLIF(TRIM(scorer), ''), '未分配')) ASC,
                 COALESCE(NULLIF(TRIM(scorer), ''), '未分配') ASC,
-                taskType ASC`,
+                criterion ASC`,
     )
     .all(subjectId, taskVersion);
   const scorerMap = new Map();
@@ -5807,7 +6183,7 @@ async function getSubjectTaskReportSummary(subjectId) {
   });
   scorerCriteriaRows.forEach((row) => {
     const item = scorerMap.get(row.scorer);
-    if (item) item.criteria.add(String(row.taskType || "").split(":")[1] || "");
+    if (item) item.criteria.add(row.criterion || "");
   });
 
   const totalTasks = taskStats.total;
@@ -6041,6 +6417,8 @@ async function runAdminExportJob(job) {
       job.result = await runJsonAdminExport(job, writeProjectCompletedTasksExport);
     } else if (job.type === "scorer-completed-tasks") {
       job.result = await runJsonAdminExport(job, writeScorerCompletedTasksExport);
+    } else if (job.type === "scoring-operation-log") {
+      job.result = await runJsonAdminExport(job, writeScoringOperationsExport);
     } else if (job.type === "team-task-summary") {
       job.result = await runJsonAdminExport(job, writeTeamTaskSummaryExport);
     } else if (job.type === "project-task-report") {
@@ -6162,6 +6540,7 @@ function invalidateAssignedTaskListCache() {
 function invalidateScorerQueryCaches() {
   invalidateAssignedTaskListCache();
   scorerDashboardCache.clear();
+  invalidateSummaryCache();
 }
 
 async function assignedTaskOptions(query = {}) {
@@ -6202,20 +6581,13 @@ async function listAssignedTasks(query = {}) {
 
   const filter = await buildScorerTaskFilter(query);
   const { page, pageSize } = parseTaskPagination(query);
-  const criterionOrder = taskCriterionOrderSql("rating_tasks.taskType");
   const cursor = parseTaskCursor(query.cursor);
-  const cursorOrder = cursor?.criterionOrder;
-  const useCursor = Boolean(cursor && cursorOrder != null);
+  const cursorAssignmentKey = cursor?.assignmentKey;
+  const useCursor = Boolean(cursor && cursorAssignmentKey != null);
   const cursorWhere = useCursor
     ? ` AND (
-         (${criterionOrder}) > ?
-         OR (
-           (${criterionOrder}) = ?
-           AND (
-             rating_tasks.createdAt > ?
-             OR (rating_tasks.createdAt = ? AND rating_tasks.id > ?)
-           )
-         )
+         rating_tasks.assignmentKey > ?
+         OR (rating_tasks.assignmentKey = ? AND rating_tasks.id > ?)
        )`
     : "";
   const total = includeTaskTotal(query)
@@ -6227,21 +6599,19 @@ async function listAssignedTasks(query = {}) {
     .prepare(
       `SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId,
               rating_tasks.taskType, rating_tasks.status,
-              rating_tasks.createdAt,
-              ${criterionOrder} AS criterionOrder,
+              rating_tasks.assignmentKey, rating_tasks.createdAt,
               projects.name AS subjectName
        FROM rating_tasks
        JOIN projects ON projects.id = rating_tasks.projectId
        ${filter.where}
        ${cursorWhere}
-       ORDER BY ${criterionOrder} ASC,
-                rating_tasks.createdAt ASC,
+       ORDER BY rating_tasks.assignmentKey ASC,
                 rating_tasks.id ASC
        LIMIT ?${useCursor ? "" : " OFFSET ?"}`,
     )
     .all(...filter.params, ...(!useCursor
     ? []
-    : [cursorOrder, cursorOrder, cursor.createdAt, cursor.createdAt, cursor.id]), pageSize + 1, ...(useCursor ? [] : [(page - 1) * pageSize]));
+    : [cursorAssignmentKey, cursorAssignmentKey, cursor.id]), pageSize + 1, ...(useCursor ? [] : [(page - 1) * pageSize]));
   const hasMore = rows.length > pageSize;
   const pageRows = rows.slice(0, pageSize);
   const lastRow = pageRows[pageRows.length - 1];
@@ -6258,7 +6628,7 @@ async function listAssignedTasks(query = {}) {
     pageSize,
     hasMore,
     nextCursor: hasMore && lastRow
-      ? serializeTaskCursor(lastRow, Number(lastRow.criterionOrder))
+      ? serializeTaskCursor(lastRow)
       : null,
     tasks: hydratedRows.map((row) => ({
       id: row.id,
@@ -6280,7 +6650,7 @@ async function listAssignedTasks(query = {}) {
   return value;
 }
 
-async function getTaskDetail(taskId, { projectId = null, scorer = null } = {}) {
+async function getTaskDetail(taskId, { projectId = null, scorer = null, includeAdminFields = false } = {}) {
   const task = await selectTaskByIdStmt.get(taskId);
   if (!task || task.taskVersion !== taskVersion) {
     throw httpError(404, "任务不存在");
@@ -6294,7 +6664,7 @@ async function getTaskDetail(taskId, { projectId = null, scorer = null } = {}) {
   if (scorer && !["assigned", "completed"].includes(task.status)) {
     throw httpError(403, "当前任务不可查看");
   }
-  return (await hydrateTaskRows([task]))[0];
+  return (await hydrateTaskRows([task], { includeAdminFields }))[0];
 }
 
 const scorerDashboardCache = new Map();
@@ -6444,6 +6814,14 @@ function parseRankingActionCount(value) {
   return Math.min(count, 100000);
 }
 
+function parseLargeImageOpened(value) {
+  if (value === null || value === undefined || value === "") return false;
+  if (typeof value === "boolean") return value;
+  if (value === 1 || value === "1" || value === "true") return true;
+  if (value === 0 || value === "0" || value === "false") return false;
+  throw httpError(400, "大图查看记录格式不正确");
+}
+
 function parseTaskSubmissionMode(value, rankingActionCount, trackingProvided = false) {
   const requested = String(value || "").trim();
   if (requested && !["direct", "ranked"].includes(requested)) {
@@ -6494,6 +6872,9 @@ async function completeAssignedTask(taskId, body = {}) {
   );
   const durationMs = parseTaskDuration(body.durationMs);
   const rankingActionCount = parseRankingActionCount(body.rankingActionCount);
+  const largeImageOpened = Object.hasOwn(body, "largeImageOpened")
+    ? parseLargeImageOpened(body.largeImageOpened)
+    : Boolean(task.largeImageOpened);
   const submissionMode = parseTaskSubmissionMode(
     body.submissionMode,
     rankingActionCount,
@@ -6515,6 +6896,7 @@ async function completeAssignedTask(taskId, body = {}) {
       rankingRelations: JSON.stringify(rankingRelations),
       submissionMode,
       rankingActionCount,
+      largeImageOpened,
       startedAt,
       completedAt,
       durationMs,
@@ -6573,6 +6955,9 @@ async function updateCompletedTask(taskId, body = {}) {
   );
   parseTaskDuration(body.durationMs);
   const rankingActionCount = parseRankingActionCount(body.rankingActionCount);
+  const largeImageOpened = Object.hasOwn(body, "largeImageOpened")
+    ? parseLargeImageOpened(body.largeImageOpened)
+    : Boolean(task.largeImageOpened);
   const submissionMode = parseTaskSubmissionMode(
     body.submissionMode,
     rankingActionCount,
@@ -6592,6 +6977,7 @@ async function updateCompletedTask(taskId, body = {}) {
       rankingRelations: JSON.stringify(rankingRelations),
       submissionMode,
       rankingActionCount,
+      largeImageOpened,
       editedAt,
       updatedAt: editedAt,
     });
@@ -6646,6 +7032,7 @@ async function parseTaskGenerationAssignees(body = {}) {
     enabledOnly: true,
   });
   const teamMatchMode = normalizeTeamMatchMode(body.teamMatchMode);
+  const backtestRatio = parseBacktestRatio(body.backtestRatio);
   const availableUsers = await listScorersByTeamIds(teamIds, teamMatchMode);
   if (!availableUsers.length) throw httpError(400, "所选团队没有可用的打分账号");
 
@@ -6670,7 +7057,7 @@ async function parseTaskGenerationAssignees(body = {}) {
     if (taskCount > 0) allocations.push({ scorer, taskCount });
   }
 
-  return { teamIds, teamMatchMode, allocations };
+  return { teamIds, teamMatchMode, allocations, backtestRatio };
 }
 
 function normalizedAllocationHeader(value) {
@@ -7110,15 +7497,133 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
   }
 }
 
-async function generateSubjectTasks(projectId, assignment, onProgress) {
-  const project = await getProjectOrThrow(projectId);
+function taskGenerationPlan(assignment) {
   const requestedTaskCount = assignment.allocations.reduce(
     (total, allocation) => total + allocation.taskCount,
     0,
   );
-  if (!requestedTaskCount) {
+  const backtestRatio = parseBacktestRatio(assignment.backtestRatio);
+  const backtestAllocations = expandBacktestAllocations(
+    assignment.allocations,
+    backtestRatio,
+  );
+  const baseAllocations = backtestAllocations
+    .filter((allocation) => allocation.baseTaskCount > 0)
+    .map((allocation) => ({
+      scorer: allocation.scorer,
+      taskCount: allocation.baseTaskCount,
+    }));
+  return {
+    requestedTaskCount,
+    backtestRatio,
+    backtestAllocations,
+    baseAllocations,
+    requestedBaseTaskCount: baseAllocations.reduce(
+      (total, allocation) => total + allocation.taskCount,
+      0,
+    ),
+    requestedBacktestTaskCount: backtestAllocations.reduce(
+      (total, allocation) => total + allocation.backtestTaskCount,
+      0,
+    ),
+  };
+}
+
+async function getTaskGenerationCapacity(projectId, project = null) {
+  const currentProject = project || await getProjectOrThrow(projectId);
+  const packageIds = await projectPackageIds(currentProject);
+  if (!packageIds.length) {
+    return {
+      templateCount: 0,
+      materializedBaseCount: 0,
+      pendingBaseCount: 0,
+      availableTaskCount: 0,
+    };
+  }
+
+  const [templateRow, materializedRow] = await Promise.all([
+    db.prepare(`
+      SELECT COUNT(*)::integer AS templateCount
+      FROM subject_task_templates
+      WHERE subjectId IN (${placeholders(packageIds.length)})
+    `).get(...packageIds),
+    db.prepare(`
+      SELECT
+        COUNT(*) FILTER (WHERE NOT isBacktest)::integer AS materializedBaseCount,
+        COUNT(*) FILTER (
+          WHERE NOT isBacktest
+            AND status = 'pending'
+            AND scorer IS NULL
+        )::integer AS pendingBaseCount
+      FROM rating_tasks
+      WHERE projectId = ?
+        AND taskVersion = ?
+    `).get(projectId, taskVersion),
+  ]);
+  const templateCount = Number(templateRow?.templateCount || 0);
+  const materializedBaseCount = Number(materializedRow?.materializedBaseCount || 0);
+  const pendingBaseCount = Number(materializedRow?.pendingBaseCount || 0);
+  return {
+    templateCount,
+    materializedBaseCount,
+    pendingBaseCount,
+    availableTaskCount: pendingBaseCount + Math.max(templateCount - materializedBaseCount, 0),
+  };
+}
+
+async function prepareTaskGeneration(projectId, assignment, project = null) {
+  const plan = taskGenerationPlan(assignment);
+  if (!plan.requestedTaskCount) {
     throw httpError(400, "请至少为一名打分人分配任务");
   }
+  const capacity = await getTaskGenerationCapacity(projectId, project);
+  if (plan.requestedBaseTaskCount > capacity.availableTaskCount) {
+    throw httpError(
+      400,
+      `本次最多还能占用 ${capacity.availableTaskCount} 个任务池任务，当前请求需要 ${plan.requestedBaseTaskCount} 个基础任务`,
+    );
+  }
+  return { ...plan, ...capacity };
+}
+
+function taskGenerationRequestSummary(assignment, prepared) {
+  const splitByScorer = new Map(
+    prepared.backtestAllocations.map((allocation) => [allocation.scorer, allocation]),
+  );
+  return {
+    teamIds: assignment.teamIds,
+    teamMatchMode: assignment.teamMatchMode,
+    backtestRatio: prepared.backtestRatio,
+    scorerCount: prepared.backtestAllocations.length,
+    requestedTaskCount: prepared.requestedTaskCount,
+    requestedBaseTaskCount: prepared.requestedBaseTaskCount,
+    requestedBacktestTaskCount: prepared.requestedBacktestTaskCount,
+    availableTaskCount: prepared.availableTaskCount,
+    templateCount: prepared.templateCount,
+    materializedBaseCount: prepared.materializedBaseCount,
+    pendingBaseCount: prepared.pendingBaseCount,
+    allocations: assignment.allocations.map((allocation) => {
+      const split = splitByScorer.get(allocation.scorer) || {};
+      return {
+        scorer: allocation.scorer,
+        taskCount: allocation.taskCount,
+        baseTaskCount: split.baseTaskCount ?? allocation.taskCount,
+        backtestTaskCount: split.backtestTaskCount ?? 0,
+      };
+    }),
+  };
+}
+
+async function generateSubjectTasks(projectId, assignment, onProgress) {
+  const project = await getProjectOrThrow(projectId);
+  const {
+    backtestRatio,
+    backtestAllocations,
+    baseAllocations,
+    requestedBaseTaskCount,
+    requestedBacktestTaskCount,
+    materializedBaseCount,
+  } = await prepareTaskGeneration(projectId, assignment, project);
   const previousTaskStatus = project.taskStatus;
   const generatedTaskIds = [];
   const assignedTaskIds = [];
@@ -7126,33 +7631,50 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
   try {
     let createdCount = 0;
     let assignedCount = 0;
+    onProgress?.({ stage: "正在校验任务池", progress: 1 });
     const pendingBefore = (await getProjectTaskStats(projectId)).pending;
     const pendingTasks = pendingBefore
       ? await selectPendingProjectTaskIdsStmt.all(
         projectId,
         taskVersion,
-        Math.min(requestedTaskCount, pendingBefore),
+        Math.min(requestedBaseTaskCount, pendingBefore),
       )
       : [];
-    const templatesNeeded = Math.max(0, requestedTaskCount - pendingTasks.length);
+    const templatesNeeded = Math.max(0, requestedBaseTaskCount - pendingTasks.length);
+    if (templatesNeeded) {
+      onProgress?.({ stage: "正在加载任务模板", progress: 3 });
+    }
     const templates = templatesNeeded
-      ? await loadUnmaterializedProjectTaskTemplates(projectId, templatesNeeded)
+      ? await loadUnmaterializedProjectTaskTemplates(projectId, templatesNeeded, { materializedBaseCount })
       : [];
 
-    if (pendingTasks.length + templates.length < requestedTaskCount) {
+    if (pendingTasks.length + templates.length < requestedBaseTaskCount) {
       const availableTaskCount = pendingTasks.length + templates.length;
-      throw httpError(400, `本次最多还能下发 ${availableTaskCount} 个任务`);
+      throw httpError(400, `本次最多还能占用 ${availableTaskCount} 个任务池任务`);
     }
 
     const assigneePlan = buildDimensionAwareAssignmentPlan(
       [...templates, ...pendingTasks],
-      assignment.allocations,
+      baseAllocations,
     );
     const createdAssigneePlan = assigneePlan.slice(0, templates.length);
     const pendingAssigneePlan = assigneePlan.slice(templates.length);
+    const baseTasksByScorer = new Map();
+    const rememberBaseTask = (task, scorer) => {
+      if (!scorer) return;
+      const tasks = baseTasksByScorer.get(scorer) || [];
+      tasks.push(task);
+      baseTasksByScorer.set(scorer, tasks);
+    };
+    const pendingTaskRecords = pendingTasks.length
+      ? await loadTaskRecordsForBacktest(pendingTasks.map((task) => task.id))
+      : [];
+    pendingTaskRecords.forEach((task, index) => {
+      rememberBaseTask(task, pendingAssigneePlan[index]);
+    });
 
     onProgress?.({
-      stage: templates.length ? "正在生成并分配本次任务" : "正在分配已有任务",
+      stage: templates.length ? "正在生成并分配基础任务" : "正在分配已有基础任务",
       progress: templates.length ? 5 : 70,
     });
 
@@ -7166,6 +7688,7 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
         ),
       );
       const itemRows = taskRows.flatMap((task) => task.items);
+      taskRows.forEach((task) => rememberBaseTask(task, task.scorer));
 
       await beginTaskWriteTransaction();
       try {
@@ -7182,20 +7705,20 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       }
 
       onProgress?.({
-        stage: "正在生成并分配本次任务",
+        stage: "正在生成并分配基础任务",
         progress: 5 + Math.round((Math.min(start + batch.length, templates.length) / templates.length) * 65),
       });
       if (start + batch.length < templates.length) await yieldToEventLoop();
     }
 
     if (pendingAssigneePlan.length) {
-      onProgress?.({ stage: "正在分配已有任务", progress: templates.length ? 75 : 70 });
+      onProgress?.({ stage: "正在分配已有基础任务", progress: templates.length ? 75 : 70 });
       const assignedResult = await assignGeneratedTasks(
         projectId,
         pendingTasks,
         pendingAssigneePlan,
         (current, total) => onProgress?.({
-          stage: "正在分配已有任务",
+          stage: "正在分配已有基础任务",
           progress: (templates.length ? 75 : 70) + (total ? Math.round((current / total) * 20) : 0),
         }),
       );
@@ -7203,6 +7726,43 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       assignedTaskIds.push(...assignedResult.taskIds);
     } else {
       assignedCount = createdCount;
+    }
+
+    let backtestCreatedCount = 0;
+    if (requestedBacktestTaskCount) {
+      onProgress?.({ stage: "正在生成回测任务", progress: 92 });
+      const backtestTaskRows = buildBacktestTaskRows(
+        backtestAllocations,
+        baseTasksByScorer,
+        projectId,
+      );
+      for (let start = 0; start < backtestTaskRows.length; start += TASK_WRITE_BATCH_SIZE) {
+        const batch = backtestTaskRows.slice(start, start + TASK_WRITE_BATCH_SIZE);
+        const itemRows = batch.flatMap((task) => task.items);
+
+        await beginTaskWriteTransaction();
+        try {
+          const result = await bulkInsertRatingTasks(batch);
+          await bulkInsertRatingTaskItems(itemRows);
+          await db.exec("COMMIT");
+          backtestCreatedCount += result;
+          generatedTaskIds.push(...batch.map((task) => task.id));
+        } catch (error) {
+          try {
+            await db.exec("ROLLBACK");
+          } catch {}
+          throw error;
+        }
+
+        const processed = start + batch.length;
+        onProgress?.({
+          stage: "正在生成回测任务",
+          progress: 92 + Math.round((processed / backtestTaskRows.length) * 5),
+        });
+        if (processed < backtestTaskRows.length) await yieldToEventLoop();
+      }
+      createdCount += backtestCreatedCount;
+      assignedCount += backtestCreatedCount;
     }
 
     await syncProjectTeams(projectId, assignment.teamIds, nowIso());
@@ -7233,6 +7793,9 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       taskCount,
       createdCount,
       assignedCount,
+      baseAssignedCount: requestedBaseTaskCount,
+      backtestCount: backtestCreatedCount,
+      backtestRatio,
       unassignedCount,
       taskVersion,
     };
@@ -7254,6 +7817,13 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
     return activeJob;
   }
 
+  const anyActiveJob = await getAnyActiveTaskGenerationJob();
+  if (anyActiveJob && anyActiveJob.subjectId !== subjectId) {
+    throw httpError(409, "已有任务生成作业正在执行，请等待完成后再下发");
+  }
+
+  const prepared = await prepareTaskGeneration(subjectId, assignment, project);
+
   const createdAt = nowIso();
   const job = {
     jobId: crypto.randomUUID(),
@@ -7262,6 +7832,13 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
     stage: "等待导入任务模板",
     progress: 0,
     message: null,
+    request: taskGenerationRequestSummary(assignment, prepared),
+    stageEvents: [{
+      stage: "等待导入任务模板",
+      progress: 0,
+      startedAt: createdAt,
+      updatedAt: createdAt,
+    }],
     result: null,
     createdAt,
     updatedAt: createdAt,
@@ -7282,6 +7859,7 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
       [],
       {
         env: { ...process.env, TASK_GENERATION_WORKER: "1" },
+        execArgv: [],
         stdio: ["ignore", "inherit", "inherit", "ipc"],
       },
     );
@@ -7298,6 +7876,14 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   let lastProgressPersistedAt = 0;
   const commitJobState = (patch = {}, options = {}) => {
     Object.assign(job, patch);
+    if (patch.stage || patch.progress != null || ["completed", "failed"].includes(patch.status)) {
+      recordTaskGenerationStage(
+        job,
+        job.stage,
+        job.progress,
+        ["completed", "failed"].includes(job.status),
+      );
+    }
     const isProgressUpdate = !options.force && patch.status === "running";
     const now = Date.now();
     if (
@@ -7334,6 +7920,7 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
           stage: "任务导入完成",
           progress: 100,
         }, { force: true });
+        queueTaskGenerationAnalyze();
         worker.disconnect();
         activeTaskGenerationBySubject.delete(subjectId);
         delete job.worker;
@@ -7374,14 +7961,16 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
     });
     console.error(`Task generation worker failed (${job.jobId})`, error);
   });
-  worker.on("exit", (code) => {
+  worker.on("exit", (code, signal) => {
     void (async () => {
       if (["queued", "running"].includes(job.status)) {
         invalidateGenerationCaches();
         await commitJobState({
           status: "failed",
           stage: "任务导入失败",
-          message: `任务生成进程异常退出（code ${code}）`,
+          message: signal
+            ? `任务生成进程异常退出（signal ${signal}）`
+            : `任务生成进程异常退出（code ${code}）`,
         }, { force: true });
       }
       activeTaskGenerationBySubject.delete(subjectId);
@@ -7692,6 +8281,15 @@ app.get("/api/admin/teams/task-summary/export", async (req, res, next) => {
 app.get("/api/admin/scoring/summary", async (req, res, next) => {
   try {
     res.json(await listScoringSummary(req.query));
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.get("/api/admin/scoring/options", async (req, res, next) => {
+  try {
+    setShortApiCache(res);
+    res.json(await listScoringOptions());
   } catch (error) {
     next(error);
   }
@@ -8204,7 +8802,12 @@ app.get("/api/projects/:id/tasks/generate/:jobId", requireAdmin, async (req, res
 
 app.get("/api/projects/:id/tasks/:taskId", requireAdmin, async (req, res, next) => {
   try {
-    res.json({ task: await getTaskDetail(req.params.taskId, { projectId: req.params.id }) });
+    res.json({
+      task: await getTaskDetail(req.params.taskId, {
+        projectId: req.params.id,
+        includeAdminFields: true,
+      }),
+    });
   } catch (error) {
     next(error);
   }
@@ -8216,7 +8819,10 @@ app.get(
   async (req, res, next) => {
     try {
       res.json({
-        task: await getTaskDetail(req.params.taskId, { projectId: req.params.id }),
+        task: await getTaskDetail(req.params.taskId, {
+          projectId: req.params.id,
+          includeAdminFields: true,
+        }),
       });
     } catch (error) {
       next(error);

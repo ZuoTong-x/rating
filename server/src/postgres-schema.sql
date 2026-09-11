@@ -127,12 +127,19 @@ create table if not exists task_generation_jobs (
     stage text not null,
     progress integer not null default 0,
     message text,
+    requestjson text,
+    stageeventsjson text,
     resultjson text,
     createdat timestamptz not null,
     updatedat timestamptz not null,
     expiresat timestamptz not null,
     foreign key (subjectid) references projects(id) on delete cascade
   );
+
+alter table task_generation_jobs
+    add column if not exists requestjson text;
+alter table task_generation_jobs
+    add column if not exists stageeventsjson text;
 
 do $$
 begin
@@ -260,8 +267,11 @@ create table if not exists rating_tasks (
     correctimageids text,
     rankingrelations text,
     assignmentkey integer not null default 0,
+    isbacktest boolean not null default false,
+    backtestsourceid text,
     submissionmode text check (submissionmode in ('direct', 'ranked')),
     rankingactioncount integer not null default 0,
+    largeimageopened boolean not null default false,
     startedat timestamptz,
     completedat timestamptz,
     durationms integer,
@@ -276,6 +286,15 @@ create table if not exists rating_tasks (
     foreign key (subjectid) references subjects(id) on delete cascade,
     unique (subjectid, taskversion, round, tasktype, imagekey)
   );
+
+alter table rating_tasks
+    add column if not exists largeimageopened boolean not null default false;
+
+alter table rating_tasks
+    add column if not exists isbacktest boolean not null default false;
+
+alter table rating_tasks
+    add column if not exists backtestsourceid text;
 
 create table if not exists rating_task_items (
     taskid text not null,
@@ -309,6 +328,22 @@ create table if not exists scorer_task_stats (
     primary key (scorer, taskversion, projectid)
   );
 
+create table if not exists scorer_scoring_stats (
+    scorer text not null,
+    taskversion text not null,
+    projectid text not null,
+    submissionmode text not null check (submissionmode in ('direct', 'ranked', 'untracked')),
+    taskcount bigint not null default 0,
+    largeimageopenedcount bigint not null default 0,
+    durationtotal bigint not null default 0,
+    durationcount bigint not null default 0,
+    durationmin bigint,
+    durationmax bigint,
+    rollbackcount bigint not null default 0,
+    updatedat timestamptz not null,
+    primary key (scorer, taskversion, projectid, submissionmode)
+  );
+
 create table if not exists dashboard_completion_hour_stats (
     taskversion text not null,
     hour integer not null check (hour between 0 and 23),
@@ -316,6 +351,11 @@ create table if not exists dashboard_completion_hour_stats (
     updatedat timestamptz not null,
     primary key (taskversion, hour)
   );
+
+alter table scorer_scoring_stats
+    add column if not exists durationmin bigint;
+alter table scorer_scoring_stats
+    add column if not exists durationmax bigint;
 
 create table if not exists subject_task_templates (
     id text primary key,
@@ -450,6 +490,9 @@ create index if not exists idx_rating_tasks_version_scorer_status_order
 create index if not exists idx_rating_tasks_assigned_list
     on rating_tasks(taskversion, scorer, status, projectid, createdat, id)
     where status in ('assigned', 'completed');
+create index if not exists idx_rating_tasks_assigned_assignment_list
+    on rating_tasks(taskversion, scorer, status, assignmentkey, id)
+    where status in ('assigned', 'completed');
 create index if not exists idx_rating_tasks_next_assigned
     on rating_tasks(taskversion, scorer, projectid, createdat, id)
     where status = 'assigned';
@@ -466,6 +509,10 @@ create index if not exists idx_feedbacks_status_created on feedbacks(status, sub
 create index if not exists idx_feedback_messages_feedback_created on feedback_messages(feedbackid, createdat asc, id asc);
 create index if not exists idx_scorer_task_stats_project_version
     on scorer_task_stats(projectid, taskversion);
+create index if not exists idx_scorer_scoring_stats_version_project
+    on scorer_scoring_stats(taskversion, projectid, scorer, submissionmode);
+create index if not exists idx_scorer_scoring_stats_version_scorer
+    on scorer_scoring_stats(taskversion, scorer, projectid, submissionmode);
 create index if not exists idx_dashboard_completion_hour_stats_version
     on dashboard_completion_hour_stats(taskversion, hour);
 create index if not exists idx_users_role_status on users(role, status, username);
@@ -473,12 +520,42 @@ create index if not exists idx_teams_status_name on teams(status, name);
 create index if not exists idx_project_packages_project_package on project_packages(projectid, packageid);
 create index if not exists idx_rating_tasks_project_assignment on rating_tasks(projectid, taskversion, status, assignmentkey, id);
 create index if not exists idx_rating_tasks_project_scorer_assignment on rating_tasks(projectid, taskversion, status, scorer, assignmentkey, id);
+create index if not exists idx_rating_tasks_project_backtest on rating_tasks(projectid, taskversion, isbacktest);
 create index if not exists idx_subject_task_templates_selection on subject_task_templates(subjectid, selectionkey, id);
 create index if not exists idx_images_thumbnail_path on images(thumbnailpath);
 create unique index if not exists idx_teams_name_ci on teams(lower(name));
 create unique index if not exists idx_projects_active_name_ci on projects(lower(trim(name))) where deletionrequestedat is null;
 
 -- Keep the denormalized dashboard counters in sync with rating_tasks.
+create or replace function refresh_scorer_scoring_duration(
+  target_scorer text,
+  target_task_version text,
+  target_project_id text,
+  target_submission_mode text
+) returns void language plpgsql as $$
+begin
+  update scorer_scoring_stats stats
+     set durationmin = duration_values.durationmin,
+         durationmax = duration_values.durationmax
+    from (
+      select min(durationms)::bigint as durationmin,
+             max(durationms)::bigint as durationmax
+      from rating_tasks
+      where status = 'completed'
+        and scorer = target_scorer
+        and taskversion = target_task_version
+        and coalesce(projectid, '') = target_project_id
+        and coalesce(submissionmode, 'untracked') = target_submission_mode
+        and durationms is not null
+        and durationms >= 0
+    ) duration_values
+   where stats.scorer = target_scorer
+     and stats.taskversion = target_task_version
+     and stats.projectid = target_project_id
+     and stats.submissionmode = target_submission_mode;
+end;
+$$;
+
 create or replace function sync_rating_task_stats() returns trigger language plpgsql as $$
 begin
   -- Bulk task jobs rebuild the counters once after their write batches. Keep
@@ -538,6 +615,101 @@ begin
   end if;
 
   if tg_op in ('DELETE', 'UPDATE')
+     and old.scorer is not null and btrim(old.scorer) <> ''
+     and old.status = 'completed' then
+    update scorer_scoring_stats
+       set taskcount = greatest(0, taskcount - 1),
+           largeimageopenedcount = greatest(
+             0,
+             largeimageopenedcount - case when coalesce(old.largeimageopened, false) then 1 else 0 end
+           ),
+           durationtotal = greatest(
+             0,
+             durationtotal - case when old.durationms is not null and old.durationms >= 0 then old.durationms else 0 end
+           ),
+           durationcount = greatest(
+             0,
+             durationcount - case when old.durationms is not null and old.durationms >= 0 then 1 else 0 end
+           ),
+           rollbackcount = greatest(0, rollbackcount - coalesce(old.rollbackcount, 0)),
+           updatedat = coalesce(new.updatedat, old.updatedat)
+     where scorer = old.scorer
+       and taskversion = old.taskversion
+       and projectid = coalesce(old.projectid, '')
+       and submissionmode = coalesce(old.submissionmode, 'untracked');
+
+    delete from scorer_scoring_stats
+     where scorer = old.scorer
+       and taskversion = old.taskversion
+       and projectid = coalesce(old.projectid, '')
+       and submissionmode = coalesce(old.submissionmode, 'untracked')
+       and taskcount = 0;
+  end if;
+
+  if tg_op in ('INSERT', 'UPDATE')
+     and new.scorer is not null and btrim(new.scorer) <> ''
+     and new.status = 'completed' then
+    insert into scorer_scoring_stats(
+      scorer, taskversion, projectid, submissionmode, taskcount,
+      largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax,
+      rollbackcount, updatedat
+    )
+    values (
+      new.scorer,
+      new.taskversion,
+      coalesce(new.projectid, ''),
+      coalesce(new.submissionmode, 'untracked'),
+      1,
+      case when coalesce(new.largeimageopened, false) then 1 else 0 end,
+      case when new.durationms is not null and new.durationms >= 0 then new.durationms else 0 end,
+      case when new.durationms is not null and new.durationms >= 0 then 1 else 0 end,
+      case when new.durationms is not null and new.durationms >= 0 then new.durationms else null end,
+      case when new.durationms is not null and new.durationms >= 0 then new.durationms else null end,
+      coalesce(new.rollbackcount, 0),
+      new.updatedat
+    )
+    on conflict (scorer, taskversion, projectid, submissionmode) do update set
+      taskcount = scorer_scoring_stats.taskcount + excluded.taskcount,
+      largeimageopenedcount = scorer_scoring_stats.largeimageopenedcount + excluded.largeimageopenedcount,
+      durationtotal = scorer_scoring_stats.durationtotal + excluded.durationtotal,
+      durationcount = scorer_scoring_stats.durationcount + excluded.durationcount,
+      durationmin = case
+        when excluded.durationmin is null then scorer_scoring_stats.durationmin
+        when scorer_scoring_stats.durationmin is null then excluded.durationmin
+        else least(scorer_scoring_stats.durationmin, excluded.durationmin)
+      end,
+      durationmax = case
+        when excluded.durationmax is null then scorer_scoring_stats.durationmax
+        when scorer_scoring_stats.durationmax is null then excluded.durationmax
+        else greatest(scorer_scoring_stats.durationmax, excluded.durationmax)
+      end,
+      rollbackcount = scorer_scoring_stats.rollbackcount + excluded.rollbackcount,
+      updatedat = excluded.updatedat;
+  end if;
+
+  if tg_op in ('DELETE', 'UPDATE')
+     and old.scorer is not null and btrim(old.scorer) <> ''
+     and old.status = 'completed' then
+    perform refresh_scorer_scoring_duration(
+      old.scorer,
+      old.taskversion,
+      coalesce(old.projectid, ''),
+      coalesce(old.submissionmode, 'untracked')
+    );
+  end if;
+
+  if tg_op = 'UPDATE'
+     and new.scorer is not null and btrim(new.scorer) <> ''
+     and new.status = 'completed' then
+    perform refresh_scorer_scoring_duration(
+      new.scorer,
+      new.taskversion,
+      coalesce(new.projectid, ''),
+      coalesce(new.submissionmode, 'untracked')
+    );
+  end if;
+
+  if tg_op in ('DELETE', 'UPDATE')
      and old.status = 'completed'
      and old.completedat is not null then
     update dashboard_completion_hour_stats
@@ -579,3 +751,30 @@ $$;
 drop trigger if exists trg_rating_tasks_stats on rating_tasks;
 create trigger trg_rating_tasks_stats after insert or update or delete on rating_tasks
 for each row execute function sync_rating_task_stats();
+
+do $$
+begin
+  if not exists (select 1 from scorer_scoring_stats limit 1) then
+    insert into scorer_scoring_stats(
+      scorer, taskversion, projectid, submissionmode, taskcount,
+      largeimageopenedcount, durationtotal, durationcount, durationmin, durationmax, rollbackcount, updatedat
+    )
+    select scorer,
+           taskversion,
+           coalesce(projectid, ''),
+           coalesce(submissionmode, 'untracked'),
+           count(*)::bigint,
+           sum(case when coalesce(largeimageopened, false) then 1 else 0 end)::bigint,
+           sum(case when durationms is not null and durationms >= 0 then durationms else 0 end)::bigint,
+           sum(case when durationms is not null and durationms >= 0 then 1 else 0 end)::bigint,
+           min(case when durationms is not null and durationms >= 0 then durationms else null end)::bigint,
+           max(case when durationms is not null and durationms >= 0 then durationms else null end)::bigint,
+           sum(coalesce(rollbackcount, 0))::bigint,
+           coalesce(max(updatedat), current_timestamp)
+    from rating_tasks
+    where status = 'completed'
+      and scorer is not null
+      and btrim(scorer) <> ''
+    group by scorer, taskversion, coalesce(projectid, ''), coalesce(submissionmode, 'untracked');
+  end if;
+end $$;

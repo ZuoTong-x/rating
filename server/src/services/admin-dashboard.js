@@ -243,7 +243,8 @@ export function createAdminDashboardService({
       .prepare(
         `SELECT rating_tasks.id, rating_tasks.subjectId, rating_tasks.projectId, rating_tasks.taskVersion,
                 rating_tasks.taskType, rating_tasks.status, rating_tasks.scorer, rating_tasks.ranking, rating_tasks.excludedImageIds, rating_tasks.correctImageIds, rating_tasks.rankingRelations,
-                rating_tasks.submissionMode, rating_tasks.rankingActionCount,
+                rating_tasks.submissionMode, rating_tasks.rankingActionCount, rating_tasks.largeImageOpened,
+                rating_tasks.isBacktest, rating_tasks.backtestSourceId,
                 rating_tasks.startedAt, rating_tasks.completedAt, rating_tasks.durationMs, rating_tasks.editedAt, rating_tasks.editCount,
                 rating_tasks.rollbackCount, rating_tasks.lastRolledBackAt, rating_tasks.lastRolledBackBy,
                 rating_tasks.imageKey, rating_tasks.createdAt, rating_tasks.updatedAt,
@@ -1109,7 +1110,7 @@ export function createAdminDashboardService({
       const rows = await listCompletedTaskRowsAfter(filters, batchSize, lastId);
       if (!rows.length) break;
       lastId = rows[rows.length - 1].id;
-      const tasks = await hydrateTaskRows(rows);
+      const tasks = await hydrateTaskRows(rows, { includeAdminFields: true });
       for (const task of tasks) {
         await writeResponseChunk(
           stream,

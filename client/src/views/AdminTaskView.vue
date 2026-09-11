@@ -73,6 +73,12 @@ function taskStatusLabel(status: RatingTask['status']) {
   return { pending: '未分配', assigned: '已分配', completed: '已完成' }[status] || status;
 }
 
+function renderBacktestTag(row: Pick<AdminTaskListItem | RatingTask, 'isBacktest'>) {
+  return row.isBacktest
+    ? h(NTag, { size: 'small', type: 'warning', bordered: false }, { default: () => '回测' })
+    : h('span', { class: 'table-muted' }, '普通');
+}
+
 function rankingLabel(ranking: unknown) {
   if (ranking == null || ranking === '') return '未产生';
   if (Array.isArray(ranking)) return ranking.join(' > ');
@@ -423,6 +429,7 @@ const columns: DataTableColumns<AdminTaskListItem> = [
       default: () => taskStatusLabel(row.status)
     })
   },
+  { title: '回测', key: 'isBacktest', width: 90, render: renderBacktestTag },
   { title: '打分人', key: 'scorer', width: 110, render: row => row.scorer || '未分配' },
 
   { title: '创建时间', key: 'createdAt', width: 180, render: row => formatBusinessDateTime(row.createdAt) },
@@ -528,7 +535,7 @@ onMounted(() => {
       </div>
       <div class="task-table-body">
         <n-data-table v-if="tasks.length" class="task-data-table" :columns="columns" :data="tasks" :loading="loading"
-          :bordered="false" remote :scroll-x="1100" />
+          :bordered="false" remote :scroll-x="1180" />
         <div v-else class="empty">{{ loading ? '正在加载任务...' : '暂无任务' }}</div>
       </div>
       <div class="task-table-footer">
@@ -558,6 +565,13 @@ onMounted(() => {
         <div>
           <span>打分耗时</span>
           <strong>{{ formatDuration(detailTask.durationMs) }}</strong>
+        </div>
+        <div>
+          <span>回测任务</span>
+          <strong>
+            <n-tag v-if="detailTask.isBacktest" size="small" type="warning" :bordered="false">回测</n-tag>
+            <span v-else>普通</span>
+          </strong>
         </div>
       </div>
 
