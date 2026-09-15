@@ -53,6 +53,7 @@ export type TaskAllocationImportResult = {
 type TaskCompletionPayload = {
   scorer: string;
   projectId?: string | null;
+  claimToken?: string | null;
   ranking: string[];
   rankingRelations?: RankingRelation[];
   excludedImageIds?: string[];
@@ -632,6 +633,7 @@ export const imageApi = {
     criterion?: RatingTask['criterion'] | null;
     summaryOnly?: boolean;
     excludeTaskId?: string | null;
+    availableOnly?: boolean;
   }) {
     const params = new URLSearchParams();
     params.set('scorer', query.scorer);
@@ -644,10 +646,23 @@ export const imageApi = {
     if (query.criterion) params.set('criterion', query.criterion);
     if (query.summaryOnly) params.set('summaryOnly', '1');
     if (query.excludeTaskId) params.set('excludeTaskId', query.excludeTaskId);
+    if (query.availableOnly) params.set('availableOnly', '1');
     return requestJsonWithRetry<TaskListPage<ScorerTaskListItem>>(`/api/tasks/assigned?${params}`);
   },
-  assignedTaskDetail(taskId: string) {
-    return requestJson<{ task: RatingTask }>(`/api/tasks/${encodeURIComponent(taskId)}`);
+  assignedTaskDetail(taskId: string, claimToken?: string | null) {
+    const params = new URLSearchParams();
+    if (claimToken) params.set('claimToken', claimToken);
+    const query = params.toString();
+    return requestJson<{ task: RatingTask }>(
+      `/api/tasks/${encodeURIComponent(taskId)}${query ? `?${query}` : ''}`,
+    );
+  },
+  releaseTaskClaim(taskId: string, claimToken: string) {
+    return requestJson<{ released: boolean }>(`/api/tasks/${encodeURIComponent(taskId)}/release`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ claimToken })
+    });
   },
   scorerDashboard(query: { scorer: string; projectId?: string | null }) {
     const params = new URLSearchParams();

@@ -16,7 +16,12 @@ export const skippableScoreFields = [
 export const scoreStateFields = skippableScoreFields.map((field) => `${field}State`);
 export const scoreFilterKeys = new Set(scoreNumericFields);
 export const subjectSelectColumns =
-  "id AS _id, name, originalFilename, importBatch, storageRoot, sourceZipPath, imageCount, categoryCount, status, taskStatus, deletionRequestedAt, createdAt, updatedAt, (SELECT COUNT(*) FROM subject_task_templates WHERE subject_task_templates.subjectId = subjects.id) AS taskTemplateCount";
+  `id AS _id, name, originalFilename, importBatch, storageRoot, sourceZipPath,
+   imageCount, categoryCount, status, taskStatus, deletionRequestedAt, createdAt, updatedAt,
+   COALESCE(
+     (SELECT taskTemplateCount FROM subject_task_template_stats WHERE subject_task_template_stats.subjectId = subjects.id),
+     (SELECT COUNT(*) FROM subject_task_templates WHERE subject_task_templates.subjectId = subjects.id)
+   ) AS taskTemplateCount`;
 export const projectSelectColumns = `
   projects.id AS _id, projects.name, projects.icon, projects.packageId, projects.taskStatus,
   projects.deletionRequestedAt, projects.createdAt, projects.updatedAt, subjects.name AS packageName,
@@ -24,8 +29,13 @@ export const projectSelectColumns = `
 export const imageSelectColumns = `id AS _id, subjectId, filename, originalPath, storagePath, thumbnailPath, mimeType, category, directory, isInfographic, prompt, catalogData, importBatch, scorer, ${scoreNumericFields.join(", ")}, ${scoreStateFields.join(", ")}, discomfort, comment, ratedAt, createdAt, updatedAt`;
 export const userSelectColumns = "id, username, role, status, mustChangePassword, lastLoginAt, createdAt, updatedAt";
 
+const isTaskGenerationWorker = process.env.TASK_GENERATION_WORKER === "1";
 const defaultPoolMax = 24;
 const configuredPoolMax = Number.parseInt(process.env.PG_POOL_MAX || "", 10);
+const configuredWorkerPoolMax = Number.parseInt(
+  process.env.PG_TASK_GENERATION_POOL_MAX || "",
+  10,
+);
 const defaultStatementTimeout = 60000;
 const configuredStatementTimeout = Number.parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "", 10);
 const statementTimeout = Number.isInteger(configuredStatementTimeout) && configuredStatementTimeout > 0
@@ -34,7 +44,17 @@ const statementTimeout = Number.isInteger(configuredStatementTimeout) && configu
 const lockTimeout = Number.parseInt(process.env.PG_LOCK_TIMEOUT_MS || "2000", 10);
 const pool = new Pool({
   connectionString: process.env.DATABASE_URL,
-  max: Number.isInteger(configuredPoolMax) && configuredPoolMax > 0 ? configuredPoolMax : defaultPoolMax,
+  max: isTaskGenerationWorker
+    ? (
+      Number.isInteger(configuredWorkerPoolMax) && configuredWorkerPoolMax > 0
+        ? configuredWorkerPoolMax
+        : 4
+    )
+    : (
+      Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
+        ? configuredPoolMax
+        : defaultPoolMax
+    ),
   idleTimeoutMillis: 30000,
   connectionTimeoutMillis: 5000,
   options: `-c statement_timeout=${statementTimeout} -c lock_timeout=${Number.isInteger(lockTimeout) && lockTimeout > 0 ? lockTimeout : 2000} -c idle_in_transaction_session_timeout=60000`,
@@ -148,7 +168,9 @@ export const db = {
   exec,
 };
 
-const schema = await fs.readFile(new URL("./postgres-schema.sql", import.meta.url), "utf8");
-await pool.query(schema);
+if (!isTaskGenerationWorker) {
+  const schema = await fs.readFile(new URL("./postgres-schema.sql", import.meta.url), "utf8");
+  await pool.query(schema);
+}
 
 export { pool };

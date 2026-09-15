@@ -178,6 +178,7 @@ export interface RatingTask {
   pageBlurCount?: number;
   riskScore?: number;
   riskFlags?: string[];
+  claimToken?: string | null;
   imageKey: string;
   rollbackCount?: number;
   lastRolledBackAt?: string | null;

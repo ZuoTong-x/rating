@@ -5,7 +5,6 @@ import { currentUser } from '../../../composables/auth';
 import { taskCriteria, type TaskCriterionKey } from '../../../constants/scoreCriteria';
 import { imageApi } from '../../../services/images';
 import { HttpError, isQueryUnavailable } from '../../../services/http';
-import AsyncStatePlaceholder from '../../../components/AsyncStatePlaceholder.vue';
 import type { RankingRelation, RatingTask, RatingTaskItem, TaskSubmissionMode } from '../../../types/image';
 
 const props = defineProps<{
@@ -17,11 +16,14 @@ const emit = defineEmits<{
   'update:show': [value: boolean];
   saved: [task: RatingTask, advancing: boolean, previousTask: RatingTask | null];
   next: [task: RatingTask];
+  released: [taskId: string];
+  loading: [payload: { active: boolean; text?: string }];
 }>();
 const RAPID_SUBMISSION_INTERVAL_MS = 3000;
 const message = useMessage();
 const dialog = useDialog();
 const saving = ref(false);
+const loadingNextTask = ref(false);
 const submitError = ref(false);
 const nextTaskError = ref(false);
 const nextTaskRetrying = ref(false);
@@ -44,48 +46,8 @@ const detailItem = ref<RatingTaskItem | null>(null);
 const detailVisible = ref(false);
 const imagePreviewVisible = ref(false);
 const imagePreviewSrc = ref('');
-let imagePrefetchRun = 0;
-const prefetchedImageUrls = new Set<string>();
-
-function idleTimeout(callback: () => void, timeout = 600) {
-  const requestIdleCallback = (window as Window & {
-    requestIdleCallback?: (handler: () => void, options?: { timeout?: number }) => void;
-  }).requestIdleCallback;
-  if (requestIdleCallback) {
-    requestIdleCallback(callback, { timeout });
-    return;
-  }
-  window.setTimeout(callback, timeout);
-}
-
-async function prefetchLargeImages(items: RatingTaskItem[], runId: number) {
-  const urls = [...new Set(items
-    .map(item => item.image.imageUrl)
-    .filter((url): url is string => Boolean(url && !prefetchedImageUrls.has(url))))];
-
-  for (const url of urls) {
-    if (runId !== imagePrefetchRun || !visible.value) return;
-    await new Promise<void>(resolve => {
-      const image = new Image();
-      image.decoding = 'async';
-      image.onload = () => {
-        prefetchedImageUrls.add(url);
-        resolve();
-      };
-      image.onerror = () => resolve();
-      image.src = url;
-    });
-  }
-}
-
-function scheduleLargeImagePrefetch(items: RatingTaskItem[]) {
-  imagePrefetchRun += 1;
-  const runId = imagePrefetchRun;
-  if (!items.length) return;
-  idleTimeout(() => {
-    void prefetchLargeImages(items, runId);
-  });
-}
+let submittedTaskId: string | null = null;
+let releasingTaskId: string | null = null;
 
 function handlePreviewEscape(event: KeyboardEvent) {
   if (!visible.value || !imagePreviewVisible.value || event.key !== 'Escape') return;
@@ -114,11 +76,20 @@ onBeforeUnmount(() => {
   window.removeEventListener('keydown', handlePreviewEscape, true);
   document.removeEventListener('click', handlePreviewImageClick, true);
   document.removeEventListener('visibilitychange', handleVisibilityChange);
+  emit('loading', { active: false });
+  void releaseCurrentClaim();
 });
 
 const visible = computed({
   get: () => props.show,
   set: (value: boolean) => emit('update:show', value)
+});
+
+watch(loadingNextTask, active => {
+  emit('loading', {
+    active,
+    text: active ? '正在打开下一条任务' : ''
+  });
 });
 
 const criterion = computed(() => props.task?.criterion as TaskCriterionKey | undefined);
@@ -158,29 +129,49 @@ const detailPrompt = computed(() => {
 });
 
 const commonRulePoint = '所有黄色、暴力、暗黑、阴暗的画风表达，都应该在排序中垫底。';
+const largeImageRulePoint = '请点击查看大图。';
 const rulePoints: Record<string, string[]> = {
-  overall: ['一眼评，不参考其他分数。', commonRulePoint],
-  creativity: ['视觉记忆性、趣味性、视觉冲击力、天马行空的想象力。', commonRulePoint],
-  mood: ['情绪传达度、氛围、意境、故事感。', commonRulePoint],
-  composition: ['主体明确性、视觉层级清晰性、画面平衡性、视线引导性。', commonRulePoint],
+  overall: [largeImageRulePoint, '一眼评，不参考其他分数。', commonRulePoint],
+  creativity: [largeImageRulePoint, '视觉记忆性、趣味性、视觉冲击力、天马行空的想象力。', commonRulePoint],
+  mood: [largeImageRulePoint, '情绪传达度、氛围、意境、故事感。', commonRulePoint],
+  composition: [largeImageRulePoint, '主体明确性、视觉层级清晰性、画面平衡性、视线引导性。', commonRulePoint],
   color: [
+    largeImageRulePoint,
     '色彩协调，或有明确控制且协调，或用色大胆且协调。',
     '请选择色彩协调、或有明确控制且协调、或用色大胆（撞色/黑白）且协调的数据，只要色彩协调感高/高级，就可以在排序中得高分。',
     commonRulePoint
   ],
-  lighting: ['光影和谐美观性、光影为画面的加分度、明暗层级是否协调。', commonRulePoint],
-  realism: ['皮肤质感真实、材质可信度、摄影美观度、摄影真实性。', commonRulePoint],
-  detail: ['画面细节性。', commonRulePoint],
-  discomfort: ['是否产生观感不舒适、恶心、厌恶、涉黄或暴力。', commonRulePoint],
-  promptAlignment: ['生成结果与提示词中的主体、场景、风格和关键约束的一致程度。', commonRulePoint],
-  textCorrectness: ['文字是否正确、清晰，无错别字或乱码。', commonRulePoint],
-  anatomyNormality: ['肢体、关节、五官和身体比例是否自然。', commonRulePoint],
-  informationClarity: ['信息传达是否突出、明确。', commonRulePoint],
-  designQuality: ['整体布局、视觉系统与设计完成度。', commonRulePoint],
-  typography: ['文字排版、字形选择和信息层级是否协调。', commonRulePoint]
+  lighting: [largeImageRulePoint, '光影和谐美观性、光影为画面的加分度、明暗层级是否协调。', commonRulePoint],
+  realism: [largeImageRulePoint, '皮肤质感真实、材质可信度、摄影美观度、摄影真实性。', commonRulePoint],
+  detail: [largeImageRulePoint, '画面细节性。', commonRulePoint],
+  discomfort: [largeImageRulePoint, '是否产生观感不舒适、恶心、厌恶、涉黄或暴力。', commonRulePoint],
+  promptAlignment: [largeImageRulePoint, '生成结果与提示词中的主体、场景、风格和关键约束的一致程度。', commonRulePoint],
+  textCorrectness: [largeImageRulePoint, '文字是否正确、清晰，无错别字或乱码。', commonRulePoint],
+  anatomyNormality: [largeImageRulePoint, '肢体、关节、五官和身体比例是否自然。', commonRulePoint],
+  informationClarity: [largeImageRulePoint, '信息传达是否突出、明确。', commonRulePoint],
+  designQuality: [largeImageRulePoint, '整体布局、视觉系统与设计完成度。', commonRulePoint],
+  typography: [largeImageRulePoint, '文字排版、字形选择和信息层级是否协调。', commonRulePoint]
 };
 
 const currentRulePoints = computed(() => criterion.value ? rulePoints[criterion.value] : rulePoints.overall);
+
+function mergeSavedTask(savedTask: RatingTask, currentTask: RatingTask | null): RatingTask {
+  if (!currentTask || currentTask.id !== savedTask.id) return savedTask;
+  return {
+    ...currentTask,
+    ...savedTask,
+    subjectId: savedTask.subjectId || currentTask.subjectId,
+    projectId: savedTask.projectId || currentTask.projectId,
+    subjectName: savedTask.subjectName ?? currentTask.subjectName,
+    taskVersion: savedTask.taskVersion || currentTask.taskVersion,
+    taskType: savedTask.taskType || currentTask.taskType,
+    criterion: savedTask.criterion ?? currentTask.criterion,
+    imageKey: savedTask.imageKey || currentTask.imageKey,
+    createdAt: savedTask.createdAt || currentTask.createdAt,
+    updatedAt: savedTask.updatedAt || currentTask.updatedAt,
+    items: savedTask.items?.length ? savedTask.items : currentTask.items
+  };
+}
 
 function resetOrder() {
   submitError.value = false;
@@ -188,7 +179,6 @@ function resetOrder() {
   lastSavedTask.value = null;
   const task = props.task;
   if (!task) {
-    imagePrefetchRun += 1;
     orderedItems.value = [];
     excludedImageIds.value = [];
     correctImageIds.value = [];
@@ -253,7 +243,6 @@ function resetOrder() {
   pageBlurCount.value = 0;
   draggingIndex.value = null;
   openedAt.value = Date.now();
-  scheduleLargeImagePrefetch(task.items);
 }
 
 function markFirstAction() {
@@ -270,9 +259,33 @@ function handleVisibilityChange() {
   if (visible.value && document.hidden) pageBlurCount.value += 1;
 }
 
-watch(() => [props.show, props.task], ([show]) => {
+async function releaseCurrentClaim() {
+  const task = props.task;
+  if (
+    saving.value ||
+    !task ||
+    task.status !== 'assigned' ||
+    !task.claimToken ||
+    releasingTaskId === task.id
+  ) return;
+
+  releasingTaskId = task.id;
+  try {
+    await imageApi.releaseTaskClaim(task.id, task.claimToken);
+    emit('released', task.id);
+  } catch {
+    // Claim expiry remains the fallback when the browser closes unexpectedly.
+  } finally {
+    releasingTaskId = null;
+  }
+}
+
+watch(() => [props.show, props.task], ([show], previous) => {
   if (!show) {
-    imagePrefetchRun += 1;
+    if (previous?.[0]) {
+      if (submittedTaskId === props.task?.id) submittedTaskId = null;
+      else void releaseCurrentClaim();
+    }
     return;
   }
   resetOrder();
@@ -420,7 +433,7 @@ function reopenForRescoring() {
 async function submit(advance = false) {
   const task = props.task;
   const scorer = currentUser.value?.username;
-  if (!task || !scorer || saving.value) return;
+  if (!task || !scorer || saving.value || loadingNextTask.value) return;
 
   const submissionIntervalMs = lastSubmissionAt.value == null
     ? null
@@ -440,6 +453,7 @@ async function submit(advance = false) {
     const payload = {
       scorer,
       projectId: task.projectId || task.subjectId,
+      claimToken: task.claimToken || null,
       ranking: orderedItems.value.map(item => item.imageId),
       rankingRelations: rankingRelations.value,
       excludedImageIds: excludedImageIds.value,
@@ -456,11 +470,12 @@ async function submit(advance = false) {
     const result = isEditing.value
       ? await imageApi.updateCompletedTask(task.id, payload)
       : await imageApi.completeTask(task.id, payload);
+    saving.value = false;
     await handleSavedTask(result.task, advance);
   } catch (error) {
     if (error instanceof HttpError && error.status === 409 && !isEditing.value) {
       try {
-        const recovered = (await imageApi.assignedTaskDetail(task.id)).task;
+        const recovered = (await imageApi.assignedTaskDetail(task.id, task.claimToken)).task;
         if (recovered.status === 'completed' && recovered.scorer === scorer) {
           await handleSavedTask(recovered, advance);
           return;
@@ -476,18 +491,21 @@ async function submit(advance = false) {
 
 async function handleSavedTask(savedTask: RatingTask, advance: boolean) {
   const previousTask = props.task;
+  const mergedTask = mergeSavedTask(savedTask, previousTask || null);
   lastSubmissionAt.value = Date.now();
-  lastSavedTask.value = savedTask;
-  emit('saved', savedTask, advance, previousTask || null);
+  lastSavedTask.value = mergedTask;
+  emit('saved', mergedTask, advance, previousTask || null);
 
   if (!advance) {
     message.success(isEditing.value ? '修改已保存' : '任务已提交');
+    submittedTaskId = mergedTask.id;
     visible.value = false;
     return;
   }
 
   try {
-    const nextTask = await props.getNextTask?.(savedTask);
+    loadingNextTask.value = true;
+    const nextTask = await props.getNextTask?.(mergedTask);
     if (nextTask) {
       message.success('任务已提交，已打开下一条');
       emit('next', nextTask);
@@ -496,10 +514,13 @@ async function handleSavedTask(savedTask: RatingTask, advance: boolean) {
 
     message.success('任务已提交');
     message.info('当前筛选条件下没有下一条待处理任务');
+    submittedTaskId = mergedTask.id;
     visible.value = false;
   } catch (error) {
     if (isQueryUnavailable(error)) nextTaskError.value = true;
     else message.error(error instanceof Error ? `当前任务已提交，${error.message}` : '当前任务已提交，但加载下一条失败');
+  } finally {
+    loadingNextTask.value = false;
   }
 }
 
@@ -507,6 +528,7 @@ async function retryNextTask() {
   const task = lastSavedTask.value;
   if (!task || !props.getNextTask || nextTaskRetrying.value) return;
   nextTaskRetrying.value = true;
+  loadingNextTask.value = true;
   try {
     const nextTask = await props.getNextTask(task);
     if (nextTask) {
@@ -515,11 +537,13 @@ async function retryNextTask() {
       return;
     }
     nextTaskError.value = false;
+    submittedTaskId = task.id;
     visible.value = false;
   } catch (error) {
     if (!isQueryUnavailable(error)) message.error(error instanceof Error ? error.message : '加载下一条失败');
   } finally {
     nextTaskRetrying.value = false;
+    loadingNextTask.value = false;
   }
 }
 </script>
@@ -645,17 +669,22 @@ async function retryNextTask() {
 
       </section>
 
-      <AsyncStatePlaceholder v-if="nextTaskError" state="unavailable" title="下一条任务暂时无法加载"
-        description="当前任务已提交，稍后重试即可继续。" :retrying="nextTaskRetrying" @retry="retryNextTask" />
+      <div v-if="nextTaskError" class="task-ranking-inline-alert">
+        <span>当前任务已提交，下一条暂时无法加载。</span>
+        <n-button size="small" secondary :loading="nextTaskRetrying" @click="retryNextTask">重试</n-button>
+      </div>
 
     </div>
 
     <template #footer>
       <div class="task-ranking-actions" style="padding-right:20px">
-        <AsyncStatePlaceholder v-if="submitError" state="unavailable" title="提交暂时未完成"
-          description="评分内容仍在当前页面，稍后重试即可。" retry-label="重新提交" @retry="() => void submit()" />
+        <div v-if="submitError" class="task-ranking-footer-alert">
+          <span>提交暂时未完成，评分内容仍在当前页面。</span>
+          <n-button size="small" secondary @click="() => void submit(!isEditing)">重新提交</n-button>
+        </div>
         <n-button @click="visible = false" size="large" style="font-size:20px;margin-right:10px">取消</n-button>
-        <n-button type="primary" :loading="saving" :disabled="!rankingComplete" @click="submit" size="large"
+        <n-button type="primary" :loading="saving" :disabled="!rankingComplete || loadingNextTask"
+          @click="() => void submit(!isEditing)" size="large"
           style="font-size:20px">{{ isEditing
             ? (isCorrectnessCriterion ? '保存确认' : '保存修改') :
             (isCorrectnessCriterion ? '提交确认' : '提交排序') }}</n-button>

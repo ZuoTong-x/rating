@@ -1,15 +1,15 @@
 <script setup lang="ts">
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
-import { NButton, NTag, useMessage, type DataTableColumns } from 'naive-ui';
+import { NButton, NTag, useLoadingBar, useMessage, type DataTableColumns } from 'naive-ui';
 import { currentUser } from '../composables/auth';
 import TaskRankingDialog from '../features/tasks/components/TaskRankingDialog.vue';
-import AsyncStatePlaceholder from '../components/AsyncStatePlaceholder.vue';
 import { taskCriteria } from '../constants/scoreCriteria';
 import { imageApi } from '../services/images';
 import { isQueryUnavailable } from '../services/http';
 import type { RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem } from '../types/image';
 
 const message = useMessage();
+const loadingBar = useLoadingBar();
 const tasks = ref<ScorerTaskListItem[]>([]);
 const loading = ref(false);
 const taskListState = ref<'loading' | 'ready' | 'stale' | 'unavailable'>('loading');
@@ -20,6 +20,7 @@ const taskTotal = ref(0);
 const activeTask = ref<RatingTask | null>(null);
 const rankingVisible = ref(false);
 const openingTaskId = ref<string | null>(null);
+const dialogLoadingText = ref('');
 const projects = ref<ScorerProjectOption[]>([]);
 const taskStats = ref<Pick<ScorerDashboard, 'pendingTasks' | 'completedTasks' | 'totalTasks' | 'projectCount'>>({
   pendingTasks: 0,
@@ -32,6 +33,7 @@ let taskStatsRefreshTimer: number | null = null;
 let taskStatsLoadPromise: Promise<void> | null = null;
 let lastTaskStatsLoadAt = 0;
 let taskStatsRefreshVersion = 0;
+let taskStatsMutationVersion = 0;
 const taskFilters = reactive({
   projectId: null as string | null,
   criterion: null as RatingTask['criterion'] | null,
@@ -39,6 +41,9 @@ const taskFilters = reactive({
 });
 let taskLoadTimer: number | null = null;
 let taskListRefreshPending = false;
+let taskLoadVersion = 0;
+let taskTotalKnown = false;
+const taskClaimTokens = new Map<string, string>();
 
 const criterionOptions = taskCriteria.map(item => ({ label: item.label, value: item.key }));
 const projectOptions = computed(() => projects.value
@@ -52,6 +57,8 @@ const taskProgressLabel = computed(() => taskStatsState.value === 'unavailable' 
 const taskProgressDetail = computed(() => taskStatsState.value === 'unavailable'
   ? '统计暂不可用'
   : `${taskStats.value.completedTasks} / ${taskProgressTotal.value} 已完成`);
+const pageLoadingActive = computed(() => loading.value || Boolean(dialogLoadingText.value));
+let pageLoadingBarActive = false;
 
 const statIconPaths = {
   task: 'M7 7h10M7 12h10M7 17h7 M5 5h14v14H5z',
@@ -111,6 +118,8 @@ function scheduleTaskStatsRefresh(force = false) {
 async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
   const scorer = currentUser.value?.username;
   if (!scorer) return;
+  const requestVersion = ++taskLoadVersion;
+  const includeTotal = !taskTotalKnown;
   loading.value = true;
   taskListState.value = tasks.value.length ? 'stale' : 'loading';
   try {
@@ -118,22 +127,27 @@ async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
       scorer,
       page,
       pageSize,
-      includeTotal: true,
+      includeTotal,
       ...taskFilters
     });
+    if (requestVersion !== taskLoadVersion) return;
     tasks.value = result.tasks;
-    taskTotal.value = result.total ?? 0;
+    if (result.total != null) {
+      taskTotal.value = result.total;
+      taskTotalKnown = true;
+    }
     taskPage.value = result.page;
     taskPageSize.value = result.pageSize;
     taskListState.value = 'ready';
   } catch (error) {
+    if (requestVersion !== taskLoadVersion) return;
     if (isQueryUnavailable(error)) taskListState.value = tasks.value.length ? 'stale' : 'unavailable';
     else {
       taskListState.value = tasks.value.length ? 'stale' : 'ready';
       message.error(errorMessage(error));
     }
   } finally {
-    loading.value = false;
+    if (requestVersion === taskLoadVersion) loading.value = false;
   }
 }
 
@@ -151,6 +165,7 @@ async function loadTaskStats() {
   const scorer = currentUser.value?.username;
   if (!scorer) return;
   const requestVersion = taskStatsRefreshVersion;
+  const mutationVersion = taskStatsMutationVersion;
   const request = (async () => {
     taskStatsState.value = taskStats.value.totalTasks ? 'stale' : 'loading';
     try {
@@ -158,12 +173,14 @@ async function loadTaskStats() {
         scorer,
         projectId: null
       });
-      taskStats.value = {
-        pendingTasks: result.pendingTasks,
-        completedTasks: result.completedTasks,
-        totalTasks: result.totalTasks,
-        projectCount: result.projectCount
-      };
+      if (mutationVersion === taskStatsMutationVersion) {
+        taskStats.value = {
+          pendingTasks: result.pendingTasks,
+          completedTasks: result.completedTasks,
+          totalTasks: result.totalTasks,
+          projectCount: result.projectCount
+        };
+      }
       taskStatsState.value = 'ready';
     } catch (error) {
       if (isQueryUnavailable(error)) taskStatsState.value = taskStats.value.totalTasks ? 'stale' : 'unavailable';
@@ -204,12 +221,20 @@ function applyTaskStatsAfterSave(previousTask: RatingTask | null, savedTask: Rat
   if (taskStatsState.value === 'unavailable') return;
   if (!previousTask || previousTask.id !== savedTask.id) return;
   if (previousTask.status === 'assigned' && savedTask.status === 'completed') {
+    taskStatsMutationVersion += 1;
     taskStats.value = {
       ...taskStats.value,
       pendingTasks: Math.max(0, taskStats.value.pendingTasks - 1),
       completedTasks: taskStats.value.completedTasks + 1,
       totalTasks: taskStats.value.totalTasks
     };
+    if (taskTotalKnown) {
+      if (taskFilters.status === 'assigned') {
+        taskTotal.value = Math.max(0, taskTotal.value - 1);
+      } else if (taskFilters.status === 'completed') {
+        taskTotal.value += 1;
+      }
+    }
   }
 }
 
@@ -217,7 +242,8 @@ async function openRanking(task: ScorerTaskListItem) {
   if (openingTaskId.value) return;
   openingTaskId.value = task.id;
   try {
-    const result = await imageApi.assignedTaskDetail(task.id);
+    const result = await imageApi.assignedTaskDetail(task.id, taskClaimTokens.get(task.id));
+    if (result.task.claimToken) taskClaimTokens.set(task.id, result.task.claimToken);
     activeTask.value = result.task;
     rankingVisible.value = true;
   } catch (error) {
@@ -229,7 +255,19 @@ async function openRanking(task: ScorerTaskListItem) {
 
 function handleTaskSaved(task: RatingTask, advancing = false, previousTask: RatingTask | null = null) {
   if (activeTask.value?.id === task.id) activeTask.value = task;
+  if (task.status === 'completed') taskClaimTokens.delete(task.id);
+  else if (task.claimToken) taskClaimTokens.set(task.id, task.claimToken);
   applyTaskStatsAfterSave(previousTask, task);
+  const taskIndex = tasks.value.findIndex(item => item.id === task.id);
+  if (taskIndex >= 0) {
+    if (taskFilters.status === 'assigned' && task.status === 'completed') {
+      tasks.value = tasks.value.filter(item => item.id !== task.id);
+    } else {
+      tasks.value = tasks.value.map((item, index) => index === taskIndex
+        ? { ...item, status: task.status === 'completed' ? 'completed' : item.status }
+        : item);
+    }
+  }
   markTaskListRefreshPending();
 }
 
@@ -245,7 +283,8 @@ async function getNextTask(savedTask?: RatingTask) {
     page: 1,
     pageSize: 1,
     summaryOnly: true,
-    excludeTaskId: savedTask?.id || null
+    excludeTaskId: savedTask?.id || null,
+    availableOnly: true
   });
 
   const nextTask = nextPage.tasks[0];
@@ -255,14 +294,46 @@ async function getNextTask(savedTask?: RatingTask) {
   if (!nextTask) {
     return null;
   }
-  const result = await imageApi.assignedTaskDetail(nextTask.id);
+  const result = await imageApi.assignedTaskDetail(nextTask.id, taskClaimTokens.get(nextTask.id));
+  if (result.task.claimToken) taskClaimTokens.set(nextTask.id, result.task.claimToken);
   return result.task;
 }
 
 function openNextTask(task: RatingTask) {
+  if (task.claimToken) taskClaimTokens.set(task.id, task.claimToken);
   activeTask.value = task;
   rankingVisible.value = true;
 }
+
+function handleTaskReleased(taskId: string) {
+  taskClaimTokens.delete(taskId);
+}
+
+function handleDialogLoading(payload: { active: boolean; text?: string }) {
+  dialogLoadingText.value = payload.active ? payload.text || '正在处理任务' : '';
+}
+
+function stopPageLoadingBar(error = false) {
+  if (!pageLoadingBarActive) return;
+  if (error) loadingBar.error();
+  else loadingBar.finish();
+  pageLoadingBarActive = false;
+}
+
+watch(pageLoadingActive, active => {
+  if (active) {
+    if (!pageLoadingBarActive) {
+      loadingBar.start();
+      pageLoadingBarActive = true;
+    }
+    return;
+  }
+  stopPageLoadingBar();
+}, { flush: 'post' });
+
+watch(taskListState, state => {
+  if (state === 'unavailable') stopPageLoadingBar(true);
+});
 
 watch(rankingVisible, (show, oldShow) => {
   if (!oldShow || show) return;
@@ -316,6 +387,9 @@ const columns: DataTableColumns<ScorerTaskListItem> = [
 
 function scheduleTaskLoad() {
   if (taskLoadTimer != null) window.clearTimeout(taskLoadTimer);
+  taskLoadVersion += 1;
+  taskTotalKnown = false;
+  taskTotal.value = 0;
   taskLoadTimer = window.setTimeout(() => {
     taskLoadTimer = null;
     void loadTasks(1, taskPageSize.value);
@@ -325,6 +399,8 @@ function scheduleTaskLoad() {
 watch(taskFilters, scheduleTaskLoad, { deep: true });
 onBeforeUnmount(() => {
   if (taskLoadTimer != null) window.clearTimeout(taskLoadTimer);
+  taskLoadVersion += 1;
+  stopPageLoadingBar();
 });
 
 onMounted(() => {
@@ -402,16 +478,18 @@ onBeforeUnmount(() => {
         <n-button secondary @click="resetTaskFilters">重置筛选</n-button>
       </div>
       <div class="scorer-task-table-body">
-        <AsyncStatePlaceholder v-if="taskListState === 'unavailable'" state="unavailable" title="任务列表暂时不可用"
-          description="任务数据正在恢复，稍后重试即可继续工作。" :retrying="loading" @retry="() => void loadTasks()" />
+        <div v-if="taskListState === 'unavailable'" class="scorer-task-inline-state">
+          <div>
+            <strong>任务列表暂时不可用</strong>
+            <span>任务数据正在恢复，稍后重试即可继续工作。</span>
+          </div>
+          <n-button size="small" secondary :loading="loading" @click="() => void loadTasks()">重试</n-button>
+        </div>
         <template v-else-if="tasks.length">
-          <AsyncStatePlaceholder v-if="taskListState === 'stale'" state="stale" title="任务列表正在刷新"
-            description="先显示上次结果，刷新完成后会自动更新。" :retrying="loading" @retry="() => void loadTasks()" />
           <n-data-table :columns="columns" :data="tasks" :loading="loading" :bordered="false" remote
           :scroll-x="1080" />
         </template>
-        <AsyncStatePlaceholder v-else-if="taskListState === 'loading'" state="loading" title="正在加载任务"
-          description="正在准备你的任务列表。" />
+        <div v-else-if="taskListState === 'loading'" class="empty">正在加载任务</div>
         <div v-else class="empty">暂无任务</div>
       </div>
       <div class="scorer-task-table-footer">
@@ -424,5 +502,5 @@ onBeforeUnmount(() => {
   </div>
 
   <TaskRankingDialog v-model:show="rankingVisible" :task="activeTask" :get-next-task="getNextTask"
-    @saved="handleTaskSaved" @next="openNextTask" />
+    @saved="handleTaskSaved" @next="openNextTask" @released="handleTaskReleased" @loading="handleDialogLoading" />
 </template>

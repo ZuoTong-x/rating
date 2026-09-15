@@ -43,13 +43,15 @@ const naiveThemeOverrides = computed<GlobalThemeOverrides | undefined>(() => isD
 
 <template>
   <n-config-provider :theme="naiveTheme" :theme-overrides="naiveThemeOverrides">
-    <n-message-provider>
-      <n-dialog-provider>
-        <n-layout class="app">
-          <router-view />
-        </n-layout>
-        <ChangePasswordModal />
-      </n-dialog-provider>
-    </n-message-provider>
+    <n-loading-bar-provider>
+      <n-message-provider>
+        <n-dialog-provider>
+          <n-layout class="app">
+            <router-view />
+          </n-layout>
+          <ChangePasswordModal />
+        </n-dialog-provider>
+      </n-message-provider>
+    </n-loading-bar-provider>
   </n-config-provider>
 </template>

@@ -285,6 +285,7 @@ export function createAdminScoringService({
   assertScorerAssignable,
   withDatabaseContext,
   onTasksChanged,
+  recordTaskStatsEvents,
 }) {
   const rollbackJobs = new Map();
   const activeRollbackJobsByKey = new Map();
@@ -1390,6 +1391,12 @@ export function createAdminScoringService({
           .filter(Boolean),
       ),
     ];
+    const nextScorerByTaskId = new Map(
+      analysis.rollbackRows.map((row) => [row.id, row.scorer]),
+    );
+    reassignment?.groups.forEach((group) => {
+      group.taskIds.forEach((taskId) => nextScorerByTaskId.set(taskId, group.scorer));
+    });
     let changed = 0;
 
     onProgress?.({
@@ -1398,6 +1405,7 @@ export function createAdminScoringService({
     });
     await db.exec("BEGIN");
     try {
+      await db.exec("SET LOCAL app.skip_rating_task_stats = 'on'");
       const updateGroups = reassignment
         ? reassignment.groups
         : [{ scorer: null, taskIds }];
@@ -1421,6 +1429,19 @@ export function createAdminScoringService({
       if (changed !== taskIds.length) {
         throw httpError(409, "部分任务状态已变化，请重新预览后再回退");
       }
+      await recordTaskStatsEvents?.(analysis.rollbackRows.map((row) => ({
+        eventType: "task_rolled_back",
+        oldTask: row,
+        newTask: {
+          ...row,
+          status: "assigned",
+          scorer: nextScorerByTaskId.get(row.id),
+          completedAt: null,
+          updatedAt: now,
+        },
+        applyScorerTaskStats: true,
+        createdAt: now,
+      })));
 
       for (const ids of chunk(projectIds)) {
         await db.prepare(

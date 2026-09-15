@@ -353,18 +353,18 @@ export function createAdminDashboardService({
                 subjects.categoryCount,
                 subjects.taskStatus,
                 subjects.status,
-                COUNT(subject_task_templates.id) AS taskTemplateCount
+                COALESCE(template_stats.taskTemplateCount, template_counts.taskTemplateCount, 0) AS taskTemplateCount
          FROM project_packages
          JOIN subjects ON subjects.id = project_packages.packageId
-         LEFT JOIN subject_task_templates ON subject_task_templates.subjectId = subjects.id
+         LEFT JOIN subject_task_template_stats template_stats
+           ON template_stats.subjectId = subjects.id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS taskTemplateCount
+           FROM subject_task_templates
+           WHERE template_stats.subjectId IS NULL
+             AND subject_task_templates.subjectId = subjects.id
+         ) template_counts ON TRUE
          WHERE project_packages.projectId = ?
-         GROUP BY project_packages.createdAt,
-                  subjects.id,
-                  subjects.name,
-                  subjects.imageCount,
-                  subjects.categoryCount,
-                  subjects.taskStatus,
-                  subjects.status
          ORDER BY project_packages.createdAt ASC, LOWER(subjects.name) ASC, subjects.name ASC`,
       )
       .all(projectId);
@@ -377,32 +377,82 @@ export function createAdminDashboardService({
                 subjects.categoryCount,
                 subjects.taskStatus,
                 subjects.status,
-                COUNT(subject_task_templates.id) AS taskTemplateCount
+                COALESCE(template_stats.taskTemplateCount, template_counts.taskTemplateCount, 0) AS taskTemplateCount
          FROM subjects
-         LEFT JOIN subject_task_templates ON subject_task_templates.subjectId = subjects.id
-         WHERE subjects.id = ?
-         GROUP BY subjects.id, subjects.name, subjects.imageCount, subjects.categoryCount, subjects.taskStatus, subjects.status`,
+         LEFT JOIN subject_task_template_stats template_stats
+           ON template_stats.subjectId = subjects.id
+         LEFT JOIN LATERAL (
+           SELECT COUNT(*) AS taskTemplateCount
+           FROM subject_task_templates
+           WHERE template_stats.subjectId IS NULL
+             AND subject_task_templates.subjectId = subjects.id
+         ) template_counts ON TRUE
+         WHERE subjects.id = ?`,
       )
       .all(fallbackPackageId);
+  }
+
+  async function getDashboardProjectTaskSummary(projectId, packageRows) {
+    const packageIds = [...new Set(packageRows.map((row) => row.id).filter(Boolean))];
+    const criterionSummaryPromise = packageIds.length
+      ? db
+        .prepare(
+          `SELECT COUNT(*) AS criterionCount
+           FROM (
+             SELECT DISTINCT NULLIF(BTRIM(criterion), '') AS criterion
+             FROM subject_task_templates
+             WHERE subjectId IN (${placeholders(packageIds.length)})
+               AND NULLIF(BTRIM(criterion), '') IS NOT NULL
+           ) criteria`,
+        )
+        .get(...packageIds)
+      : Promise.resolve({ criterionCount: 0 });
+    const taskSummaryPromise = db
+      .prepare(
+        `WITH scorer_summary AS (
+           SELECT COUNT(*) AS scorerCount
+           FROM scorer_task_stats
+           WHERE projectId = ?
+             AND taskVersion = ?
+             AND scorer IS NOT NULL
+             AND TRIM(scorer) <> ''
+             AND (assigned + completed) > 0
+         ), duration_summary AS (
+           SELECT COALESCE(SUM(durationTotal), 0) AS durationTotal,
+                  COALESCE(SUM(durationCount), 0) AS durationCount
+           FROM scorer_scoring_stats
+           WHERE projectId = ?
+             AND taskVersion = ?
+         )
+         SELECT scorer_summary.scorerCount,
+                CASE
+                  WHEN duration_summary.durationCount > 0
+                  THEN duration_summary.durationTotal::double precision / duration_summary.durationCount
+                END AS averageDurationMs
+         FROM scorer_summary
+         CROSS JOIN duration_summary`,
+      )
+      .get(projectId, taskVersion, projectId, taskVersion);
+    const [criterionSummary, taskSummary] = await Promise.all([
+      criterionSummaryPromise,
+      taskSummaryPromise,
+    ]);
+    return {
+      scorerCount: Number(taskSummary?.scorerCount || 0),
+      criterionCount: Number(criterionSummary?.criterionCount || 0),
+      averageDurationMs: taskSummary?.averageDurationMs ?? null,
+    };
   }
 
   async function getDashboardProjectSummary(projectId) {
     if (!projectId) return null;
     const project = await getProjectOrThrow(projectId);
-    const packageRows = await listProjectPackages(project.id, project.packageId);
-    const statusCounts = await projectTaskStatusCounts(projectId);
+    const [packageRows, statusCounts] = await Promise.all([
+      listProjectPackages(project.id, project.packageId),
+      projectTaskStatusCounts(projectId),
+    ]);
     const totalTasks = statusCounts.pending + statusCounts.assigned + statusCounts.completed;
-    const taskSummary = await db
-      .prepare(
-        `SELECT COUNT(DISTINCT NULLIF(BTRIM(scorer), '')) AS scorerCount,
-                COUNT(DISTINCT NULLIF(split_part(taskType, ':', 2), '')) AS criterionCount,
-                AVG(CASE
-                  WHEN status = 'completed' AND durationMs >= 0 THEN durationMs
-                END) AS averageDurationMs
-         FROM rating_tasks
-         WHERE projectId = ? AND taskVersion = ?`,
-      )
-      .get(projectId, taskVersion);
+    const taskSummary = await getDashboardProjectTaskSummary(projectId, packageRows);
 
     return {
       projectId: project.id,
@@ -767,10 +817,12 @@ export function createAdminDashboardService({
              AND projectId <> ''
          ), durations AS (
            SELECT projectId,
-                  SUM(CASE WHEN status = 'completed' AND durationMs >= 0 THEN durationMs ELSE 0 END) AS durationTotal,
-                  COUNT(*) FILTER (WHERE status = 'completed' AND durationMs >= 0) AS durationCount
-           FROM rating_tasks
-           WHERE taskVersion = ? AND scorer = ?
+                  SUM(durationTotal) AS durationTotal,
+                  SUM(durationCount) AS durationCount
+           FROM scorer_scoring_stats
+           WHERE taskVersion = ?
+             AND scorer = ?
+             AND projectId <> ''
            GROUP BY projectId
          )
          SELECT projects.id AS projectId,
@@ -869,22 +921,17 @@ export function createAdminDashboardService({
              AND projectId <> ''
            GROUP BY scorer
          ), durations AS (
-           SELECT rating_tasks.scorer,
-                  SUM(CASE
-                    WHEN rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0
-                    THEN rating_tasks.durationMs
-                    ELSE 0
-                  END) AS durationTotal,
-                  COUNT(*) FILTER (
-                    WHERE rating_tasks.status = 'completed' AND rating_tasks.durationMs >= 0
-                  ) AS durationCount
-           FROM rating_tasks
-           JOIN users duration_users ON duration_users.username = rating_tasks.scorer
+           SELECT scorer_scoring_stats.scorer,
+                  SUM(scorer_scoring_stats.durationTotal) AS durationTotal,
+                  SUM(scorer_scoring_stats.durationCount) AS durationCount
+           FROM scorer_scoring_stats
+           JOIN users duration_users ON duration_users.username = scorer_scoring_stats.scorer
             AND duration_users.role = 'scorer'
            JOIN user_teams duration_members ON duration_members.userId = duration_users.id
            WHERE duration_members.teamId = ?
-             AND rating_tasks.taskVersion = ?
-           GROUP BY rating_tasks.scorer
+             AND scorer_scoring_stats.taskVersion = ?
+             AND scorer_scoring_stats.projectId <> ''
+           GROUP BY scorer_scoring_stats.scorer
          )
          SELECT users.id,
                 users.username AS name,

@@ -95,6 +95,12 @@ function positiveLimit(name, fallback) {
   return Number.isFinite(configured) && configured > 0 ? configured : fallback;
 }
 
+function envFlag(name, fallback = false) {
+  const raw = process.env[name];
+  if (raw == null || raw === "") return fallback;
+  return ["1", "true", "yes", "on"].includes(String(raw).trim().toLowerCase());
+}
+
 function setShortApiCache(res) {
   res.setHeader("Cache-Control", "private, max-age=2, stale-while-revalidate=2");
   res.setHeader("Vary", "Cookie");
@@ -123,6 +129,61 @@ const importDbItemBatchSize = Math.min(
   10000,
   Math.max(500, Math.floor(positiveLimit("IMPORT_DB_ITEM_BATCH_SIZE", 5000))),
 );
+const taskStatsRefreshIntervalMs = Math.max(
+  60 * 1000,
+  Math.floor(positiveLimit("TASK_STATS_REFRESH_INTERVAL_MS", 10 * 60 * 1000)),
+);
+const taskStatsEventFlushIntervalMs = Math.max(
+  500,
+  Math.floor(positiveLimit("TASK_STATS_EVENT_FLUSH_INTERVAL_MS", 2 * 1000)),
+);
+const taskStatsRefreshStartupDelayMs = Math.max(
+  1000,
+  Math.floor(positiveLimit("TASK_STATS_REFRESH_STARTUP_DELAY_MS", 30 * 1000)),
+);
+const taskStatsRefreshFullOnStartup = envFlag("TASK_STATS_REFRESH_FULL_ON_STARTUP", false);
+const taskStatsEventScanBatchSize = Math.min(
+  50000,
+  Math.max(1, Math.floor(positiveLimit("TASK_STATS_EVENT_SCAN_BATCH_SIZE", 20000))),
+);
+const taskStatsEventInsertBatchSize = Math.min(
+  1000,
+  Math.max(1, Math.floor(positiveLimit("TASK_STATS_EVENT_INSERT_BATCH_SIZE", 500))),
+);
+const taskStatsEventRetentionMs = Math.max(
+  60 * 60 * 1000,
+  Math.floor(positiveLimit("TASK_STATS_EVENT_RETENTION_MS", 48 * 60 * 60 * 1000)),
+);
+const taskStatsReconcileLookbackMs = Math.max(
+  taskStatsRefreshIntervalMs * 2,
+  Math.floor(positiveLimit("TASK_STATS_RECONCILE_LOOKBACK_MS", 30 * 60 * 1000)),
+);
+const completeTaskSlowLogMs = Math.floor(positiveLimit("COMPLETE_TASK_SLOW_LOG_MS", 1000));
+
+function createStepTimer() {
+  const startedAt = performance.now();
+  let previousAt = startedAt;
+  const steps = [];
+  return {
+    mark(step) {
+      const currentAt = performance.now();
+      steps.push({
+        step,
+        ms: Number((currentAt - previousAt).toFixed(1)),
+      });
+      previousAt = currentAt;
+    },
+    warnIfSlow(label, fields = {}) {
+      const totalMs = Number((performance.now() - startedAt).toFixed(1));
+      if (totalMs < completeTaskSlowLogMs) return;
+      console.warn(`${label} slow`, JSON.stringify({
+        ...fields,
+        totalMs,
+        steps,
+      }));
+    },
+  };
+}
 
 const upload = multer({
   dest: zipUploadDir,
@@ -278,6 +339,10 @@ const TASK_WRITE_BATCH_SIZE = Number.isInteger(configuredTaskWriteBatchSize)
 const TASK_ASSIGN_BATCH_SIZE = Number.isInteger(configuredTaskAssignBatchSize)
   ? Math.min(5000, Math.max(100, configuredTaskAssignBatchSize))
   : 1000;
+const taskClaimLeaseMs = Math.max(
+  5 * 60 * 1000,
+  Math.floor(positiveLimit("TASK_CLAIM_LEASE_MS", 30 * 60 * 1000)),
+);
 const TASK_GENERATION_PROGRESS_PERSIST_INTERVAL_MS = 1000;
 const ADMIN_EXPORT_JOB_TTL_MS = 24 * 60 * 60 * 1000;
 const ADMIN_EXPORT_CONCURRENCY = Math.max(
@@ -753,24 +818,19 @@ const selectProjectPackagesStmt = db.prepare(`
          subjects.status,
          subjects.createdAt,
          subjects.updatedAt,
-         COUNT(subject_task_templates.id) AS taskTemplateCount
+         COALESCE(template_stats.taskTemplateCount, template_counts.taskTemplateCount, 0) AS taskTemplateCount
   FROM project_packages
   JOIN subjects ON subjects.id = project_packages.packageId
-  LEFT JOIN subject_task_templates
-    ON subject_task_templates.subjectId = subjects.id
+  LEFT JOIN subject_task_template_stats template_stats
+    ON template_stats.subjectId = subjects.id
+  LEFT JOIN LATERAL (
+    SELECT COUNT(*) AS taskTemplateCount
+    FROM subject_task_templates
+    WHERE template_stats.subjectId IS NULL
+      AND subject_task_templates.subjectId = subjects.id
+  ) template_counts ON TRUE
   WHERE project_packages.projectId = ?
     AND subjects.deletionRequestedAt IS NULL
-  GROUP BY project_packages.projectId,
-           project_packages.packageId,
-           project_packages.createdAt,
-           subjects.id,
-           subjects.name,
-           subjects.originalFilename,
-           subjects.imageCount,
-           subjects.categoryCount,
-           subjects.status,
-           subjects.createdAt,
-           subjects.updatedAt
   ORDER BY project_packages.createdAt ASC, subjects.createdAt ASC, subjects.id ASC
 `);
 const insertProjectStmt = db.prepare(`
@@ -811,6 +871,12 @@ const deleteUncompletedProjectTasksStmt = db.prepare(
 );
 const deleteProjectUserLinksStmt = db.prepare(
   "DELETE FROM user_projects WHERE projectId = ?",
+);
+const deleteProjectScorerTaskStatsStmt = db.prepare(
+  "DELETE FROM scorer_task_stats WHERE projectId = ? AND taskVersion = ?",
+);
+const deleteProjectScorerScoringStatsStmt = db.prepare(
+  "DELETE FROM scorer_scoring_stats WHERE projectId = ? AND taskVersion = ?",
 );
 const deleteProjectStmt = db.prepare(
   "DELETE FROM projects WHERE id = ? AND deletionRequestedAt IS NULL",
@@ -1219,6 +1285,19 @@ const selectScorerTaskStatsStmt = db.prepare(`
     AND scorer = ?
     AND (?::text IS NULL OR projectId = ?)
 `);
+const selectScorerTaskListTotalStmt = db.prepare(`
+  SELECT COALESCE(SUM(
+    CASE
+      WHEN ?::text = 'assigned' THEN assigned
+      WHEN ?::text = 'completed' THEN completed
+      ELSE assigned + completed
+    END
+  ), 0) AS total
+  FROM scorer_task_stats
+  WHERE taskVersion = ?
+    AND scorer = ?
+    AND (?::text IS NULL OR projectId = ?)
+`);
 const selectScorerProjectCountStmt = db.prepare(`
   SELECT COUNT(*) AS total
   FROM scorer_task_stats
@@ -1231,9 +1310,53 @@ const selectTaskByIdStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
          submissionMode, rankingActionCount, dragActionCount, orderChanged, largeImageOpened, largeImageOpenCount,
          firstActionMs, pageBlurCount, behaviorTracked, riskScore, riskFlags, isBacktest, backtestSourceId, startedAt, completedAt, durationMs, editedAt, editCount,
-         rollbackCount, lastRolledBackAt, lastRolledBackBy, imageKey, createdAt, updatedAt
+         rollbackCount, lastRolledBackAt, lastRolledBackBy, claimToken, claimedAt, claimExpiresAt,
+         imageKey, createdAt, updatedAt
   FROM rating_tasks
   WHERE id = ?
+`);
+const claimAssignedTaskStmt = db.prepare(`
+  UPDATE rating_tasks
+  SET claimToken = @claimToken,
+      claimedAt = CASE
+        WHEN claimToken = @claimToken THEN COALESCE(claimedAt, @claimedAt)
+        ELSE @claimedAt
+      END,
+      claimExpiresAt = @claimExpiresAt
+  WHERE id = @id
+    AND taskVersion = @taskVersion
+    AND scorer = @scorer
+    AND status = 'assigned'
+    AND (
+      (
+        @requestedClaimToken <> ''
+        AND (
+          claimToken = @requestedClaimToken
+          OR claimToken IS NULL
+          OR claimExpiresAt IS NULL
+          OR claimExpiresAt <= @claimedAt
+        )
+      )
+      OR (
+        @requestedClaimToken = ''
+        AND (
+          claimToken IS NULL
+          OR claimExpiresAt IS NULL
+          OR claimExpiresAt <= @claimedAt
+        )
+      )
+    )
+`);
+const releaseTaskClaimStmt = db.prepare(`
+  UPDATE rating_tasks
+  SET claimToken = NULL,
+      claimedAt = NULL,
+      claimExpiresAt = NULL
+  WHERE id = ?
+    AND taskVersion = ?
+    AND scorer = ?
+    AND status = 'assigned'
+    AND claimToken = ?
 `);
 const selectTaskImageIdsStmt = db.prepare(`
   SELECT imageId
@@ -1262,6 +1385,9 @@ const completeAssignedTaskStmt = db.prepare(`
       behaviorTracked = @behaviorTracked,
       riskScore = @riskScore,
       riskFlags = @riskFlags,
+      claimToken = NULL,
+      claimedAt = NULL,
+      claimExpiresAt = NULL,
       updatedAt = @updatedAt
   WHERE id = @id
     AND status = 'assigned'
@@ -1284,6 +1410,9 @@ const updateCompletedTaskStmt = db.prepare(`
       behaviorTracked = @behaviorTracked,
       riskScore = @riskScore,
       riskFlags = @riskFlags,
+      claimToken = NULL,
+      claimedAt = NULL,
+      claimExpiresAt = NULL,
       editedAt = @editedAt,
       editCount = COALESCE(editCount, 0) + 1,
       updatedAt = @updatedAt
@@ -1310,13 +1439,46 @@ const selectSubjectTaskTemplatesStmt = db.prepare(`
   WHERE subjectId = ?
   ORDER BY selectionKey ASC, id ASC
 `);
+const upsertSubjectTaskTemplateStatsStmt = db.prepare(`
+  INSERT INTO subject_task_template_stats (
+    subjectId, taskTemplateCount, criterionCount, updatedAt
+  )
+  SELECT
+    subjectId,
+    COUNT(*)::integer,
+    COUNT(DISTINCT NULLIF(BTRIM(criterion), ''))::integer,
+    ?
+  FROM subject_task_templates
+  WHERE subjectId = ?
+  GROUP BY subjectId
+  ON CONFLICT (subjectId) DO UPDATE SET
+    taskTemplateCount = EXCLUDED.taskTemplateCount,
+    criterionCount = EXCLUDED.criterionCount,
+    updatedAt = EXCLUDED.updatedAt
+`);
+const upsertAllSubjectTaskTemplateStatsStmt = db.prepare(`
+  INSERT INTO subject_task_template_stats (
+    subjectId, taskTemplateCount, criterionCount, updatedAt
+  )
+  SELECT
+    subjectId,
+    COUNT(*)::integer,
+    COUNT(DISTINCT NULLIF(BTRIM(criterion), ''))::integer,
+    ?
+  FROM subject_task_templates
+  GROUP BY subjectId
+  ON CONFLICT (subjectId) DO UPDATE SET
+    taskTemplateCount = EXCLUDED.taskTemplateCount,
+    criterionCount = EXCLUDED.criterionCount,
+    updatedAt = EXCLUDED.updatedAt
+`);
 const updateSubjectTaskStatusStmt = db.prepare(`
   UPDATE projects
   SET taskStatus = @taskStatus, updatedAt = @updatedAt
   WHERE id = @id
 `);
 const selectProjectTaskStatsStmt = db.prepare(`
-  SELECT total, pending, assigned, completed
+  SELECT total, pending, assigned, completed, baseTotal, basePending
   FROM project_task_stats
   WHERE projectId = ? AND taskVersion = ?
 `);
@@ -1326,7 +1488,7 @@ const deleteProjectTaskStatsStmt = db.prepare(`
 `);
 const insertProjectTaskStatsFromTasksStmt = db.prepare(`
   INSERT INTO project_task_stats (
-    projectId, taskVersion, total, pending, assigned, completed, updatedAt
+    projectId, taskVersion, total, pending, assigned, completed, baseTotal, basePending, updatedAt
   )
   SELECT
     projectId,
@@ -1335,10 +1497,34 @@ const insertProjectTaskStatsFromTasksStmt = db.prepare(`
     COUNT(*) FILTER (WHERE status = 'pending')::integer,
     COUNT(*) FILTER (WHERE status = 'assigned')::integer,
     COUNT(*) FILTER (WHERE status = 'completed')::integer,
+    COUNT(*) FILTER (WHERE NOT isBacktest)::integer,
+    COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending')::integer,
     COALESCE(MAX(updatedAt), ?)
   FROM rating_tasks
   WHERE projectId = ? AND taskVersion = ?
   GROUP BY projectId, taskVersion
+`);
+const backfillProjectTaskBaseStatsStmt = db.prepare(`
+  UPDATE project_task_stats stats
+  SET baseTotal = task_counts.baseTotal,
+      basePending = task_counts.basePending,
+      updatedAt = GREATEST(stats.updatedAt, task_counts.updatedAt)
+  FROM (
+    SELECT
+      projectId,
+      taskVersion,
+      COUNT(*) FILTER (WHERE NOT isBacktest)::integer AS baseTotal,
+      COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending')::integer AS basePending,
+      COALESCE(MAX(updatedAt), ?) AS updatedAt
+    FROM rating_tasks
+    WHERE taskVersion = ?
+      AND projectId IS NOT NULL
+      AND TRIM(projectId) <> ''
+    GROUP BY projectId, taskVersion
+  ) task_counts
+  WHERE stats.projectId = task_counts.projectId
+    AND stats.taskVersion = task_counts.taskVersion
+    AND (stats.baseTotal IS NULL OR stats.basePending IS NULL)
 `);
 const deleteScorerTaskStatsStmt = db.prepare(`
   DELETE FROM scorer_task_stats
@@ -1362,6 +1548,318 @@ const insertScorerTaskStatsFromTasksStmt = db.prepare(`
     AND TRIM(scorer) <> ''
     AND status IN ('assigned', 'completed')
   GROUP BY scorer, taskVersion, projectId
+`);
+const deleteScorerScoringStatsStmt = db.prepare(`
+  DELETE FROM scorer_scoring_stats
+  WHERE projectId = ? AND taskVersion = ?
+`);
+const insertScorerScoringStatsFromTasksStmt = db.prepare(`
+  INSERT INTO scorer_scoring_stats (
+    scorer, taskVersion, projectId, submissionMode, taskCount,
+    largeImageOpenedCount, trackedLargeImageOpenedCount, largeImageOpenCountTotal, dragActionCountTotal,
+    orderChangedCount, fastSubmitCount, highRiskCount, behaviorTrackedCount, riskScoreTotal, riskScoreMax,
+    pageBlurCountTotal, durationTotal, durationCount, durationMin, durationMax,
+    rollbackCount, updatedAt
+  )
+  SELECT
+    scorer,
+    taskVersion,
+    COALESCE(projectId, ''),
+    COALESCE(submissionMode, 'untracked'),
+    COUNT(*)::bigint,
+    COUNT(*) FILTER (WHERE COALESCE(largeImageOpened, false))::bigint,
+    COUNT(*) FILTER (WHERE COALESCE(behaviorTracked, false) AND COALESCE(largeImageOpened, false))::bigint,
+    COALESCE(SUM(GREATEST(COALESCE(largeImageOpenCount, 0), 0)), 0)::bigint,
+    COALESCE(SUM(GREATEST(COALESCE(dragActionCount, 0), 0)), 0)::bigint,
+    COUNT(*) FILTER (WHERE COALESCE(behaviorTracked, false) AND COALESCE(orderChanged, false))::bigint,
+    COUNT(*) FILTER (
+      WHERE COALESCE(behaviorTracked, false)
+        AND durationMs IS NOT NULL
+        AND durationMs >= 0
+        AND durationMs < 3000
+    )::bigint,
+    COUNT(*) FILTER (WHERE COALESCE(behaviorTracked, false) AND COALESCE(riskScore, 0) >= 60)::bigint,
+    COUNT(*) FILTER (WHERE COALESCE(behaviorTracked, false))::bigint,
+    COALESCE(SUM(
+      CASE WHEN COALESCE(behaviorTracked, false)
+        THEN GREATEST(COALESCE(riskScore, 0), 0)
+        ELSE 0
+      END
+    ), 0)::bigint,
+    COALESCE(MAX(GREATEST(COALESCE(riskScore, 0), 0)), 0)::integer,
+    COALESCE(SUM(
+      CASE WHEN COALESCE(behaviorTracked, false)
+        THEN GREATEST(COALESCE(pageBlurCount, 0), 0)
+        ELSE 0
+      END
+    ), 0)::bigint,
+    COALESCE(SUM(
+      CASE WHEN durationMs IS NOT NULL AND durationMs >= 0
+        THEN durationMs
+        ELSE 0
+      END
+    ), 0)::bigint,
+    COUNT(*) FILTER (WHERE durationMs IS NOT NULL AND durationMs >= 0)::bigint,
+    MIN(durationMs) FILTER (WHERE durationMs IS NOT NULL AND durationMs >= 0),
+    MAX(durationMs) FILTER (WHERE durationMs IS NOT NULL AND durationMs >= 0),
+    COALESCE(SUM(COALESCE(rollbackCount, 0)), 0)::bigint,
+    COALESCE(MAX(updatedAt), ?)
+  FROM rating_tasks
+  WHERE projectId = ?
+    AND taskVersion = ?
+    AND scorer IS NOT NULL
+    AND TRIM(scorer) <> ''
+    AND status = 'completed'
+  GROUP BY scorer, taskVersion, COALESCE(projectId, ''), COALESCE(submissionMode, 'untracked')
+`);
+const deleteDashboardCompletionHourStatsStmt = db.prepare(`
+  DELETE FROM dashboard_completion_hour_stats
+  WHERE taskVersion = ?
+`);
+const insertDashboardCompletionHourStatsFromTasksStmt = db.prepare(`
+  INSERT INTO dashboard_completion_hour_stats (
+    taskVersion, hour, completedTaskCount, updatedAt
+  )
+  SELECT
+    taskVersion,
+    EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer,
+    COUNT(*)::bigint,
+    COALESCE(MAX(updatedAt), ?)
+  FROM rating_tasks
+  WHERE taskVersion = ?
+    AND status = 'completed'
+    AND completedAt IS NOT NULL
+  GROUP BY taskVersion, EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer
+`);
+const addDashboardCompletionHourStatsStmt = db.prepare(`
+  INSERT INTO dashboard_completion_hour_stats (
+    taskVersion, hour, completedTaskCount, updatedAt
+  ) VALUES (?, ?, ?, ?)
+  ON CONFLICT (taskVersion, hour) DO UPDATE SET
+    completedTaskCount = dashboard_completion_hour_stats.completedTaskCount + excluded.completedTaskCount,
+    updatedAt = excluded.updatedAt
+`);
+const subtractDashboardCompletionHourStatsStmt = db.prepare(`
+  UPDATE dashboard_completion_hour_stats
+  SET completedTaskCount = GREATEST(0, completedTaskCount - ?),
+      updatedAt = ?
+  WHERE taskVersion = ?
+    AND hour = ?
+`);
+const selectPendingTaskStatsEventsStmt = db.prepare(`
+  SELECT id, taskId, projectId, taskVersion, eventType,
+         oldStatus, newStatus, oldScorer, newScorer,
+         oldCompletedAt, newCompletedAt, isBacktest, applyScorerTaskStats,
+         oldScoringStats, newScoringStats, createdAt
+  FROM task_stats_events
+  WHERE taskVersion = ?
+    AND processedAt IS NULL
+    AND createdAt <= ?
+  ORDER BY id ASC
+  LIMIT ?
+  FOR UPDATE SKIP LOCKED
+`);
+const selectPendingProjectTaskStatsEventHourDeltasStmt = db.prepare(`
+  SELECT taskVersion, hour, SUM(delta)::integer AS delta
+  FROM (
+    SELECT taskVersion,
+           EXTRACT(HOUR FROM oldCompletedAt AT TIME ZONE 'Asia/Shanghai')::integer AS hour,
+           -COUNT(*)::integer AS delta
+    FROM task_stats_events
+    WHERE taskVersion = ?
+      AND projectId = ?
+      AND processedAt IS NULL
+      AND createdAt <= ?
+      AND oldStatus = 'completed'
+      AND oldCompletedAt IS NOT NULL
+    GROUP BY taskVersion, EXTRACT(HOUR FROM oldCompletedAt AT TIME ZONE 'Asia/Shanghai')::integer
+
+    UNION ALL
+
+    SELECT taskVersion,
+           EXTRACT(HOUR FROM newCompletedAt AT TIME ZONE 'Asia/Shanghai')::integer AS hour,
+           COUNT(*)::integer AS delta
+    FROM task_stats_events
+    WHERE taskVersion = ?
+      AND projectId = ?
+      AND processedAt IS NULL
+      AND createdAt <= ?
+      AND newStatus = 'completed'
+      AND newCompletedAt IS NOT NULL
+    GROUP BY taskVersion, EXTRACT(HOUR FROM newCompletedAt AT TIME ZONE 'Asia/Shanghai')::integer
+  ) event_deltas
+  GROUP BY taskVersion, hour
+  ORDER BY hour ASC
+`);
+const markPendingProjectTaskStatsEventsStmt = db.prepare(`
+  UPDATE task_stats_events
+  SET processedAt = ?
+  WHERE taskVersion = ?
+    AND projectId = ?
+    AND processedAt IS NULL
+    AND createdAt <= ?
+`);
+const markTaskStatsEventsProcessedByIdsStmt = (eventCount) => db.prepare(`
+  UPDATE task_stats_events
+  SET processedAt = ?
+  WHERE processedAt IS NULL
+    AND id IN (${placeholders(eventCount)})
+`);
+const hasPendingTaskStatsEventsStmt = db.prepare(`
+  SELECT EXISTS (
+    SELECT 1
+    FROM task_stats_events
+    WHERE taskVersion = ?
+      AND processedAt IS NULL
+      AND (?::text IS NULL OR projectId = ?)
+  ) AS pending
+`);
+const selectRecentTaskStatsEventProjectsStmt = db.prepare(`
+  SELECT DISTINCT projectId
+  FROM task_stats_events
+  WHERE taskVersion = ?
+    AND processedAt IS NOT NULL
+    AND processedAt >= ?
+  ORDER BY projectId ASC
+`);
+const tryTaskStatsMaintenanceLockStmt = db.prepare(`
+  SELECT pg_try_advisory_xact_lock(2026091401) AS locked
+`);
+const updateProjectTaskStatsDeltaStmt = db.prepare(`
+  UPDATE project_task_stats
+  SET total = GREATEST(0, total + @total),
+      pending = GREATEST(0, pending + @pending),
+      assigned = GREATEST(0, assigned + @assigned),
+      completed = GREATEST(0, completed + @completed),
+      baseTotal = GREATEST(0, COALESCE(baseTotal, total) + @baseTotal),
+      basePending = GREATEST(0, COALESCE(basePending, pending) + @basePending),
+      updatedAt = @updatedAt
+  WHERE projectId = @projectId
+    AND taskVersion = @taskVersion
+`);
+const reconcileProjectTaskStatsStmt = db.prepare(`
+  INSERT INTO project_task_stats (
+    projectId, taskVersion, total, pending, assigned, completed, baseTotal, basePending, updatedAt
+  )
+  SELECT
+    projectId,
+    taskVersion,
+    COUNT(*)::integer,
+    COUNT(*) FILTER (WHERE status = 'pending')::integer,
+    COUNT(*) FILTER (WHERE status = 'assigned')::integer,
+    COUNT(*) FILTER (WHERE status = 'completed')::integer,
+    COUNT(*) FILTER (WHERE NOT isBacktest)::integer,
+    COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending')::integer,
+    @updatedAt
+  FROM rating_tasks
+  WHERE projectId = @projectId
+    AND taskVersion = @taskVersion
+  GROUP BY projectId, taskVersion
+  ON CONFLICT (projectId, taskVersion) DO UPDATE SET
+    total = excluded.total,
+    pending = excluded.pending,
+    assigned = excluded.assigned,
+    completed = excluded.completed,
+    baseTotal = excluded.baseTotal,
+    basePending = excluded.basePending,
+    updatedAt = excluded.updatedAt
+`);
+const updateScorerTaskStatsDeltaStmt = db.prepare(`
+  UPDATE scorer_task_stats
+  SET assigned = GREATEST(0, assigned + @assigned),
+      completed = GREATEST(0, completed + @completed),
+      updatedAt = @updatedAt
+  WHERE scorer = @scorer
+    AND taskVersion = @taskVersion
+    AND projectId = @projectId
+`);
+const insertScorerTaskStatsDeltaStmt = db.prepare(`
+  INSERT INTO scorer_task_stats (
+    scorer, taskVersion, projectId, assigned, completed, updatedAt
+  ) VALUES (
+    @scorer, @taskVersion, @projectId, @assigned, @completed, @updatedAt
+  )
+  ON CONFLICT DO NOTHING
+`);
+const deleteEmptyScorerTaskStatsStmt = db.prepare(`
+  DELETE FROM scorer_task_stats
+  WHERE scorer = ? AND taskVersion = ? AND projectId = ?
+    AND assigned = 0 AND completed = 0
+`);
+const updateScorerScoringStatsDeltaStmt = db.prepare(`
+  UPDATE scorer_scoring_stats
+  SET taskCount = GREATEST(0, taskCount + @taskCount),
+      largeImageOpenedCount = GREATEST(0, largeImageOpenedCount + @largeImageOpenedCount),
+      trackedLargeImageOpenedCount = GREATEST(0, trackedLargeImageOpenedCount + @trackedLargeImageOpenedCount),
+      largeImageOpenCountTotal = GREATEST(0, largeImageOpenCountTotal + @largeImageOpenCountTotal),
+      dragActionCountTotal = GREATEST(0, dragActionCountTotal + @dragActionCountTotal),
+      orderChangedCount = GREATEST(0, orderChangedCount + @orderChangedCount),
+      fastSubmitCount = GREATEST(0, fastSubmitCount + @fastSubmitCount),
+      highRiskCount = GREATEST(0, highRiskCount + @highRiskCount),
+      behaviorTrackedCount = GREATEST(0, behaviorTrackedCount + @behaviorTrackedCount),
+      riskScoreTotal = GREATEST(0, riskScoreTotal + @riskScoreTotal),
+      riskScoreMax = GREATEST(riskScoreMax, @riskScoreMax),
+      pageBlurCountTotal = GREATEST(0, pageBlurCountTotal + @pageBlurCountTotal),
+      durationTotal = GREATEST(0, durationTotal + @durationTotal),
+      durationCount = GREATEST(0, durationCount + @durationCount),
+      durationMin = CASE
+        WHEN @durationMin::bigint IS NULL THEN durationMin
+        WHEN durationMin IS NULL THEN @durationMin::bigint
+        ELSE LEAST(durationMin, @durationMin::bigint)
+      END,
+      durationMax = CASE
+        WHEN @durationMax::bigint IS NULL THEN durationMax
+        WHEN durationMax IS NULL THEN @durationMax::bigint
+        ELSE GREATEST(durationMax, @durationMax::bigint)
+      END,
+      rollbackCount = GREATEST(0, rollbackCount + @rollbackCount),
+      updatedAt = @updatedAt
+  WHERE scorer = @scorer
+    AND taskVersion = @taskVersion
+    AND projectId = @projectId
+    AND submissionMode = @submissionMode
+`);
+const insertScorerScoringStatsDeltaStmt = db.prepare(`
+  INSERT INTO scorer_scoring_stats (
+    scorer, taskVersion, projectId, submissionMode, taskCount,
+    largeImageOpenedCount, trackedLargeImageOpenedCount, largeImageOpenCountTotal, dragActionCountTotal,
+    orderChangedCount, fastSubmitCount, highRiskCount, behaviorTrackedCount, riskScoreTotal, riskScoreMax,
+    pageBlurCountTotal, durationTotal, durationCount, durationMin, durationMax,
+    rollbackCount, updatedAt
+  ) VALUES (
+    @scorer, @taskVersion, @projectId, @submissionMode, @taskCount,
+    @largeImageOpenedCount, @trackedLargeImageOpenedCount, @largeImageOpenCountTotal, @dragActionCountTotal,
+    @orderChangedCount, @fastSubmitCount, @highRiskCount, @behaviorTrackedCount, @riskScoreTotal, @riskScoreMax,
+    @pageBlurCountTotal, @durationTotal, @durationCount, @durationMin, @durationMax,
+    @rollbackCount, @updatedAt
+  )
+  ON CONFLICT DO NOTHING
+`);
+const deleteEmptyScorerScoringStatsStmt = db.prepare(`
+  DELETE FROM scorer_scoring_stats
+  WHERE scorer = ? AND taskVersion = ? AND projectId = ? AND submissionMode = ?
+    AND taskCount = 0
+`);
+const refreshScorerScoringExtremaStmt = db.prepare(`
+  SELECT refresh_scorer_scoring_duration(?, ?, ?, ?)
+`);
+const deleteProcessedTaskStatsEventsStmt = db.prepare(`
+  DELETE FROM task_stats_events
+  WHERE processedAt IS NOT NULL
+    AND processedAt < ?
+`);
+const deleteProjectTaskStatsEventsStmt = db.prepare(`
+  DELETE FROM task_stats_events
+  WHERE projectId = ? AND taskVersion = ?
+`);
+const selectProjectIdsWithTaskStatsStmt = db.prepare(`
+  SELECT DISTINCT rating_tasks.projectId
+  FROM rating_tasks
+  JOIN projects ON projects.id = rating_tasks.projectId
+  WHERE rating_tasks.taskVersion = ?
+    AND rating_tasks.projectId IS NOT NULL
+    AND TRIM(rating_tasks.projectId) <> ''
+    AND projects.deletionRequestedAt IS NULL
 `);
 const selectPendingProjectTaskIdsStmt = db.prepare(`
   SELECT id, taskType
@@ -2729,6 +3227,7 @@ async function importZipArchive(
     await bulkInsertImageRecords(imageRecords);
     await onProgress?.({ stage: "正在写入图片数据", progress: 95, current: imageRecords.length, total: imageRecords.length });
     await bulkInsertSubjectTaskTemplates(taskTemplates);
+    await refreshSubjectTaskTemplateStats(subjectId, createdAt);
     await bulkInsertSubjectTaskTemplateItems(taskTemplates);
     await onProgress?.({ stage: "正在写入任务模板", progress: 98, current: taskTemplates.length, total: taskTemplates.length });
 
@@ -3152,6 +3651,31 @@ async function bulkInsertSubjectTaskTemplates(taskTemplates) {
     });
     await db.prepare(sql).run(...params);
   }
+}
+
+async function refreshSubjectTaskTemplateStats(subjectId, updatedAt = nowIso()) {
+  await upsertSubjectTaskTemplateStatsStmt.run(updatedAt, subjectId);
+}
+
+function queueSubjectTaskTemplateStatsBackfill() {
+  setImmediate(async () => {
+    try {
+      await upsertAllSubjectTaskTemplateStatsStmt.run(nowIso());
+    } catch (error) {
+      console.error("Subject task template stats backfill failed", error);
+    }
+  });
+}
+
+function queueProjectTaskBaseStatsBackfill() {
+  setImmediate(async () => {
+    try {
+      const updatedAt = nowIso();
+      await backfillProjectTaskBaseStatsStmt.run(updatedAt, taskVersion);
+    } catch (error) {
+      console.error("Project base task stats backfill failed", error);
+    }
+  });
 }
 
 async function bulkInsertSubjectTaskTemplateItems(taskTemplates) {
@@ -3667,14 +4191,352 @@ async function getProjectTaskStats(projectId, version = taskVersion) {
     pending: Number(row?.pending || 0),
     assigned: Number(row?.assigned || 0),
     completed: Number(row?.completed || 0),
+    baseTotal: row?.baseTotal == null ? null : Number(row.baseTotal || 0),
+    basePending: row?.basePending == null ? null : Number(row.basePending || 0),
   };
 }
 
-async function beginTaskWriteTransaction() {
+async function beginTaskStatsSkippedTransaction() {
   await db.exec("BEGIN");
-  // The row trigger remains enabled for normal scoring requests. Large task
-  // jobs rebuild these counters once per project instead of once per row.
+  await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+  // Task counters are rebuilt in batches. Keep row-level triggers out of hot
+  // task write paths so scoring submissions do not compete on stats rows.
   await db.exec("SET LOCAL app.skip_rating_task_stats = 'on'");
+}
+
+async function beginSynchronousTaskStatsTransaction() {
+  await db.exec("BEGIN");
+  await db.exec("SET LOCAL app.sync_rating_task_stats = 'on'");
+}
+
+async function beginTaskWriteTransaction() {
+  await beginTaskStatsSkippedTransaction();
+}
+
+function normalizedTaskStatsEvent(event = {}) {
+  const oldTask = event.oldTask || null;
+  const newTask = event.newTask || null;
+  const projectId = String(
+    event.projectId || newTask?.projectId || oldTask?.projectId ||
+    event.subjectId || newTask?.subjectId || oldTask?.subjectId || "",
+  ).trim();
+  if (!projectId) return null;
+  return {
+    taskId: event.taskId || event.id || newTask?.id || oldTask?.id || null,
+    projectId,
+    taskVersion: event.taskVersion || newTask?.taskVersion || oldTask?.taskVersion || taskVersion,
+    eventType: event.eventType || "task_changed",
+    oldStatus: event.oldStatus ?? oldTask?.status ?? null,
+    newStatus: event.newStatus ?? newTask?.status ?? null,
+    oldScorer: event.oldScorer ?? oldTask?.scorer ?? null,
+    newScorer: event.newScorer ?? newTask?.scorer ?? null,
+    oldCompletedAt: event.oldCompletedAt ?? oldTask?.completedAt ?? null,
+    newCompletedAt: event.newCompletedAt ?? newTask?.completedAt ?? null,
+    isBacktest: Boolean(event.isBacktest ?? newTask?.isBacktest ?? oldTask?.isBacktest),
+    applyScorerTaskStats: Boolean(event.applyScorerTaskStats),
+    oldScoringStats: event.oldScoringStats ?? taskScoringStatsSnapshot(oldTask),
+    newScoringStats: event.newScoringStats ?? taskScoringStatsSnapshot(newTask),
+    createdAt: event.createdAt || nowIso(),
+  };
+}
+
+function nonNegativeInteger(value) {
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : 0;
+}
+
+function taskScoringStatsSnapshot(task) {
+  if (!task || task.status !== "completed") return null;
+  const scorer = String(task.scorer || "").trim();
+  const projectId = String(task.projectId || task.subjectId || "").trim();
+  if (!scorer || !projectId) return null;
+  const behaviorTracked = Boolean(task.behaviorTracked);
+  const largeImageOpened = Boolean(task.largeImageOpened);
+  const orderChanged = Boolean(task.orderChanged);
+  const durationValue = Number(task.durationMs);
+  const durationMs = Number.isFinite(durationValue) && durationValue >= 0
+    ? Math.floor(durationValue)
+    : null;
+  const riskScore = nonNegativeInteger(task.riskScore);
+  return {
+    scorer,
+    taskVersion: task.taskVersion || taskVersion,
+    projectId,
+    submissionMode: task.submissionMode || "untracked",
+    taskCount: 1,
+    largeImageOpenedCount: largeImageOpened ? 1 : 0,
+    trackedLargeImageOpenedCount: behaviorTracked && largeImageOpened ? 1 : 0,
+    largeImageOpenCountTotal: nonNegativeInteger(task.largeImageOpenCount),
+    dragActionCountTotal: nonNegativeInteger(task.dragActionCount),
+    orderChangedCount: behaviorTracked && orderChanged ? 1 : 0,
+    fastSubmitCount: behaviorTracked && durationMs != null && durationMs < 3000 ? 1 : 0,
+    highRiskCount: behaviorTracked && riskScore >= 60 ? 1 : 0,
+    behaviorTrackedCount: behaviorTracked ? 1 : 0,
+    riskScoreTotal: behaviorTracked ? riskScore : 0,
+    riskScoreMax: behaviorTracked ? riskScore : 0,
+    pageBlurCountTotal: behaviorTracked ? nonNegativeInteger(task.pageBlurCount) : 0,
+    durationTotal: durationMs ?? 0,
+    durationCount: durationMs == null ? 0 : 1,
+    durationMin: durationMs,
+    durationMax: durationMs,
+    rollbackCount: nonNegativeInteger(task.rollbackCount),
+  };
+}
+
+async function recordTaskStatsEvents(events) {
+  const rows = (Array.isArray(events) ? events : [events])
+    .map(normalizedTaskStatsEvent)
+    .filter(Boolean);
+  for (let start = 0; start < rows.length; start += taskStatsEventInsertBatchSize) {
+    const batch = rows.slice(start, start + taskStatsEventInsertBatchSize);
+    const params = [];
+    batch.forEach((row) => {
+      params.push(
+        row.taskId,
+        row.projectId,
+        row.taskVersion,
+        row.eventType,
+        row.oldStatus,
+        row.newStatus,
+        row.oldScorer,
+        row.newScorer,
+        row.oldCompletedAt,
+        row.newCompletedAt,
+        row.isBacktest,
+        row.applyScorerTaskStats,
+        row.oldScoringStats ? JSON.stringify(row.oldScoringStats) : null,
+        row.newScoringStats ? JSON.stringify(row.newScoringStats) : null,
+        row.createdAt,
+      );
+    });
+    await db.prepare(
+      `INSERT INTO task_stats_events (
+         taskId, projectId, taskVersion, eventType,
+         oldStatus, newStatus, oldScorer, newScorer,
+         oldCompletedAt, newCompletedAt, isBacktest, applyScorerTaskStats,
+         oldScoringStats, newScoringStats, createdAt
+       ) VALUES ${batch.map(() => "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?::jsonb, ?::jsonb, ?)").join(", ")}`,
+    ).run(...params);
+  }
+}
+
+const scoringStatsAdditiveFields = [
+  "taskCount",
+  "largeImageOpenedCount",
+  "trackedLargeImageOpenedCount",
+  "largeImageOpenCountTotal",
+  "dragActionCountTotal",
+  "orderChangedCount",
+  "fastSubmitCount",
+  "highRiskCount",
+  "behaviorTrackedCount",
+  "riskScoreTotal",
+  "pageBlurCountTotal",
+  "durationTotal",
+  "durationCount",
+  "rollbackCount",
+];
+
+function statusCounterDelta(target, status, direction, isBacktest = false) {
+  if (!status) return;
+  target.total += direction;
+  if (status === "pending") target.pending += direction;
+  if (status === "assigned") target.assigned += direction;
+  if (status === "completed") target.completed += direction;
+  if (!isBacktest) {
+    target.baseTotal += direction;
+    if (status === "pending") target.basePending += direction;
+  }
+}
+
+function scorerTaskStatsDelta(map, event, scorer, status, direction) {
+  if (!event.applyScorerTaskStats || !scorer || !["assigned", "completed"].includes(status)) return;
+  const key = [scorer, event.taskVersion, event.projectId].join("\u0000");
+  const delta = map.get(key) || {
+    scorer,
+    taskVersion: event.taskVersion,
+    projectId: event.projectId,
+    assigned: 0,
+    completed: 0,
+  };
+  delta[status] += direction;
+  map.set(key, delta);
+}
+
+function scoringStatsDelta(map, snapshot, direction) {
+  if (!snapshot?.scorer || !snapshot?.projectId) return;
+  const submissionMode = snapshot.submissionMode || "untracked";
+  const key = [snapshot.scorer, snapshot.taskVersion, snapshot.projectId, submissionMode].join("\u0000");
+  const delta = map.get(key) || {
+    scorer: snapshot.scorer,
+    taskVersion: snapshot.taskVersion,
+    projectId: snapshot.projectId,
+    submissionMode,
+    riskScoreMax: 0,
+    durationMin: null,
+    durationMax: null,
+    requiresExtremaRefresh: false,
+    ...Object.fromEntries(scoringStatsAdditiveFields.map((field) => [field, 0])),
+  };
+  scoringStatsAdditiveFields.forEach((field) => {
+    delta[field] += direction * Number(snapshot[field] || 0);
+  });
+  if (direction > 0) {
+    delta.riskScoreMax = Math.max(delta.riskScoreMax, Number(snapshot.riskScoreMax || 0));
+    if (snapshot.durationMin != null) {
+      delta.durationMin = delta.durationMin == null
+        ? Number(snapshot.durationMin)
+        : Math.min(delta.durationMin, Number(snapshot.durationMin));
+    }
+    if (snapshot.durationMax != null) {
+      delta.durationMax = delta.durationMax == null
+        ? Number(snapshot.durationMax)
+        : Math.max(delta.durationMax, Number(snapshot.durationMax));
+    }
+  } else {
+    delta.requiresExtremaRefresh = true;
+  }
+  map.set(key, delta);
+}
+
+function shanghaiHour(value) {
+  if (!value) return null;
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return null;
+  return (timestamp.getUTCHours() + 8) % 24;
+}
+
+function aggregateTaskStatsEvents(events) {
+  const projectDeltas = new Map();
+  const scorerTaskDeltas = new Map();
+  const scoringDeltas = new Map();
+  const hourDeltas = new Map();
+  for (const event of events) {
+    const projectDelta = projectDeltas.get(event.projectId) || {
+      projectId: event.projectId,
+      taskVersion: event.taskVersion,
+      total: 0,
+      pending: 0,
+      assigned: 0,
+      completed: 0,
+      baseTotal: 0,
+      basePending: 0,
+    };
+    statusCounterDelta(projectDelta, event.oldStatus, -1, event.isBacktest);
+    statusCounterDelta(projectDelta, event.newStatus, 1, event.isBacktest);
+    projectDeltas.set(event.projectId, projectDelta);
+
+    scorerTaskStatsDelta(scorerTaskDeltas, event, event.oldScorer, event.oldStatus, -1);
+    scorerTaskStatsDelta(scorerTaskDeltas, event, event.newScorer, event.newStatus, 1);
+    scoringStatsDelta(scoringDeltas, event.oldScoringStats, -1);
+    scoringStatsDelta(scoringDeltas, event.newScoringStats, 1);
+
+    const oldHour = event.oldStatus === "completed" ? shanghaiHour(event.oldCompletedAt) : null;
+    const newHour = event.newStatus === "completed" ? shanghaiHour(event.newCompletedAt) : null;
+    if (oldHour != null) {
+      const key = `${event.taskVersion}\u0000${oldHour}`;
+      hourDeltas.set(key, (hourDeltas.get(key) || 0) - 1);
+    }
+    if (newHour != null) {
+      const key = `${event.taskVersion}\u0000${newHour}`;
+      hourDeltas.set(key, (hourDeltas.get(key) || 0) + 1);
+    }
+  }
+  return { projectDeltas, scorerTaskDeltas, scoringDeltas, hourDeltas };
+}
+
+async function applyProjectTaskStatsDeltas(deltas, updatedAt) {
+  for (const delta of deltas.values()) {
+    const changed = delta.total || delta.pending || delta.assigned || delta.completed ||
+      delta.baseTotal || delta.basePending;
+    if (!changed) continue;
+    const result = await updateProjectTaskStatsDeltaStmt.run({ ...delta, updatedAt });
+    if (!result.changes) {
+      await reconcileProjectTaskStatsStmt.run({
+        projectId: delta.projectId,
+        taskVersion: delta.taskVersion,
+        updatedAt,
+      });
+    }
+  }
+}
+
+async function applyScorerTaskStatsDeltas(deltas, updatedAt) {
+  for (const delta of deltas.values()) {
+    if (!delta.assigned && !delta.completed) continue;
+    const values = { ...delta, updatedAt };
+    const result = await updateScorerTaskStatsDeltaStmt.run(values);
+    if (!result.changes && (delta.assigned > 0 || delta.completed > 0)) {
+      await insertScorerTaskStatsDeltaStmt.run({
+        ...values,
+        assigned: Math.max(0, delta.assigned),
+        completed: Math.max(0, delta.completed),
+      });
+    }
+    await deleteEmptyScorerTaskStatsStmt.run(
+      delta.scorer,
+      delta.taskVersion,
+      delta.projectId,
+    );
+  }
+}
+
+async function applyScorerScoringStatsDeltas(deltas, updatedAt) {
+  for (const delta of deltas.values()) {
+    const values = { ...delta, updatedAt };
+    const result = await updateScorerScoringStatsDeltaStmt.run(values);
+    if (!result.changes && delta.taskCount > 0) {
+      await insertScorerScoringStatsDeltaStmt.run({
+        ...values,
+        ...Object.fromEntries(
+          scoringStatsAdditiveFields.map((field) => [field, Math.max(0, delta[field])]),
+        ),
+      });
+    }
+    if (delta.requiresExtremaRefresh) {
+      await refreshScorerScoringExtremaStmt.get(
+        delta.scorer,
+        delta.taskVersion,
+        delta.projectId,
+        delta.submissionMode,
+      );
+    }
+    await deleteEmptyScorerScoringStatsStmt.run(
+      delta.scorer,
+      delta.taskVersion,
+      delta.projectId,
+      delta.submissionMode,
+    );
+  }
+}
+
+async function applyTaskStatsEventBatch(events, processedAt) {
+  const aggregates = aggregateTaskStatsEvents(events);
+  await applyProjectTaskStatsDeltas(aggregates.projectDeltas, processedAt);
+  await applyScorerTaskStatsDeltas(aggregates.scorerTaskDeltas, processedAt);
+  await applyScorerScoringStatsDeltas(aggregates.scoringDeltas, processedAt);
+  await applyDashboardCompletionHourDeltas(
+    [...aggregates.hourDeltas.entries()].map(([key, delta]) => {
+      const [version, hour] = key.split("\u0000");
+      return { taskVersion: version, hour: Number(hour), delta };
+    }),
+    processedAt,
+  );
+}
+
+async function applyDashboardCompletionHourDeltas(deltas, updatedAt = nowIso()) {
+  for (const row of deltas) {
+    const version = row.taskVersion || taskVersion;
+    const hour = Number(row.hour);
+    const delta = Number(row.delta || 0);
+    if (!Number.isInteger(hour) || hour < 0 || hour > 23) continue;
+    if (!delta) continue;
+    if (delta > 0) {
+      await addDashboardCompletionHourStatsStmt.run(version, hour, delta, updatedAt);
+    } else {
+      await subtractDashboardCompletionHourStatsStmt.run(Math.abs(delta), updatedAt, version, hour);
+    }
+  }
 }
 
 async function refreshProjectTaskStats(projectId, version = taskVersion) {
@@ -3689,6 +4551,36 @@ async function refreshProjectTaskStats(projectId, version = taskVersion) {
   await insertScorerTaskStatsFromTasksStmt.run(
     refreshedAt,
     projectId,
+    version,
+  );
+  await deleteScorerScoringStatsStmt.run(projectId, version);
+  await insertScorerScoringStatsFromTasksStmt.run(
+    refreshedAt,
+    projectId,
+    version,
+  );
+  const hourDeltas = await selectPendingProjectTaskStatsEventHourDeltasStmt.all(
+    version,
+    projectId,
+    refreshedAt,
+    version,
+    projectId,
+    refreshedAt,
+  );
+  await applyDashboardCompletionHourDeltas(hourDeltas, refreshedAt);
+  await markPendingProjectTaskStatsEventsStmt.run(
+    refreshedAt,
+    version,
+    projectId,
+    refreshedAt,
+  );
+}
+
+async function refreshDashboardCompletionHourStats(version = taskVersion) {
+  const refreshedAt = nowIso();
+  await deleteDashboardCompletionHourStatsStmt.run(version);
+  await insertDashboardCompletionHourStatsFromTasksStmt.run(
+    refreshedAt,
     version,
   );
 }
@@ -3750,6 +4642,217 @@ function queueProjectTaskSummary(projectId) {
   });
 }
 
+let taskStatsRefreshRunning = false;
+let taskStatsRefreshQueued = false;
+let taskStatsRefreshAllQueued = false;
+let taskStatsRefreshIntervalHandle = null;
+let taskStatsEventFlushRunning = false;
+let taskStatsEventFlushQueued = false;
+let taskStatsEventFlushIntervalHandle = null;
+
+async function runTaskStatsRefreshTransaction(callback, { repeatableRead = false } = {}) {
+  return await runWithDatabaseContext(async () => {
+    await db.exec("BEGIN");
+    try {
+      if (repeatableRead) {
+        await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      }
+      const result = await callback();
+      await db.exec("COMMIT");
+      return result;
+    } catch (error) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+  });
+}
+
+async function taskStatsProjectIdsForRefresh(refreshAll) {
+  if (refreshAll) {
+    const rows = await selectProjectIdsWithTaskStatsStmt.all(taskVersion);
+    return {
+      projectIds: rows.map((row) => row.projectId).filter(Boolean),
+    };
+  }
+
+  const cutoff = new Date(Date.now() - taskStatsReconcileLookbackMs).toISOString();
+  const rows = await selectRecentTaskStatsEventProjectsStmt.all(
+    taskVersion,
+    cutoff,
+  );
+  return {
+    projectIds: rows.map((row) => row.projectId).filter(Boolean),
+  };
+}
+
+function hasActiveTaskGeneration(projectId) {
+  const jobId = activeTaskGenerationBySubject.get(projectId);
+  if (!jobId) return false;
+  const job = taskGenerationJobs.get(jobId);
+  return Boolean(job && ["queued", "running"].includes(job.status));
+}
+
+async function cleanupProcessedTaskStatsEvents(now = nowIso()) {
+  const cutoff = new Date(Date.now() - taskStatsEventRetentionMs).toISOString();
+  await deleteProcessedTaskStatsEventsStmt.run(cutoff);
+}
+
+async function flushTaskStatsEvents() {
+  if (taskStatsEventFlushRunning) {
+    taskStatsEventFlushQueued = true;
+    return;
+  }
+  taskStatsEventFlushRunning = true;
+  let failed = false;
+  let processedCount = 0;
+  let changedProjectIds = [];
+  try {
+    const result = await runTaskStatsRefreshTransaction(async () => {
+      const lock = await tryTaskStatsMaintenanceLockStmt.get();
+      if (!lock?.locked) return { processedCount: 0, changedProjectIds: [] };
+      const cutoff = nowIso();
+      const pendingEvents = await selectPendingTaskStatsEventsStmt.all(
+        taskVersion,
+        cutoff,
+        taskStatsEventScanBatchSize,
+      );
+      const events = pendingEvents.filter((event) => !hasActiveTaskGeneration(event.projectId));
+      if (!events.length) return { processedCount: 0, changedProjectIds: [] };
+
+      const processedAt = nowIso();
+      const exactRefreshProjectIds = new Set(
+        events
+          .filter((event) => event.eventType === "task_rolled_back" && !event.oldScoringStats)
+          .map((event) => event.projectId),
+      );
+      for (const projectId of exactRefreshProjectIds) {
+        await refreshProjectTaskStats(projectId);
+      }
+      const incrementalEvents = events.filter(
+        (event) => !exactRefreshProjectIds.has(event.projectId),
+      );
+      if (incrementalEvents.length) {
+        await applyTaskStatsEventBatch(incrementalEvents, processedAt);
+        await markTaskStatsEventsProcessedByIdsStmt(incrementalEvents.length).run(
+          processedAt,
+          ...incrementalEvents.map((event) => event.id),
+        );
+      }
+      return {
+        processedCount: events.length,
+        changedProjectIds: [...new Set(events.map((event) => event.projectId).filter(Boolean))],
+      };
+    });
+    processedCount = result?.processedCount || 0;
+    changedProjectIds = result?.changedProjectIds || [];
+    for (const projectId of changedProjectIds) {
+      invalidateTaskSummaryCaches(projectId);
+      queueProjectTaskSummary(projectId);
+    }
+    if (processedCount) invalidateScorerQueryCaches();
+  } catch (error) {
+    failed = true;
+    console.error("Task stats event flush failed", error);
+  } finally {
+    taskStatsEventFlushRunning = false;
+    if (!failed && (taskStatsEventFlushQueued || processedCount >= taskStatsEventScanBatchSize)) {
+      taskStatsEventFlushQueued = false;
+      setImmediate(() => flushTaskStatsEvents());
+    } else {
+      taskStatsEventFlushQueued = false;
+    }
+  }
+}
+
+async function flushTaskStatsRefresh({ refreshAll = false } = {}) {
+  if (taskStatsRefreshRunning) {
+    taskStatsRefreshQueued = true;
+    taskStatsRefreshAllQueued = taskStatsRefreshAllQueued || refreshAll;
+    return;
+  }
+  taskStatsRefreshRunning = true;
+  let failed = false;
+  let refreshedProjectCount = 0;
+  try {
+    const refreshWindow = await taskStatsProjectIdsForRefresh(refreshAll);
+    const refreshedProjectIds = [];
+    for (const projectId of refreshWindow.projectIds) {
+      if (hasActiveTaskGeneration(projectId)) {
+        continue;
+      }
+      const refreshed = await runTaskStatsRefreshTransaction(async () => {
+        const lock = await tryTaskStatsMaintenanceLockStmt.get();
+        if (!lock?.locked) return false;
+        const pending = await hasPendingTaskStatsEventsStmt.get(taskVersion, projectId, projectId);
+        if (pending?.pending) return false;
+        if (refreshAll) {
+          await refreshProjectTaskStats(projectId);
+        } else {
+          await reconcileProjectTaskStatsStmt.run({
+            projectId,
+            taskVersion,
+            updatedAt: nowIso(),
+          });
+        }
+        return true;
+      }, { repeatableRead: true });
+      if (!refreshed) continue;
+      refreshedProjectIds.push(projectId);
+      refreshedProjectCount += 1;
+      invalidateTaskSummaryCaches(projectId);
+      queueProjectTaskSummary(projectId);
+    }
+
+    if (refreshAll && refreshedProjectIds.length === refreshWindow.projectIds.length) {
+      await runTaskStatsRefreshTransaction(async () => {
+        const lock = await tryTaskStatsMaintenanceLockStmt.get();
+        if (!lock?.locked) return;
+        const pending = await hasPendingTaskStatsEventsStmt.get(taskVersion, null, null);
+        if (pending?.pending) return;
+        await refreshDashboardCompletionHourStats();
+      }, { repeatableRead: true });
+    }
+    if (refreshedProjectCount) invalidateScorerQueryCaches();
+    await cleanupProcessedTaskStatsEvents();
+  } catch (error) {
+    failed = true;
+    console.error("Deferred task stats refresh failed", error);
+  } finally {
+    taskStatsRefreshRunning = false;
+    if (failed) {
+      taskStatsRefreshQueued = false;
+      taskStatsRefreshAllQueued = false;
+    }
+    if (!failed && taskStatsRefreshQueued) {
+      const queuedRefreshAll = taskStatsRefreshAllQueued;
+      taskStatsRefreshQueued = false;
+      taskStatsRefreshAllQueued = false;
+      setImmediate(() => flushTaskStatsRefresh({ refreshAll: queuedRefreshAll }));
+    }
+  }
+}
+
+function startTaskStatsRefresher() {
+  if (taskStatsRefreshIntervalHandle) return;
+  taskStatsEventFlushIntervalHandle = setInterval(() => {
+    flushTaskStatsEvents();
+  }, taskStatsEventFlushIntervalMs);
+  taskStatsEventFlushIntervalHandle.unref?.();
+
+  taskStatsRefreshIntervalHandle = setInterval(() => {
+    flushTaskStatsRefresh();
+  }, taskStatsRefreshIntervalMs);
+  taskStatsRefreshIntervalHandle.unref?.();
+
+  const startupHandle = setTimeout(async () => {
+    await flushTaskStatsEvents();
+    await flushTaskStatsRefresh({ refreshAll: taskStatsRefreshFullOnStartup });
+  }, taskStatsRefreshStartupDelayMs);
+  startupHandle.unref?.();
+}
+
 async function projectStatsByIds(projectIds, version = taskVersion) {
   const ids = [...new Set(projectIds.filter(Boolean))];
   if (!ids.length) return new Map();
@@ -3758,30 +4861,17 @@ async function projectStatsByIds(projectIds, version = taskVersion) {
     pending: 0,
     assigned: 0,
     completed: 0,
-    materializedTotal: 0,
-    materializedPending: 0,
+    baseTotal: null,
+    basePending: null,
   }]));
-  const [statRows, materializedRows] = await Promise.all([
-    db
-      .prepare(
-        `SELECT projectId, total, pending, assigned, completed
-         FROM project_task_stats
-         WHERE taskVersion = ?
-           AND projectId IN (${placeholders(ids.length)})`,
-      )
-      .all(version, ...ids),
-    db
-      .prepare(
-        `SELECT projectId,
-                COUNT(*) FILTER (WHERE NOT isBacktest) AS materializedTotal,
-                COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending') AS materializedPending
-         FROM rating_tasks
-         WHERE taskVersion = ?
-           AND projectId IN (${placeholders(ids.length)})
-         GROUP BY projectId`,
-      )
-      .all(version, ...ids),
-  ]);
+  const statRows = await db
+    .prepare(
+      `SELECT projectId, total, pending, assigned, completed, baseTotal, basePending
+       FROM project_task_stats
+       WHERE taskVersion = ?
+         AND projectId IN (${placeholders(ids.length)})`,
+    )
+    .all(version, ...ids);
   statRows.forEach((row) => {
     statsByProjectId.set(row.projectId, {
       ...(statsByProjectId.get(row.projectId) || {}),
@@ -3789,28 +4879,22 @@ async function projectStatsByIds(projectIds, version = taskVersion) {
       pending: Number(row.pending || 0),
       assigned: Number(row.assigned || 0),
       completed: Number(row.completed || 0),
-    });
-  });
-  materializedRows.forEach((row) => {
-    statsByProjectId.set(row.projectId, {
-      ...(statsByProjectId.get(row.projectId) || {}),
-      materializedTotal: Number(row.materializedTotal || 0),
-      materializedPending: Number(row.materializedPending || 0),
+      baseTotal: row.baseTotal == null ? null : Number(row.baseTotal || 0),
+      basePending: row.basePending == null ? null : Number(row.basePending || 0),
     });
   });
   return statsByProjectId;
 }
 
 async function getProjectMaterializedTaskStats(projectId, version = taskVersion) {
-  const row = await db.prepare(
-    `SELECT COUNT(*) FILTER (WHERE NOT isBacktest) AS materializedTotal,
-            COUNT(*) FILTER (WHERE NOT isBacktest AND status = 'pending') AS materializedPending
-     FROM rating_tasks
-     WHERE projectId = ? AND taskVersion = ?`,
-  ).get(projectId, version);
+  const row = await selectProjectTaskStatsStmt.get(projectId, version);
   return {
-    materializedTotal: Number(row?.materializedTotal || 0),
-    materializedPending: Number(row?.materializedPending || 0),
+    materializedTotal: row?.baseTotal == null
+      ? Number(row?.total || 0)
+      : Number(row.baseTotal || 0),
+    materializedPending: row?.basePending == null
+      ? Number(row?.pending || 0)
+      : Number(row.basePending || 0),
   };
 }
 
@@ -3820,7 +4904,27 @@ async function projectRelatedRowsByIds(projectIds) {
 
   const packageRows = await db
     .prepare(
-      `SELECT project_packages.projectId AS _projectId,
+      `WITH package_links AS (
+         SELECT project_packages.projectId,
+                project_packages.packageId,
+                project_packages.createdAt
+         FROM project_packages
+         WHERE project_packages.projectId IN (${placeholders(ids.length)})
+       ), template_counts AS (
+         SELECT missing_packages.packageId AS subjectId,
+                COUNT(subject_task_templates.id) AS taskTemplateCount
+         FROM (
+           SELECT DISTINCT package_links.packageId
+           FROM package_links
+           LEFT JOIN subject_task_template_stats template_stats
+             ON template_stats.subjectId = package_links.packageId
+           WHERE template_stats.subjectId IS NULL
+         ) missing_packages
+         LEFT JOIN subject_task_templates
+           ON subject_task_templates.subjectId = missing_packages.packageId
+         GROUP BY missing_packages.packageId
+       )
+       SELECT package_links.projectId AS "_projectId",
               subjects.id AS _id,
               subjects.name,
               subjects.originalFilename,
@@ -3829,33 +4933,22 @@ async function projectRelatedRowsByIds(projectIds) {
               subjects.status,
               subjects.createdAt,
               subjects.updatedAt,
-              COUNT(subject_task_templates.id) AS taskTemplateCount
-       FROM project_packages
-       JOIN subjects ON subjects.id = project_packages.packageId
-       LEFT JOIN subject_task_templates
-         ON subject_task_templates.subjectId = subjects.id
-       WHERE project_packages.projectId IN (${placeholders(ids.length)})
-         AND subjects.deletionRequestedAt IS NULL
-       GROUP BY project_packages.projectId,
-                project_packages.packageId,
-                project_packages.createdAt,
-                subjects.id,
-                subjects.name,
-                subjects.originalFilename,
-                subjects.imageCount,
-                subjects.categoryCount,
-                subjects.status,
-                subjects.createdAt,
-                subjects.updatedAt
-       ORDER BY project_packages.projectId ASC,
-                project_packages.createdAt ASC,
+              COALESCE(template_stats.taskTemplateCount, template_counts.taskTemplateCount, 0) AS taskTemplateCount
+       FROM package_links
+       JOIN subjects ON subjects.id = package_links.packageId
+       LEFT JOIN subject_task_template_stats template_stats
+         ON template_stats.subjectId = subjects.id
+       LEFT JOIN template_counts ON template_counts.subjectId = subjects.id
+       WHERE subjects.deletionRequestedAt IS NULL
+       ORDER BY package_links.projectId ASC,
+                package_links.createdAt ASC,
                 subjects.createdAt ASC,
                 subjects.id ASC`,
     )
     .all(...ids);
   const teamRows = await db
     .prepare(
-      `SELECT project_teams.projectId AS _projectId,
+      `SELECT project_teams.projectId AS "_projectId",
               teams.id,
               teams.name,
               teams.status
@@ -3912,10 +5005,11 @@ async function projectDto(row, taskStats = null, related = null) {
     0,
   );
   const stats = taskStats || (await getProjectTaskStats(row._id));
-  const materializedStats = stats.materializedTotal == null
-    ? await getProjectMaterializedTaskStats(row._id)
-    : stats;
-  const generatedTaskCount = materializedStats.materializedTotal;
+  const materializedStats = {
+    materializedTotal: stats.baseTotal == null ? stats.total : stats.baseTotal,
+    materializedPending: stats.basePending == null ? stats.pending : stats.basePending,
+  };
+  const generatedTaskCount = Math.min(materializedStats.materializedTotal, taskTemplateCount);
   const pendingTaskCount = materializedStats.materializedPending;
   const remainingTemplateCount = Math.max(taskTemplateCount - generatedTaskCount, 0);
   return {
@@ -4313,6 +5407,10 @@ async function deleteProject(id) {
   try {
     const deletedTaskCount = (await deleteUncompletedProjectTasksStmt.run(project._id)).changes;
     await deleteProjectUserLinksStmt.run(project._id);
+    await deleteProjectScorerTaskStatsStmt.run(project._id, taskVersion);
+    await deleteProjectScorerScoringStatsStmt.run(project._id, taskVersion);
+    await deleteProjectTaskStatsStmt.run(project._id, taskVersion);
+    await deleteProjectTaskStatsEventsStmt.run(project._id, taskVersion);
     if (!(await deleteProjectStmt.run(project._id)).changes) {
       throw httpError(404, "项目不存在");
     }
@@ -5761,6 +6859,47 @@ function parseStoredTaskRankingRelations(value) {
   }
 }
 
+function completedTaskResultDto(row) {
+  return {
+    id: row.id,
+    subjectId: row.subjectId,
+    projectId: row.projectId || row.subjectId,
+    taskVersion: row.taskVersion,
+    taskType: row.taskType,
+    criterion: row.taskType.split(":")[1] || null,
+    status: row.status,
+    scorer: row.scorer,
+    ranking: row.ranking ? JSON.parse(row.ranking) : null,
+    excludedImageIds: parseStoredTaskImageIds(row.excludedImageIds),
+    correctImageIds: parseStoredTaskImageIds(row.correctImageIds),
+    rankingRelations: parseStoredTaskRankingRelations(row.rankingRelations),
+    submissionMode: row.submissionMode || null,
+    rankingActionCount: Number(row.rankingActionCount || 0),
+    dragActionCount: Number(row.dragActionCount || 0),
+    orderChanged: Boolean(row.orderChanged),
+    largeImageOpened: Boolean(row.largeImageOpened),
+    largeImageOpenCount: Number(row.largeImageOpenCount || 0),
+    startedAt: row.startedAt ?? null,
+    completedAt: row.completedAt ?? null,
+    durationMs: row.durationMs ?? null,
+    firstActionMs: row.firstActionMs ?? null,
+    pageBlurCount: Number(row.pageBlurCount || 0),
+    behaviorTracked: Boolean(row.behaviorTracked),
+    riskScore: Number(row.riskScore || 0),
+    riskFlags: parseStoredTaskImageIds(row.riskFlags),
+    editedAt: row.editedAt ?? null,
+    editCount: Number(row.editCount || 0),
+    claimToken: null,
+    rollbackCount: Number(row.rollbackCount || 0),
+    lastRolledBackAt: row.lastRolledBackAt ?? null,
+    lastRolledBackBy: row.lastRolledBackBy ?? null,
+    imageKey: row.imageKey,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+    items: [],
+  };
+}
+
 async function hydrateTaskRows(rows, options = {}) {
   const includeAdminFields = Boolean(options.includeAdminFields);
   const taskIds = rows.map((row) => row.id);
@@ -5841,6 +6980,7 @@ async function hydrateTaskRows(rows, options = {}) {
       riskFlags: parseStoredTaskImageIds(row.riskFlags),
       editedAt: row.editedAt ?? null,
       editCount: Number(row.editCount || 0),
+      claimToken: includeAdminFields ? null : row.claimToken ?? null,
       rollbackCount: Number(row.rollbackCount || 0),
       lastRolledBackAt: row.lastRolledBackAt ?? null,
       lastRolledBackBy: row.lastRolledBackBy ?? null,
@@ -5896,6 +7036,7 @@ const adminScoringService = createAdminScoringService({
   assertScorerAssignable,
   withDatabaseContext: runWithDatabaseContext,
   onTasksChanged: () => invalidateScorerQueryCaches(),
+  recordTaskStatsEvents,
 });
 const {
   listScoringSummary,
@@ -6543,6 +7684,9 @@ async function buildScorerTaskFilter(query = {}) {
   const params = [taskVersion, scorer];
   const status = String(query.status || "");
   const criterion = String(query.criterion || "");
+  const activeGenerationProjectIds = [
+    ...activeTaskGenerationBySubject.keys(),
+  ].filter((id) => hasActiveTaskGeneration(id));
 
   if (["assigned", "completed"].includes(status)) {
     clauses.push("rating_tasks.status = ?");
@@ -6554,6 +7698,19 @@ async function buildScorerTaskFilter(query = {}) {
     clauses.push("rating_tasks.projectId = ?");
     params.push(projectId);
   }
+  if (activeGenerationProjectIds.length) {
+    if (projectId && activeGenerationProjectIds.includes(projectId)) {
+      clauses.push("1 = 0");
+    } else if (!projectId) {
+      clauses.push(
+        `rating_tasks.projectId NOT IN (${placeholders(activeGenerationProjectIds.length)})`,
+      );
+      params.push(...activeGenerationProjectIds);
+    }
+  }
+  if (["1", "true", "yes"].includes(String(query.availableOnly ?? "").toLowerCase())) {
+    clauses.push("(rating_tasks.claimToken IS NULL OR rating_tasks.claimExpiresAt IS NULL OR rating_tasks.claimExpiresAt <= CURRENT_TIMESTAMP)");
+  }
   if (taskCriteria.includes(criterion)) {
     const taskType = `dimension:${criterion}`;
     clauses.push("(rating_tasks.taskType = ? OR rating_tasks.taskType LIKE ?)");
@@ -6564,7 +7721,15 @@ async function buildScorerTaskFilter(query = {}) {
     clauses.push("rating_tasks.id <> ?");
     params.push(excludeTaskId);
   }
-  return { where: `WHERE ${clauses.join(" AND ")}`, params };
+  return {
+    where: `WHERE ${clauses.join(" AND ")}`,
+    params,
+    scorer,
+    projectId,
+    status: ["assigned", "completed"].includes(status) ? status : null,
+    criterion,
+    activeGenerationProjectIds,
+  };
 }
 
 function taskCriterionOrderSql(column) {
@@ -6579,15 +7744,69 @@ function taskCriterionOrderSql(column) {
 
 const assignedTaskListCache = new Map();
 const assignedTaskListCacheTtlMs = 1000;
+const assignedTaskCountCache = new Map();
+const assignedTaskCountCacheTtlMs = 15 * 1000;
+let assignedTaskCacheVersion = 0;
 
 function invalidateAssignedTaskListCache() {
+  assignedTaskCacheVersion += 1;
   assignedTaskListCache.clear();
+  assignedTaskCountCache.clear();
 }
 
 function invalidateScorerQueryCaches() {
   invalidateAssignedTaskListCache();
   scorerDashboardCache.clear();
   invalidateSummaryCache();
+}
+
+async function getAssignedTaskListTotal(query, filter) {
+  const hasCriterion = taskCriteria.includes(filter.criterion);
+  const hasAvailabilityFilter = ["1", "true", "yes"].includes(
+    String(query.availableOnly ?? "").toLowerCase(),
+  );
+  const hasExcludedTask = Boolean(String(query.excludeTaskId || "").trim());
+
+  if (
+    !hasCriterion &&
+    !hasAvailabilityFilter &&
+    !hasExcludedTask &&
+    !filter.activeGenerationProjectIds?.length
+  ) {
+    const row = await selectScorerTaskListTotalStmt.get(
+      filter.status,
+      filter.status,
+      taskVersion,
+      filter.scorer,
+      filter.projectId,
+      filter.projectId,
+    );
+    return Number(row?.total || 0);
+  }
+
+  const cacheKey = JSON.stringify({
+    scorer: filter.scorer,
+    projectId: filter.projectId,
+    status: filter.status,
+    criterion: filter.criterion,
+    availableOnly: hasAvailabilityFilter,
+    excludeTaskId: query.excludeTaskId || null,
+  });
+  const cached = assignedTaskCountCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) return cached.value;
+
+  const value = Number(
+    (await db.prepare(`SELECT COUNT(*) AS total FROM rating_tasks ${filter.where}`)
+      .get(...filter.params))?.total || 0,
+  );
+  if (assignedTaskCountCache.size >= 256) {
+    assignedTaskCountCache.delete(assignedTaskCountCache.keys().next().value);
+  }
+  assignedTaskCountCache.set(cacheKey, {
+    value,
+    expiresAt: Date.now() + assignedTaskCountCacheTtlMs,
+  });
+  return value;
 }
 
 async function assignedTaskOptions(query = {}) {
@@ -6607,10 +7826,15 @@ async function assignedTaskOptions(query = {}) {
       AND projects.deletionRequestedAt IS NULL
     ORDER BY projects.createdAt DESC, projects.id ASC
   `).all(taskVersion, scorer);
-  return { projects: rows.map(({ _id, name }) => ({ _id, name })) };
+  return {
+    projects: rows
+      .filter(({ _id }) => !hasActiveTaskGeneration(_id))
+      .map(({ _id, name }) => ({ _id, name })),
+  };
 }
 
 async function listAssignedTasks(query = {}) {
+  const cacheVersion = assignedTaskCacheVersion;
   const cacheKey = JSON.stringify({
     scorer: query.scorer || null,
     projectId: query.projectId || null,
@@ -6621,6 +7845,7 @@ async function listAssignedTasks(query = {}) {
     criterion: query.criterion || null,
     excludeTaskId: query.excludeTaskId || null,
     summaryOnly: query.summaryOnly || null,
+    availableOnly: query.availableOnly || null,
     includeTotal: includeTaskTotal(query),
   });
   const cached = assignedTaskListCache.get(cacheKey);
@@ -6638,9 +7863,7 @@ async function listAssignedTasks(query = {}) {
        )`
     : "";
   const total = includeTaskTotal(query)
-    ? (await db
-      .prepare(`SELECT COUNT(*) AS total FROM rating_tasks ${filter.where}`)
-      .get(...filter.params)).total
+    ? await getAssignedTaskListTotal(query, filter)
     : null;
   const rows = await db
     .prepare(
@@ -6687,18 +7910,23 @@ async function listAssignedTasks(query = {}) {
       items: row.items,
     })),
   };
-  if (assignedTaskListCache.size >= 256) {
-    assignedTaskListCache.delete(assignedTaskListCache.keys().next().value);
+  if (cacheVersion === assignedTaskCacheVersion) {
+    if (assignedTaskListCache.size >= 256) {
+      assignedTaskListCache.delete(assignedTaskListCache.keys().next().value);
+    }
+    assignedTaskListCache.set(cacheKey, {
+      value,
+      expiresAt: Date.now() + assignedTaskListCacheTtlMs,
+    });
   }
-  assignedTaskListCache.set(cacheKey, {
-    value,
-    expiresAt: Date.now() + assignedTaskListCacheTtlMs,
-  });
   return value;
 }
 
-async function getTaskDetail(taskId, { projectId = null, scorer = null, includeAdminFields = false } = {}) {
-  const task = await selectTaskByIdStmt.get(taskId);
+async function getTaskDetail(
+  taskId,
+  { projectId = null, scorer = null, claimToken = null, includeAdminFields = false } = {},
+) {
+  let task = await selectTaskByIdStmt.get(taskId);
   if (!task || task.taskVersion !== taskVersion) {
     throw httpError(404, "任务不存在");
   }
@@ -6710,6 +7938,13 @@ async function getTaskDetail(taskId, { projectId = null, scorer = null, includeA
   }
   if (scorer && !["assigned", "completed"].includes(task.status)) {
     throw httpError(403, "当前任务不可查看");
+  }
+  if (scorer && task.status === "assigned") {
+    task = await claimTaskForScorer(
+      taskId,
+      scorer,
+      parseTaskClaimToken(claimToken),
+    );
   }
   return (await hydrateTaskRows([task], { includeAdminFields }))[0];
 }
@@ -6884,6 +8119,14 @@ function parseTaskBehaviorBoolean(value, label, fallback = false) {
   throw httpError(400, `${label}格式不正确`);
 }
 
+function parseTaskClaimToken(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const token = String(value).trim();
+  if (!token) return null;
+  if (token.length > 256) throw httpError(400, "任务占用令牌不正确");
+  return token;
+}
+
 function parseFirstActionMs(value, durationMs) {
   if (value === null || value === undefined || value === "") return null;
   const firstActionMs = Math.floor(Number(value));
@@ -6950,13 +8193,74 @@ function parseTaskSubmissionMode(value, rankingActionCount, trackingProvided = f
   return trackingProvided ? "direct" : null;
 }
 
+async function claimTaskForScorer(taskId, scorer, requestedClaimToken = null) {
+  const claimToken = requestedClaimToken || crypto.randomBytes(24).toString("base64url");
+  const requestedToken = requestedClaimToken || "";
+  const claimedAt = nowIso();
+  const claimExpiresAt = new Date(Date.now() + taskClaimLeaseMs).toISOString();
+
+  await db.exec("BEGIN");
+  try {
+    const result = await claimAssignedTaskStmt.run({
+      id: taskId,
+      taskVersion,
+      scorer,
+      claimToken,
+      requestedClaimToken: requestedToken,
+      claimedAt,
+      claimExpiresAt,
+    });
+    if (result.changes !== 1) {
+      const current = await selectTaskByIdStmt.get(taskId);
+      if (current?.status === "assigned" && current.scorer === scorer) {
+        await db.exec("COMMIT");
+        return current;
+      }
+      throw httpError(409, "任务状态已变更，请刷新后重试");
+    }
+    const claimedTask = await selectTaskByIdStmt.get(taskId);
+    await db.exec("COMMIT");
+    return claimedTask;
+  } catch (error) {
+    try {
+      await db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+}
+
+async function releaseTaskClaim(taskId, scorer, claimToken) {
+  const token = parseTaskClaimToken(claimToken);
+  if (!token) return { released: false };
+  return {
+    released: (await releaseTaskClaimStmt.run(
+      taskId,
+      taskVersion,
+      scorer,
+      token,
+    )).changes === 1,
+  };
+}
+
 async function completeAssignedTask(taskId, body = {}) {
+  const timer = createStepTimer();
   const scorer = parseScorerName(body.scorer);
   if (!scorer) throw httpError(400, "缺少打分人");
   const task = await selectTaskByIdStmt.get(taskId);
+  timer.mark("selectTask");
   if (!task) throw httpError(404, "任务不存在");
   if (task.status === "completed") {
-    if (task.scorer === scorer) return (await hydrateTaskRows([task]))[0];
+    if (task.scorer === scorer) {
+      const completedTask = completedTaskResultDto(task);
+      timer.mark("buildAlreadyCompletedResponse");
+      timer.warnIfSlow("completeAssignedTask", {
+        taskId,
+        scorer,
+        projectId: task.projectId || task.subjectId,
+        alreadyCompleted: true,
+      });
+      return completedTask;
+    }
     throw httpError(409, "该任务已完成");
   }
   if (task.status !== "assigned" || task.scorer !== scorer)
@@ -6967,6 +8271,7 @@ async function completeAssignedTask(taskId, body = {}) {
   const taskImageIds = (await selectTaskImageIdsStmt
     .all(task.id))
     .map((item) => item.imageId);
+  timer.mark("selectTaskImageIds");
   const excludedImageIds = parseTaskExcludedImageIds(
     body.excludedImageIds,
     taskImageIds,
@@ -7038,8 +8343,10 @@ async function completeAssignedTask(taskId, body = {}) {
   const completedAt = nowIso();
   const startedAt = new Date(Date.now() - durationMs).toISOString();
   const projectId = task.projectId || task.subjectId;
+  timer.mark("validatePayload");
 
-  await db.exec("BEGIN");
+  await beginSynchronousTaskStatsTransaction();
+  timer.mark("beginTransaction");
   try {
     const result = await completeAssignedTaskStmt.run({
       id: task.id,
@@ -7064,9 +8371,37 @@ async function completeAssignedTask(taskId, body = {}) {
       riskFlags: JSON.stringify(risk.flags),
       updatedAt: completedAt,
     });
+    timer.mark("updateTask");
     if (result.changes === 0)
       throw httpError(409, "任务状态已变更，请刷新后重试");
+    await recordTaskStatsEvents({
+      eventType: "task_completed",
+      oldTask: task,
+      newTask: {
+        ...task,
+        status: "completed",
+        scorer,
+        projectId,
+        submissionMode,
+        rankingActionCount,
+        dragActionCount,
+        orderChanged,
+        largeImageOpened,
+        largeImageOpenCount,
+        startedAt,
+        completedAt,
+        durationMs,
+        firstActionMs,
+        pageBlurCount,
+        behaviorTracked,
+        riskScore: risk.score,
+        updatedAt: completedAt,
+      },
+      createdAt: completedAt,
+    });
+    timer.mark("appendStatsEvent");
     await db.exec("COMMIT");
+    timer.mark("commit");
   } catch (error) {
     try {
       await db.exec("ROLLBACK");
@@ -7076,9 +8411,15 @@ async function completeAssignedTask(taskId, body = {}) {
 
   invalidateTaskSummaryCaches(projectId);
   invalidateScorerQueryCaches();
-  queueProjectTaskSummary(projectId);
-  const updated = await selectTaskByIdStmt.get(task.id);
-  return (await hydrateTaskRows([updated]))[0];
+  timer.mark("invalidateCaches");
+  const persistedTask = await selectTaskByIdStmt.get(task.id);
+  if (!persistedTask || persistedTask.status !== "completed") {
+    throw new Error("任务提交后状态校验失败，请刷新后重试");
+  }
+  const completedTask = completedTaskResultDto(persistedTask);
+  timer.mark("buildResponse");
+  timer.warnIfSlow("completeAssignedTask", { taskId: task.id, scorer, projectId });
+  return completedTask;
 }
 
 async function updateCompletedTask(taskId, body = {}) {
@@ -7164,7 +8505,7 @@ async function updateCompletedTask(taskId, body = {}) {
   );
   const editedAt = nowIso();
 
-  await db.exec("BEGIN");
+  await beginSynchronousTaskStatsTransaction();
   try {
     const result = await updateCompletedTaskStmt.run({
       id: task.id,
@@ -7189,7 +8530,28 @@ async function updateCompletedTask(taskId, body = {}) {
     });
     if (result.changes === 0)
       throw httpError(409, "任务状态已变更，请刷新后重试");
-
+    await recordTaskStatsEvents({
+      eventType: "task_completed_updated",
+      oldTask: task,
+      newTask: {
+        ...task,
+        status: "completed",
+        scorer,
+        submissionMode,
+        rankingActionCount,
+        dragActionCount,
+        orderChanged,
+        largeImageOpened,
+        largeImageOpenCount,
+        firstActionMs,
+        pageBlurCount,
+        behaviorTracked,
+        riskScore: risk.score,
+        editedAt,
+        updatedAt: editedAt,
+      },
+      createdAt: editedAt,
+    });
     await db.exec("COMMIT");
   } catch (error) {
     try {
@@ -7198,7 +8560,8 @@ async function updateCompletedTask(taskId, body = {}) {
     throw error;
   }
 
-  invalidateTaskSummaryCaches(task.projectId || task.subjectId);
+  const projectId = task.projectId || task.subjectId;
+  invalidateTaskSummaryCaches(projectId);
   invalidateScorerQueryCaches();
   const updated = await selectTaskByIdStmt.get(task.id);
   return (await hydrateTaskRows([updated]))[0];
@@ -7979,6 +9342,7 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
     });
     await db.exec("BEGIN");
     try {
+      await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
       await refreshProjectTaskStats(projectId);
       await db.exec("COMMIT");
     } catch (error) {
@@ -8053,12 +9417,14 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   await persistTaskGenerationJob(job);
   taskGenerationJobs.set(job.jobId, job);
   activeTaskGenerationBySubject.set(subjectId, job.jobId);
+  invalidateScorerQueryCaches();
 
   const invalidateGenerationCaches = () => {
     invalidateTaskSummaryCaches(subjectId);
     invalidateScorerQueryCaches();
   };
   let worker;
+  let terminalStateReceived = false;
   try {
     worker = fork(
       fileURLToPath(new URL("./task-generation-worker.js", import.meta.url)),
@@ -8119,6 +9485,8 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         return;
       }
       if (message?.type === "completed") {
+        if (terminalStateReceived) return;
+        terminalStateReceived = true;
         invalidateGenerationCaches();
         await commitJobState({
           result: message.result,
@@ -8134,6 +9502,8 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         return;
       }
       if (message?.type === "failed") {
+        if (terminalStateReceived) return;
+        terminalStateReceived = true;
         invalidateGenerationCaches();
         await commitJobState({
           status: "failed",
@@ -8151,6 +9521,8 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   });
   worker.on("error", (error) => {
     void (async () => {
+      if (terminalStateReceived) return;
+      terminalStateReceived = true;
       if (["queued", "running"].includes(job.status)) {
         invalidateGenerationCaches();
         await commitJobState({
@@ -8169,6 +9541,8 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   });
   worker.on("exit", (code, signal) => {
     void (async () => {
+      if (terminalStateReceived) return;
+      terminalStateReceived = true;
       if (["queued", "running"].includes(job.status)) {
         invalidateGenerationCaches();
         await commitJobState({
@@ -8754,8 +10128,23 @@ app.put(
 app.get("/api/tasks/:id", requireScorer, async (req, res, next) => {
   try {
     res.json({
-      task: await getTaskDetail(req.params.id, { scorer: req.auth.username }),
+      task: await getTaskDetail(req.params.id, {
+        scorer: req.auth.username,
+        claimToken: req.query.claimToken,
+      }),
     });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.post("/api/tasks/:id/release", requireScorer, async (req, res, next) => {
+  try {
+    res.json(await releaseTaskClaim(
+      req.params.id,
+      req.auth.username,
+      req.body?.claimToken,
+    ));
   } catch (error) {
     next(error);
   }
@@ -9565,11 +10954,11 @@ if (!isTaskGenerationWorker) {
     .all();
   for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
 
-const startupNow = nowIso();
-await deleteExpiredSessionsStmt.run(startupNow);
-await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
-await deleteExpiredCaptchaChallengesStmt.run(startupNow);
-await deleteExpiredImportJobsStmt.run(startupNow);
+  const startupNow = nowIso();
+  await deleteExpiredSessionsStmt.run(startupNow);
+  await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
+  await deleteExpiredCaptchaChallengesStmt.run(startupNow);
+  await deleteExpiredImportJobsStmt.run(startupNow);
   await deleteExpiredTaskGenerationJobsStmt.run(startupNow);
   await sweepResumableUploadSessions();
   await db.prepare(
@@ -9591,6 +10980,9 @@ await deleteExpiredImportJobsStmt.run(startupNow);
   ).run({ updatedAt: startupNow });
   await failInterruptedTaskGenerationJobsStmt.run({ updatedAt: startupNow });
   await sweepPendingJsonImports();
+  queueSubjectTaskTemplateStatsBackfill();
+  queueProjectTaskBaseStatsBackfill();
+  startTaskStatsRefresher();
 }
 
 export { generateSubjectTasks, importZipArchive };
