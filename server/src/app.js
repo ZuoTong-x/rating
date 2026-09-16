@@ -129,19 +129,10 @@ const importDbItemBatchSize = Math.min(
   10000,
   Math.max(500, Math.floor(positiveLimit("IMPORT_DB_ITEM_BATCH_SIZE", 5000))),
 );
-const taskStatsRefreshIntervalMs = Math.max(
-  60 * 1000,
-  Math.floor(positiveLimit("TASK_STATS_REFRESH_INTERVAL_MS", 10 * 60 * 1000)),
-);
 const taskStatsEventFlushIntervalMs = Math.max(
   500,
   Math.floor(positiveLimit("TASK_STATS_EVENT_FLUSH_INTERVAL_MS", 2 * 1000)),
 );
-const taskStatsRefreshStartupDelayMs = Math.max(
-  1000,
-  Math.floor(positiveLimit("TASK_STATS_REFRESH_STARTUP_DELAY_MS", 30 * 1000)),
-);
-const taskStatsRefreshFullOnStartup = envFlag("TASK_STATS_REFRESH_FULL_ON_STARTUP", false);
 const taskStatsEventScanBatchSize = Math.min(
   50000,
   Math.max(1, Math.floor(positiveLimit("TASK_STATS_EVENT_SCAN_BATCH_SIZE", 20000))),
@@ -154,9 +145,9 @@ const taskStatsEventRetentionMs = Math.max(
   60 * 60 * 1000,
   Math.floor(positiveLimit("TASK_STATS_EVENT_RETENTION_MS", 48 * 60 * 60 * 1000)),
 );
-const taskStatsReconcileLookbackMs = Math.max(
-  taskStatsRefreshIntervalMs * 2,
-  Math.floor(positiveLimit("TASK_STATS_RECONCILE_LOOKBACK_MS", 30 * 60 * 1000)),
+const taskStatsEventCleanupIntervalMs = Math.max(
+  60 * 1000,
+  Math.floor(positiveLimit("TASK_STATS_EVENT_CLEANUP_INTERVAL_MS", 60 * 60 * 1000)),
 );
 const completeTaskSlowLogMs = Math.floor(positiveLimit("COMPLETE_TASK_SLOW_LOG_MS", 1000));
 
@@ -1612,25 +1603,6 @@ const insertScorerScoringStatsFromTasksStmt = db.prepare(`
     AND status = 'completed'
   GROUP BY scorer, taskVersion, COALESCE(projectId, ''), COALESCE(submissionMode, 'untracked')
 `);
-const deleteDashboardCompletionHourStatsStmt = db.prepare(`
-  DELETE FROM dashboard_completion_hour_stats
-  WHERE taskVersion = ?
-`);
-const insertDashboardCompletionHourStatsFromTasksStmt = db.prepare(`
-  INSERT INTO dashboard_completion_hour_stats (
-    taskVersion, hour, completedTaskCount, updatedAt
-  )
-  SELECT
-    taskVersion,
-    EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer,
-    COUNT(*)::bigint,
-    COALESCE(MAX(updatedAt), ?)
-  FROM rating_tasks
-  WHERE taskVersion = ?
-    AND status = 'completed'
-    AND completedAt IS NOT NULL
-  GROUP BY taskVersion, EXTRACT(HOUR FROM completedAt AT TIME ZONE 'Asia/Shanghai')::integer
-`);
 const addDashboardCompletionHourStatsStmt = db.prepare(`
   INSERT INTO dashboard_completion_hour_stats (
     taskVersion, hour, completedTaskCount, updatedAt
@@ -1704,23 +1676,6 @@ const markTaskStatsEventsProcessedByIdsStmt = (eventCount) => db.prepare(`
   SET processedAt = ?
   WHERE processedAt IS NULL
     AND id IN (${placeholders(eventCount)})
-`);
-const hasPendingTaskStatsEventsStmt = db.prepare(`
-  SELECT EXISTS (
-    SELECT 1
-    FROM task_stats_events
-    WHERE taskVersion = ?
-      AND processedAt IS NULL
-      AND (?::text IS NULL OR projectId = ?)
-  ) AS pending
-`);
-const selectRecentTaskStatsEventProjectsStmt = db.prepare(`
-  SELECT DISTINCT projectId
-  FROM task_stats_events
-  WHERE taskVersion = ?
-    AND processedAt IS NOT NULL
-    AND processedAt >= ?
-  ORDER BY projectId ASC
 `);
 const tryTaskStatsMaintenanceLockStmt = db.prepare(`
   SELECT pg_try_advisory_xact_lock(2026091401) AS locked
@@ -1851,15 +1806,6 @@ const deleteProcessedTaskStatsEventsStmt = db.prepare(`
 const deleteProjectTaskStatsEventsStmt = db.prepare(`
   DELETE FROM task_stats_events
   WHERE projectId = ? AND taskVersion = ?
-`);
-const selectProjectIdsWithTaskStatsStmt = db.prepare(`
-  SELECT DISTINCT rating_tasks.projectId
-  FROM rating_tasks
-  JOIN projects ON projects.id = rating_tasks.projectId
-  WHERE rating_tasks.taskVersion = ?
-    AND rating_tasks.projectId IS NOT NULL
-    AND TRIM(rating_tasks.projectId) <> ''
-    AND projects.deletionRequestedAt IS NULL
 `);
 const selectPendingProjectTaskIdsStmt = db.prepare(`
   SELECT id, taskType
@@ -4576,15 +4522,6 @@ async function refreshProjectTaskStats(projectId, version = taskVersion) {
   );
 }
 
-async function refreshDashboardCompletionHourStats(version = taskVersion) {
-  const refreshedAt = nowIso();
-  await deleteDashboardCompletionHourStatsStmt.run(version);
-  await insertDashboardCompletionHourStatsFromTasksStmt.run(
-    refreshedAt,
-    version,
-  );
-}
-
 let taskGenerationAnalyzeQueued = false;
 function queueTaskGenerationAnalyze() {
   if (taskGenerationAnalyzeQueued) return;
@@ -4642,13 +4579,11 @@ function queueProjectTaskSummary(projectId) {
   });
 }
 
-let taskStatsRefreshRunning = false;
-let taskStatsRefreshQueued = false;
-let taskStatsRefreshAllQueued = false;
-let taskStatsRefreshIntervalHandle = null;
 let taskStatsEventFlushRunning = false;
 let taskStatsEventFlushQueued = false;
 let taskStatsEventFlushIntervalHandle = null;
+let taskStatsEventCleanupRunning = false;
+let taskStatsEventCleanupIntervalHandle = null;
 
 async function runTaskStatsRefreshTransaction(callback, { repeatableRead = false } = {}) {
   return await runWithDatabaseContext(async () => {
@@ -4669,24 +4604,6 @@ async function runTaskStatsRefreshTransaction(callback, { repeatableRead = false
   });
 }
 
-async function taskStatsProjectIdsForRefresh(refreshAll) {
-  if (refreshAll) {
-    const rows = await selectProjectIdsWithTaskStatsStmt.all(taskVersion);
-    return {
-      projectIds: rows.map((row) => row.projectId).filter(Boolean),
-    };
-  }
-
-  const cutoff = new Date(Date.now() - taskStatsReconcileLookbackMs).toISOString();
-  const rows = await selectRecentTaskStatsEventProjectsStmt.all(
-    taskVersion,
-    cutoff,
-  );
-  return {
-    projectIds: rows.map((row) => row.projectId).filter(Boolean),
-  };
-}
-
 function hasActiveTaskGeneration(projectId) {
   const jobId = activeTaskGenerationBySubject.get(projectId);
   if (!jobId) return false;
@@ -4697,6 +4614,18 @@ function hasActiveTaskGeneration(projectId) {
 async function cleanupProcessedTaskStatsEvents(now = nowIso()) {
   const cutoff = new Date(Date.now() - taskStatsEventRetentionMs).toISOString();
   await deleteProcessedTaskStatsEventsStmt.run(cutoff);
+}
+
+async function runTaskStatsEventCleanup() {
+  if (taskStatsEventCleanupRunning) return;
+  taskStatsEventCleanupRunning = true;
+  try {
+    await cleanupProcessedTaskStatsEvents();
+  } catch (error) {
+    console.error("Task stats event cleanup failed", error);
+  } finally {
+    taskStatsEventCleanupRunning = false;
+  }
 }
 
 async function flushTaskStatsEvents() {
@@ -4766,91 +4695,20 @@ async function flushTaskStatsEvents() {
   }
 }
 
-async function flushTaskStatsRefresh({ refreshAll = false } = {}) {
-  if (taskStatsRefreshRunning) {
-    taskStatsRefreshQueued = true;
-    taskStatsRefreshAllQueued = taskStatsRefreshAllQueued || refreshAll;
-    return;
-  }
-  taskStatsRefreshRunning = true;
-  let failed = false;
-  let refreshedProjectCount = 0;
-  try {
-    const refreshWindow = await taskStatsProjectIdsForRefresh(refreshAll);
-    const refreshedProjectIds = [];
-    for (const projectId of refreshWindow.projectIds) {
-      if (hasActiveTaskGeneration(projectId)) {
-        continue;
-      }
-      const refreshed = await runTaskStatsRefreshTransaction(async () => {
-        const lock = await tryTaskStatsMaintenanceLockStmt.get();
-        if (!lock?.locked) return false;
-        const pending = await hasPendingTaskStatsEventsStmt.get(taskVersion, projectId, projectId);
-        if (pending?.pending) return false;
-        if (refreshAll) {
-          await refreshProjectTaskStats(projectId);
-        } else {
-          await reconcileProjectTaskStatsStmt.run({
-            projectId,
-            taskVersion,
-            updatedAt: nowIso(),
-          });
-        }
-        return true;
-      }, { repeatableRead: true });
-      if (!refreshed) continue;
-      refreshedProjectIds.push(projectId);
-      refreshedProjectCount += 1;
-      invalidateTaskSummaryCaches(projectId);
-      queueProjectTaskSummary(projectId);
-    }
-
-    if (refreshAll && refreshedProjectIds.length === refreshWindow.projectIds.length) {
-      await runTaskStatsRefreshTransaction(async () => {
-        const lock = await tryTaskStatsMaintenanceLockStmt.get();
-        if (!lock?.locked) return;
-        const pending = await hasPendingTaskStatsEventsStmt.get(taskVersion, null, null);
-        if (pending?.pending) return;
-        await refreshDashboardCompletionHourStats();
-      }, { repeatableRead: true });
-    }
-    if (refreshedProjectCount) invalidateScorerQueryCaches();
-    await cleanupProcessedTaskStatsEvents();
-  } catch (error) {
-    failed = true;
-    console.error("Deferred task stats refresh failed", error);
-  } finally {
-    taskStatsRefreshRunning = false;
-    if (failed) {
-      taskStatsRefreshQueued = false;
-      taskStatsRefreshAllQueued = false;
-    }
-    if (!failed && taskStatsRefreshQueued) {
-      const queuedRefreshAll = taskStatsRefreshAllQueued;
-      taskStatsRefreshQueued = false;
-      taskStatsRefreshAllQueued = false;
-      setImmediate(() => flushTaskStatsRefresh({ refreshAll: queuedRefreshAll }));
-    }
-  }
-}
-
-function startTaskStatsRefresher() {
-  if (taskStatsRefreshIntervalHandle) return;
+function startTaskStatsWorkers() {
+  if (taskStatsEventFlushIntervalHandle) return;
   taskStatsEventFlushIntervalHandle = setInterval(() => {
     flushTaskStatsEvents();
   }, taskStatsEventFlushIntervalMs);
   taskStatsEventFlushIntervalHandle.unref?.();
 
-  taskStatsRefreshIntervalHandle = setInterval(() => {
-    flushTaskStatsRefresh();
-  }, taskStatsRefreshIntervalMs);
-  taskStatsRefreshIntervalHandle.unref?.();
+  taskStatsEventCleanupIntervalHandle = setInterval(() => {
+    runTaskStatsEventCleanup();
+  }, taskStatsEventCleanupIntervalMs);
+  taskStatsEventCleanupIntervalHandle.unref?.();
 
-  const startupHandle = setTimeout(async () => {
-    await flushTaskStatsEvents();
-    await flushTaskStatsRefresh({ refreshAll: taskStatsRefreshFullOnStartup });
-  }, taskStatsRefreshStartupDelayMs);
-  startupHandle.unref?.();
+  // Incremental events are the normal statistics path; avoid periodic full-project scans.
+  setImmediate(() => flushTaskStatsEvents());
 }
 
 async function projectStatsByIds(projectIds, version = taskVersion) {
@@ -10982,7 +10840,7 @@ if (!isTaskGenerationWorker) {
   await sweepPendingJsonImports();
   queueSubjectTaskTemplateStatsBackfill();
   queueProjectTaskBaseStatsBackfill();
-  startTaskStatsRefresher();
+  startTaskStatsWorkers();
 }
 
 export { generateSubjectTasks, importZipArchive };
