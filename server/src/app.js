@@ -47,6 +47,7 @@ const chunkUploadDir = path.join(uploadDir, "_chunks");
 const resumableUploadDir = path.join(uploadDir, "_resumable");
 const pendingJsonImportDir = path.join(uploadDir, "_pending-json");
 const adminExportDir = path.join(uploadDir, "_exports");
+const taskGenerationUploadDir = path.join(uploadDir, "_task-generation");
 const feedbackUploadDir = path.join(uploadDir, "feedback");
 const imageExts = new Set([".jpg", ".jpeg", ".png", ".webp", ".gif"]);
 const feedbackImageExts = new Set([".jpg", ".jpeg", ".png", ".webp"]);
@@ -67,6 +68,7 @@ await fs.mkdir(chunkUploadDir, { recursive: true });
 await fs.mkdir(resumableUploadDir, { recursive: true });
 await fs.mkdir(pendingJsonImportDir, { recursive: true });
 await fs.mkdir(adminExportDir, { recursive: true });
+await fs.mkdir(taskGenerationUploadDir, { recursive: true });
 await fs.mkdir(feedbackUploadDir, { recursive: true });
 
 const corsOrigin = process.env.CORS_ORIGIN?.trim();
@@ -255,6 +257,22 @@ const taskAllocationUpload = multer({
   },
 });
 
+const exactTaskAssignmentUpload = multer({
+  dest: taskGenerationUploadDir,
+  limits: {
+    files: 1,
+    fileSize: 64 * 1024 * 1024,
+  },
+  fileFilter(_req, file, callback) {
+    const ext = path.extname(file.originalname || "").toLowerCase();
+    if (ext !== ".json") {
+      callback(httpError(400, "精确分配清单仅支持 JSON 文件"));
+      return;
+    }
+    callback(null, true);
+  },
+});
+
 const importJobs = new Map();
 const adminExportJobs = new Map();
 const adminExportQueue = [];
@@ -330,6 +348,7 @@ const TASK_WRITE_BATCH_SIZE = Number.isInteger(configuredTaskWriteBatchSize)
 const TASK_ASSIGN_BATCH_SIZE = Number.isInteger(configuredTaskAssignBatchSize)
   ? Math.min(5000, Math.max(100, configuredTaskAssignBatchSize))
   : 1000;
+const MAX_EXACT_TASK_ASSIGNMENTS = 500000;
 const taskClaimLeaseMs = Math.max(
   5 * 60 * 1000,
   Math.floor(positiveLimit("TASK_CLAIM_LEASE_MS", 30 * 60 * 1000)),
@@ -6247,6 +6266,56 @@ async function loadUnmaterializedProjectTaskTemplates(projectId, limit, options 
   }));
 }
 
+async function loadProjectTaskTemplatesBySourceTaskIds(projectId, sourceTaskIds) {
+  if (!sourceTaskIds.length) return [];
+
+  const project = await selectProjectByIdStmt.get(projectId);
+  if (!project) throw httpError(404, "项目不存在");
+  const packageIds = await projectPackageIds(project);
+  if (!packageIds.length) return [];
+
+  const templateRows = [];
+  for (let start = 0; start < sourceTaskIds.length; start += 500) {
+    const batch = sourceTaskIds.slice(start, start + 500);
+    templateRows.push(...(await db.prepare(`
+      SELECT id, subjectId, sourceTaskId, round, criterion, imageKey
+      FROM subject_task_templates
+      WHERE subjectId IN (${placeholders(packageIds.length)})
+        AND sourceTaskId IN (${placeholders(batch.length)})
+    `).all(...packageIds, ...batch)));
+    if (start + batch.length < sourceTaskIds.length) await yieldToEventLoop();
+  }
+
+  const rowsBySourceTaskId = new Map();
+  templateRows.forEach((row) => {
+    const rows = rowsBySourceTaskId.get(row.sourceTaskId) || [];
+    rows.push(row);
+    rowsBySourceTaskId.set(row.sourceTaskId, rows);
+  });
+  const missing = sourceTaskIds.filter((sourceTaskId) => !rowsBySourceTaskId.has(sourceTaskId));
+  if (missing.length) {
+    throw httpError(
+      400,
+      `清单中有 ${missing.length} 个 sourceTaskId 不属于当前项目图包，示例：${missing.slice(0, 5).join("、")}`,
+    );
+  }
+  const ambiguous = sourceTaskIds.filter(
+    (sourceTaskId) => rowsBySourceTaskId.get(sourceTaskId).length !== 1,
+  );
+  if (ambiguous.length) {
+    throw httpError(
+      400,
+      `清单中有 ${ambiguous.length} 个 sourceTaskId 在关联图包中不唯一，示例：${ambiguous.slice(0, 5).join("、")}`,
+    );
+  }
+
+  const orderedRows = sourceTaskIds.map((sourceTaskId) => rowsBySourceTaskId.get(sourceTaskId)[0]);
+  return (await hydrateSubjectTaskTemplates(orderedRows)).map((template) => ({
+    ...template,
+    packageId: template.subjectId,
+  }));
+}
+
 function buildGeneratedTaskRecord(projectId, template, scorer, options = {}) {
   const imageIds = template.items.map((item) => item.imageId);
   const taskType = options.taskType || dimensionTaskType(projectId, template.packageId, template.criterion);
@@ -8487,6 +8556,108 @@ async function parseTaskGenerationAssignees(body = {}) {
   return { teamIds, teamMatchMode, allocations, backtestRatio };
 }
 
+function parseMultipartArray(value, label) {
+  if (Array.isArray(value)) return value;
+  try {
+    const parsed = JSON.parse(String(value ?? "[]"));
+    if (Array.isArray(parsed)) return parsed;
+  } catch {}
+  throw httpError(400, `${label}格式不正确`);
+}
+
+async function readExactTaskAssignmentFile(file) {
+  if (!file?.path) throw httpError(400, "请选择精确分配 JSON 清单");
+  let parsed;
+  try {
+    parsed = JSON.parse(await fs.readFile(file.path, "utf8"));
+  } catch (error) {
+    if (error instanceof SyntaxError) throw httpError(400, "精确分配清单不是有效的 JSON 文件");
+    throw error;
+  }
+
+  const rows = Array.isArray(parsed)
+    ? parsed
+    : parsed?.tasks ?? parsed?.assignments ?? parsed?.mappings;
+  if (!Array.isArray(rows) || !rows.length) {
+    throw httpError(400, "精确分配清单中没有任务数据");
+  }
+  if (rows.length > MAX_EXACT_TASK_ASSIGNMENTS) {
+    throw httpError(400, `精确分配清单最多支持 ${MAX_EXACT_TASK_ASSIGNMENTS} 条任务`);
+  }
+
+  const seen = new Set();
+  const entries = rows.map((row, index) => {
+    const sourceTaskId = String(row?.sourceTaskId ?? "").trim();
+    if (!sourceTaskId || sourceTaskId.length > 160) {
+      throw httpError(400, `精确分配清单第 ${index + 1} 条缺少有效的 sourceTaskId`);
+    }
+    if (seen.has(sourceTaskId)) {
+      throw httpError(400, `精确分配清单存在重复的 sourceTaskId：${sourceTaskId}`);
+    }
+    seen.add(sourceTaskId);
+    const scorer = String(row?.scorer ?? row?.sourceScorer ?? "").trim();
+    if (scorer.length > 100) {
+      throw httpError(400, `精确分配清单第 ${index + 1} 条打分人名称过长`);
+    }
+    return { sourceTaskId, scorer: scorer || null };
+  });
+  return entries;
+}
+
+async function parseExactTaskGenerationAssignment(body, file) {
+  const entries = await readExactTaskAssignmentFile(file);
+  const teamIds = await normalizeTeamIds(parseMultipartArray(body.teamIds, "团队列表"), {
+    required: true,
+    enabledOnly: true,
+  });
+  const teamMatchMode = normalizeTeamMatchMode(body.teamMatchMode);
+  const availableUsers = await listScorersByTeamIds(teamIds, teamMatchMode);
+  if (!availableUsers.length) throw httpError(400, "所选团队没有可用的打分账号");
+
+  const fallbackScorerText = String(body.fallbackScorer ?? "").trim();
+  const fallbackTaskCount = entries.reduce((total, entry) => total + (entry.scorer ? 0 : 1), 0);
+  if (fallbackTaskCount && !fallbackScorerText) {
+    throw httpError(400, `清单中有 ${fallbackTaskCount} 条任务没有原打分人，请选择兜底账号`);
+  }
+  const fallbackScorer = fallbackScorerText ? normalizeUsername(fallbackScorerText) : null;
+  const availableNames = new Set(availableUsers.map((user) => user.username));
+  const unavailableNames = new Set();
+  const countsByScorer = new Map();
+  entries.forEach((entry) => {
+    entry.scorer = entry.scorer || fallbackScorer;
+    if (!availableNames.has(entry.scorer)) unavailableNames.add(entry.scorer);
+    countsByScorer.set(entry.scorer, (countsByScorer.get(entry.scorer) || 0) + 1);
+  });
+  if (unavailableNames.size) {
+    const names = [...unavailableNames];
+    throw httpError(
+      400,
+      `清单中有 ${names.length} 名打分人不属于所选团队或账号不可用：${names.slice(0, 8).join("、")}`,
+    );
+  }
+
+  const normalized = {
+    version: 1,
+    tasks: entries,
+  };
+  await fs.writeFile(file.path, JSON.stringify(normalized));
+  return {
+    mode: "exact",
+    teamIds,
+    teamMatchMode,
+    backtestRatio: 0,
+    fallbackScorer,
+    fallbackTaskCount,
+    exactTaskCount: entries.length,
+    exactAssignmentFile: file.path,
+    exactAssignmentFilename: file.originalname || "exact-task-assignment.json",
+    allocations: [...countsByScorer.entries()].map(([scorer, taskCount]) => ({
+      scorer,
+      taskCount,
+    })),
+  };
+}
+
 function normalizedAllocationHeader(value) {
   return String(value ?? "")
     .trim()
@@ -9018,6 +9189,7 @@ function taskGenerationRequestSummary(assignment, prepared) {
     prepared.backtestAllocations.map((allocation) => [allocation.scorer, allocation]),
   );
   return {
+    mode: assignment.mode || "random",
     teamIds: assignment.teamIds,
     teamMatchMode: assignment.teamMatchMode,
     backtestRatio: prepared.backtestRatio,
@@ -9029,6 +9201,12 @@ function taskGenerationRequestSummary(assignment, prepared) {
     templateCount: prepared.templateCount,
     materializedBaseCount: prepared.materializedBaseCount,
     pendingBaseCount: prepared.pendingBaseCount,
+    ...(assignment.mode === "exact" ? {
+      exactTaskCount: assignment.exactTaskCount,
+      fallbackScorer: assignment.fallbackScorer,
+      fallbackTaskCount: assignment.fallbackTaskCount,
+      filename: assignment.exactAssignmentFilename,
+    } : {}),
     allocations: assignment.allocations.map((allocation) => {
       const split = splitByScorer.get(allocation.scorer) || {};
       return {
@@ -9041,7 +9219,174 @@ function taskGenerationRequestSummary(assignment, prepared) {
   };
 }
 
+async function loadExactTaskAssignmentEntries(assignment) {
+  let parsed;
+  try {
+    parsed = JSON.parse(await fs.readFile(assignment.exactAssignmentFile, "utf8"));
+  } catch (error) {
+    if (error?.code === "ENOENT") throw httpError(409, "精确分配清单已过期，请重新上传");
+    throw error;
+  }
+  const entries = parsed?.tasks;
+  if (!Array.isArray(entries) || entries.length !== assignment.exactTaskCount) {
+    throw httpError(409, "精确分配清单内容已变化，请重新上传");
+  }
+  return entries;
+}
+
+async function loadExistingTaskAssignmentRows(taskIds) {
+  const rows = [];
+  for (let start = 0; start < taskIds.length; start += TASK_WRITE_BATCH_SIZE) {
+    const batch = taskIds.slice(start, start + TASK_WRITE_BATCH_SIZE);
+    rows.push(...(await db.prepare(`
+      SELECT id, status, scorer
+      FROM rating_tasks
+      WHERE id IN (${placeholders(batch.length)})
+    `).all(...batch)));
+  }
+  return rows;
+}
+
+async function generateExactSubjectTasks(projectId, assignment, onProgress) {
+  const project = await getProjectOrThrow(projectId);
+  const { requestedBaseTaskCount } = await prepareTaskGeneration(projectId, assignment, project);
+  const previousTaskStatus = project.taskStatus;
+  const generatedTaskIds = [];
+  const assignedTaskIds = [];
+
+  try {
+    onProgress?.({ stage: "正在读取精确分配清单", progress: 1 });
+    const entries = await loadExactTaskAssignmentEntries(assignment);
+    onProgress?.({ stage: "正在匹配图包任务模板", progress: 3 });
+    const templates = await loadProjectTaskTemplatesBySourceTaskIds(
+      projectId,
+      entries.map((entry) => entry.sourceTaskId),
+    );
+    const taskRows = templates.map((template, index) =>
+      buildGeneratedTaskRecord(projectId, template, entries[index].scorer),
+    );
+
+    const taskIdSources = new Map();
+    const duplicateTaskSources = [];
+    taskRows.forEach((task, index) => {
+      const previousSource = taskIdSources.get(task.id);
+      if (previousSource) {
+        duplicateTaskSources.push(`${previousSource} / ${entries[index].sourceTaskId}`);
+      } else {
+        taskIdSources.set(task.id, entries[index].sourceTaskId);
+      }
+    });
+    if (duplicateTaskSources.length) {
+      throw httpError(
+        400,
+        `清单中有 ${duplicateTaskSources.length} 组任务的维度和图片完全相同，示例：${duplicateTaskSources.slice(0, 3).join("；")}`,
+      );
+    }
+
+    onProgress?.({ stage: "正在校验已有任务", progress: 12 });
+    const existingRows = await loadExistingTaskAssignmentRows(taskRows.map((task) => task.id));
+    const existingById = new Map(existingRows.map((row) => [row.id, row]));
+    const occupiedRows = existingRows.filter(
+      (row) => row.status !== "pending" || row.scorer,
+    );
+    if (occupiedRows.length) {
+      throw httpError(
+        409,
+        `清单中有 ${occupiedRows.length} 条任务已经分配或完成，未对现有数据做修改`,
+      );
+    }
+
+    const taskRowsToCreate = taskRows.filter((task) => !existingById.has(task.id));
+    const pendingTaskRows = taskRows.filter((task) => existingById.has(task.id));
+    let createdCount = 0;
+    onProgress?.({ stage: "正在按清单创建并分配任务", progress: 15 });
+    for (let start = 0; start < taskRowsToCreate.length; start += TASK_WRITE_BATCH_SIZE) {
+      const batch = taskRowsToCreate.slice(start, start + TASK_WRITE_BATCH_SIZE);
+      const itemRows = batch.flatMap((task) => task.items);
+      await beginTaskWriteTransaction();
+      try {
+        const result = await bulkInsertRatingTasks(batch);
+        if (result !== batch.length) {
+          throw httpError(409, "任务在生成过程中发生变化，请重新发起");
+        }
+        await bulkInsertRatingTaskItems(itemRows);
+        await db.exec("COMMIT");
+        createdCount += result;
+        generatedTaskIds.push(...batch.map((task) => task.id));
+      } catch (error) {
+        try {
+          await db.exec("ROLLBACK");
+        } catch {}
+        throw error;
+      }
+      const processed = start + batch.length;
+      onProgress?.({
+        stage: "正在按清单创建并分配任务",
+        progress: 15 + Math.round((processed / Math.max(taskRowsToCreate.length, 1)) * 65),
+      });
+      if (processed < taskRowsToCreate.length) await yieldToEventLoop();
+    }
+
+    if (pendingTaskRows.length) {
+      onProgress?.({ stage: "正在分配已有未分配任务", progress: 82 });
+      const pendingResult = await assignGeneratedTasks(
+        projectId,
+        pendingTaskRows,
+        pendingTaskRows.map((task) => task.scorer),
+        (current, total) => onProgress?.({
+          stage: "正在分配已有未分配任务",
+          progress: 82 + (total ? Math.round((current / total) * 10) : 0),
+        }),
+      );
+      assignedTaskIds.push(...pendingResult.taskIds);
+    }
+
+    onProgress?.({ stage: "正在更新项目统计", progress: 94 });
+    await syncProjectTeams(projectId, assignment.teamIds, nowIso());
+    await updateSubjectTaskStatusStmt.run({
+      id: projectId,
+      taskStatus: "scoring",
+      updatedAt: nowIso(),
+    });
+    await db.exec("BEGIN");
+    try {
+      await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
+      await refreshProjectTaskStats(projectId);
+      await db.exec("COMMIT");
+    } catch (error) {
+      try {
+        await db.exec("ROLLBACK");
+      } catch {}
+      throw error;
+    }
+    invalidateTaskSummaryCaches(projectId);
+    invalidateScorerQueryCaches();
+    const updatedProject = await selectProjectByIdStmt.get(projectId);
+    const taskStats = await getProjectTaskStats(projectId);
+    onProgress?.({ stage: "精确任务分配完成", progress: 100 });
+    return {
+      project: await projectDto(updatedProject, taskStats),
+      taskCount: taskStats.total,
+      createdCount,
+      assignedCount: requestedBaseTaskCount,
+      baseAssignedCount: requestedBaseTaskCount,
+      backtestCount: 0,
+      backtestRatio: 0,
+      fallbackScorer: assignment.fallbackScorer,
+      fallbackTaskCount: assignment.fallbackTaskCount,
+      unassignedCount: taskStats.pending,
+      taskVersion,
+    };
+  } catch (error) {
+    await rollbackGeneratedTasks(projectId, generatedTaskIds, previousTaskStatus, assignedTaskIds);
+    throw error;
+  }
+}
+
 async function generateSubjectTasks(projectId, assignment, onProgress) {
+  if (assignment.mode === "exact") {
+    return generateExactSubjectTasks(projectId, assignment, onProgress);
+  }
   const project = await getProjectOrThrow(projectId);
   const {
     backtestRatio,
@@ -9233,15 +9578,20 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
   }
 }
 
-async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
-  const project = await getProjectOrThrow(subjectId);
-  if (!["task_pending", "scoring"].includes(project.taskStatus)) {
-    throw httpError(409, "当前项目已完成任务，不能继续下发");
-  }
-  const assignment = await parseTaskGenerationAssignees(assigneesInput);
+async function cleanupExactTaskAssignment(assignment) {
+  if (assignment?.mode !== "exact" || !assignment.exactAssignmentFile) return;
+  await fs.unlink(assignment.exactAssignmentFile).catch(() => {});
+}
+
+async function startPreparedTaskGeneration(subjectId, assignment, project) {
+  const exactMode = assignment.mode === "exact";
+  const waitingStage = exactMode ? "等待精确任务分配" : "等待导入任务模板";
+  const completedStage = exactMode ? "精确任务分配完成" : "任务导入完成";
+  const failedStage = exactMode ? "精确任务分配失败" : "任务导入失败";
 
   const activeJob = await getActiveTaskGenerationJob(subjectId);
   if (activeJob && ["queued", "running"].includes(activeJob.status)) {
+    await cleanupExactTaskAssignment(assignment);
     return activeJob;
   }
 
@@ -9257,12 +9607,12 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
     jobId: crypto.randomUUID(),
     subjectId,
     status: "queued",
-    stage: "等待导入任务模板",
+    stage: waitingStage,
     progress: 0,
     message: null,
     request: taskGenerationRequestSummary(assignment, prepared),
     stageEvents: [{
-      stage: "等待导入任务模板",
+      stage: waitingStage,
       progress: 0,
       startedAt: createdAt,
       updatedAt: createdAt,
@@ -9296,10 +9646,11 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   } catch (error) {
     invalidateGenerationCaches();
     job.status = "failed";
-    job.stage = "任务导入失败";
+    job.stage = failedStage;
     job.message = error.message || "任务生成进程启动失败";
     await persistTaskGenerationJob(job);
     activeTaskGenerationBySubject.delete(subjectId);
+    await cleanupExactTaskAssignment(assignment);
     throw error;
   }
   job.worker = worker;
@@ -9349,13 +9700,14 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         await commitJobState({
           result: message.result,
           status: "completed",
-          stage: "任务导入完成",
+          stage: completedStage,
           progress: 100,
         }, { force: true });
         queueTaskGenerationAnalyze();
         worker.disconnect();
         activeTaskGenerationBySubject.delete(subjectId);
         delete job.worker;
+        await cleanupExactTaskAssignment(assignment);
         scheduleTaskGenerationJobCleanup(job);
         return;
       }
@@ -9365,12 +9717,13 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         invalidateGenerationCaches();
         await commitJobState({
           status: "failed",
-          stage: "任务导入失败",
+          stage: failedStage,
           message: message.message || "任务导入失败，请重试",
         }, { force: true });
         worker.disconnect();
         activeTaskGenerationBySubject.delete(subjectId);
         delete job.worker;
+        await cleanupExactTaskAssignment(assignment);
         scheduleTaskGenerationJobCleanup(job);
       }
     })().catch((error) => {
@@ -9385,12 +9738,13 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         invalidateGenerationCaches();
         await commitJobState({
           status: "failed",
-          stage: "任务导入失败",
+          stage: failedStage,
           message: error.message || "任务生成进程启动失败",
         }, { force: true });
       }
       activeTaskGenerationBySubject.delete(subjectId);
       delete job.worker;
+      await cleanupExactTaskAssignment(assignment);
       scheduleTaskGenerationJobCleanup(job);
     })().catch((persistError) => {
       console.error(`Task generation worker failed (${job.jobId})`, persistError);
@@ -9405,7 +9759,7 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
         invalidateGenerationCaches();
         await commitJobState({
           status: "failed",
-          stage: "任务导入失败",
+          stage: failedStage,
           message: signal
             ? `任务生成进程异常退出（signal ${signal}）`
             : `任务生成进程异常退出（code ${code}）`,
@@ -9413,6 +9767,7 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
       }
       activeTaskGenerationBySubject.delete(subjectId);
       delete job.worker;
+      await cleanupExactTaskAssignment(assignment);
       scheduleTaskGenerationJobCleanup(job);
     })().catch((error) => {
       console.error(`Task generation job exit handling failed (${job.jobId})`, error);
@@ -9421,6 +9776,29 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   worker.send({ type: "start", subjectId, assignment });
 
   return job;
+}
+
+async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
+  const project = await getProjectOrThrow(subjectId);
+  if (!["task_pending", "scoring"].includes(project.taskStatus)) {
+    throw httpError(409, "当前项目已完成任务，不能继续下发");
+  }
+  const assignment = await parseTaskGenerationAssignees(assigneesInput);
+  return startPreparedTaskGeneration(subjectId, assignment, project);
+}
+
+async function startExactSubjectTaskGeneration(subjectId, body, file) {
+  try {
+    const project = await getProjectOrThrow(subjectId);
+    if (!["task_pending", "scoring"].includes(project.taskStatus)) {
+      throw httpError(409, "当前项目已完成任务，不能继续下发");
+    }
+    const assignment = await parseExactTaskGenerationAssignment(body, file);
+    return await startPreparedTaskGeneration(subjectId, assignment, project);
+  } catch (error) {
+    if (file?.path) await fs.unlink(file.path).catch(() => {});
+    throw error;
+  }
 }
 
 function buildImageFilter(query) {
@@ -10243,6 +10621,21 @@ app.post("/api/projects/:id/tasks/generate", requireAdmin, async (req, res, next
   }
 });
 
+app.post(
+  "/api/projects/:id/tasks/generate/exact",
+  requireAdmin,
+  exactTaskAssignmentUpload.single("file"),
+  async (req, res, next) => {
+    try {
+      res.status(202).json(taskGenerationJobDto(
+        await startExactSubjectTaskGeneration(req.params.id, req.body, req.file),
+      ));
+    } catch (error) {
+      next(error);
+    }
+  },
+);
+
 app.get("/api/projects/:id/tasks/generate/:jobId", requireAdmin, async (req, res, next) => {
   try {
     const job = await getTaskGenerationJob(req.params.jobId);
@@ -10796,7 +11189,9 @@ app.use((error, req, res, _next) => {
       error.code === "LIMIT_FILE_SIZE"
         ? req.path.includes("/chunks/")
           ? "上传分片超过大小限制，请重新上传该文件"
-          : "ZIP 文件超过服务器允许的大小限制"
+          : req.path.includes("/tasks/generate/exact")
+            ? "精确分配清单超过 64MB"
+            : "ZIP 文件超过服务器允许的大小限制"
         : "上传文件数据不完整，请重新上传";
   }
 

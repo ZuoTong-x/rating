@@ -1851,6 +1851,26 @@ body {
   margin-bottom: 12px;
 }
 
+.exact-task-assignment-panel {
+  padding: 14px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  background: var(--surface-bg);
+}
+
+.exact-task-assignment-panel .n-form-item:last-of-type {
+  margin-bottom: 10px;
+}
+
+.exact-task-assignment-filename {
+  display: block;
+  max-width: 100%;
+  margin-top: 8px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .task-allocation-list {
   max-height: 320px;
   min-height: 320px;

@@ -636,6 +636,8 @@ create index if not exists idx_rating_task_items_task_position
     on rating_task_items(taskid, position, imageid);
 create index if not exists idx_subject_task_templates_subject_order
     on subject_task_templates(subjectid, round, criterion, sourcetaskid);
+create index if not exists idx_subject_task_templates_subject_source_task
+    on subject_task_templates(subjectid, sourcetaskid);
 create index if not exists idx_subject_task_template_items_image
     on subject_task_template_items(imageid);
 create index if not exists idx_image_pair_edges_subject on image_pair_edges(subjectid);

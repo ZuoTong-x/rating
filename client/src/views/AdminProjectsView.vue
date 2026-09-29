@@ -22,6 +22,13 @@ type AllocationImportFeedback = {
   errors: string[];
 };
 
+type TaskGenerationMode = 'random' | 'exact';
+type ExactAssignmentSummary = {
+  taskCount: number;
+  mappedScorerCount: number;
+  fallbackTaskCount: number;
+};
+
 const router = useRouter();
 const message = useMessage();
 const dialog = useDialog();
@@ -42,6 +49,10 @@ const taskTeamIds = ref<string[]>([]);
 const taskTeamMatchMode = ref<'all' | 'any'>('all');
 const taskScorersLoading = ref(false);
 const taskScorers = ref<Array<{ id: string; username: string }>>([]);
+const taskGenerationMode = ref<TaskGenerationMode>('random');
+const exactAssignmentFile = ref<File | null>(null);
+const exactAssignmentSummary = ref<ExactAssignmentSummary | null>(null);
+const exactFallbackScorer = ref<string | null>(null);
 const selectedTaskScorers = ref<string[]>([]);
 const taskAllocations = ref<Record<string, number | null>>({});
 const perScorerTaskCount = ref<number | null>(null);
@@ -64,6 +75,10 @@ const packageOptions = computed(() => packages.value
 const teamOptions = computed(() => teams.value.map(team => ({
   label: `${team.name}${team.userCount != null ? ` (${team.userCount} 人)` : ''}`,
   value: team.id
+})));
+const taskScorerOptions = computed(() => taskScorers.value.map(user => ({
+  label: user.username,
+  value: user.username
 })));
 const taskTemplateCount = computed(() => pendingTaskProject.value?.taskTemplateCount || 0);
 const availableTaskCount = computed(() => pendingTaskProject.value?.availableTaskCount ?? taskTemplateCount.value);
@@ -278,6 +293,9 @@ async function loadTaskScorers() {
     taskAllocations.value = nextAllocations;
     const availableNames = new Set(result.users.map(user => user.username));
     selectedTaskScorers.value = selectedTaskScorers.value.filter(username => availableNames.has(username));
+    if (exactFallbackScorer.value && !availableNames.has(exactFallbackScorer.value)) {
+      exactFallbackScorer.value = null;
+    }
   } catch (error) {
     if (requestId === taskScorerRequest.value) message.error(errorMessage(error));
   } finally {
@@ -471,6 +489,47 @@ async function importAllocationSheet({ file, onFinish, onError }: UploadCustomRe
   }
 }
 
+async function readExactAssignmentFile({ file, onFinish, onError }: UploadCustomRequestOptions) {
+  if (!(file.file instanceof File)) {
+    message.error('无法读取精确分配清单');
+    onError();
+    return;
+  }
+  try {
+    const parsed = JSON.parse(await file.file.text()) as Record<string, unknown> | unknown[];
+    const rows = Array.isArray(parsed)
+      ? parsed
+      : Array.isArray(parsed.tasks)
+        ? parsed.tasks
+        : Array.isArray(parsed.assignments)
+          ? parsed.assignments
+          : Array.isArray(parsed.mappings)
+            ? parsed.mappings
+            : null;
+    if (!rows?.length) throw new Error('清单中没有任务数据');
+    let mappedScorerCount = 0;
+    rows.forEach((raw, index) => {
+      const row = raw as Record<string, unknown>;
+      if (!String(row?.sourceTaskId ?? '').trim()) {
+        throw new Error(`第 ${index + 1} 条缺少 sourceTaskId`);
+      }
+      if (String(row?.scorer ?? row?.sourceScorer ?? '').trim()) mappedScorerCount += 1;
+    });
+    exactAssignmentFile.value = file.file;
+    exactAssignmentSummary.value = {
+      taskCount: rows.length,
+      mappedScorerCount,
+      fallbackTaskCount: rows.length - mappedScorerCount
+    };
+    onFinish();
+  } catch (error) {
+    exactAssignmentFile.value = null;
+    exactAssignmentSummary.value = null;
+    message.error(errorMessage(error));
+    onError();
+  }
+}
+
 async function openTaskProject(project: ProjectItem) {
   if (!['task_pending', 'scoring'].includes(project.taskStatus)) {
     void router.push(`/admin/projects/${encodeURIComponent(project._id)}/tasks`);
@@ -480,6 +539,10 @@ async function openTaskProject(project: ProjectItem) {
   taskTeamIds.value = [];
   taskTeamMatchMode.value = 'all';
   taskScorers.value = [];
+  taskGenerationMode.value = 'random';
+  exactAssignmentFile.value = null;
+  exactAssignmentSummary.value = null;
+  exactFallbackScorer.value = null;
   selectedTaskScorers.value = [];
   taskAllocations.value = {};
   perScorerTaskCount.value = null;
@@ -544,36 +607,62 @@ async function startTask() {
     message.error('请至少选择一个标注团队');
     return;
   }
-  if (!selectedTaskScorerCount.value) {
-    message.error('请至少选择一名打分人');
-    return;
-  }
-  if (!allocationPayload.value.length) {
-    message.error('请至少为一名打分人设置任务数量');
-    return;
-  }
-  if (baseAssignedTaskCount.value > availableTaskCount.value) {
-    message.error(`占用任务池数量不能超过 ${availableTaskCount.value}`);
-    return;
+  const exactMode = taskGenerationMode.value === 'exact';
+  if (exactMode) {
+    if (!exactAssignmentFile.value || !exactAssignmentSummary.value) {
+      message.error('请选择精确分配 JSON 清单');
+      return;
+    }
+    if (!exactFallbackScorer.value) {
+      message.error('请选择未匹配任务的兜底账号');
+      return;
+    }
+    if (exactAssignmentSummary.value.taskCount > availableTaskCount.value) {
+      message.error(`清单任务数不能超过可下发数量 ${availableTaskCount.value}`);
+      return;
+    }
+  } else {
+    if (!selectedTaskScorerCount.value) {
+      message.error('请至少选择一名打分人');
+      return;
+    }
+    if (!allocationPayload.value.length) {
+      message.error('请至少为一名打分人设置任务数量');
+      return;
+    }
+    if (baseAssignedTaskCount.value > availableTaskCount.value) {
+      message.error(`占用任务池数量不能超过 ${availableTaskCount.value}`);
+      return;
+    }
   }
   submitting.value = true;
   taskModalVisible.value = false;
   setGenerating(project._id, true);
-  setProgress(project._id, 0, '等待导入任务模板');
+  const initialStage = exactMode ? '等待精确任务分配' : '等待导入任务模板';
+  setProgress(project._id, 0, initialStage);
   const taskId = taskStack.addTask({
     kind: 'generate',
     title: `发起任务：${project.name}`,
-    description: `${allocationPayload.value.length} 个打分人 / 实际 ${assignedTaskCount.value} 个任务 / 回测 ${backtestTaskCount.value} 个`,
-    stage: '等待导入任务模板',
+    description: exactMode
+      ? `按清单分配 ${exactAssignmentSummary.value?.taskCount || 0} 个任务`
+      : `${allocationPayload.value.length} 个打分人 / 实际 ${assignedTaskCount.value} 个任务 / 回测 ${backtestTaskCount.value} 个`,
+    stage: initialStage,
     progress: 0
   });
   try {
-    const job = await imageApi.generateProjectTasks(project._id, {
-      teamIds: taskTeamIds.value,
-      teamMatchMode: taskTeamMatchMode.value,
-      allocations: allocationPayload.value,
-      backtestRatio: backtestPercent.value
-    });
+    const job = exactMode
+      ? await imageApi.generateExactProjectTasks(project._id, {
+        file: exactAssignmentFile.value!,
+        teamIds: taskTeamIds.value,
+        teamMatchMode: taskTeamMatchMode.value,
+        fallbackScorer: exactFallbackScorer.value!
+      })
+      : await imageApi.generateProjectTasks(project._id, {
+        teamIds: taskTeamIds.value,
+        teamMatchMode: taskTeamMatchMode.value,
+        allocations: allocationPayload.value,
+        backtestRatio: backtestPercent.value
+      });
     taskStack.updateTask(taskId, {
       progress: job.progress,
       stage: job.stage || '任务生成中'
@@ -586,9 +675,13 @@ async function startTask() {
     if (!result) throw new Error('任务生成完成，但没有返回结果');
     taskStack.finishTask(taskId, {
       stage: '任务创建完成',
-      description: `已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个`
+      description: exactMode
+        ? `已按清单分配 ${result.assignedCount} 个任务`
+        : `已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个`
     });
-    message.success(`已生成 ${result.createdCount} 个任务，已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个，待分配 ${result.unassignedCount} 个`);
+    message.success(exactMode
+      ? `已按清单分配 ${result.assignedCount} 个任务，待分配 ${result.unassignedCount} 个`
+      : `已生成 ${result.createdCount} 个任务，已分配 ${result.assignedCount} 个，其中回测 ${result.backtestCount || 0} 个，待分配 ${result.unassignedCount} 个`);
     await loadData();
     await router.push(`/admin/projects/${encodeURIComponent(project._id)}/tasks`);
   } catch (error) {
@@ -740,6 +833,12 @@ onMounted(() => void loadData());
 
     <n-modal v-model:show="taskModalVisible" preset="card" class="task-allocation-modal" title="开始任务" :bordered="false">
       <n-form label-placement="top">
+        <n-form-item label="分配方式">
+          <n-radio-group v-model:value="taskGenerationMode" size="small">
+            <n-radio-button value="random">按数量分配</n-radio-button>
+            <n-radio-button value="exact">按清单精确分配</n-radio-button>
+          </n-radio-group>
+        </n-form-item>
         <n-form-item>
           <template #label>
             <div class="flex">
@@ -755,6 +854,7 @@ onMounted(() => void loadData());
             @update:value="updateTaskTeams" />
 
         </n-form-item>
+        <template v-if="taskGenerationMode === 'random'">
         <div class="task-allocation-summary" aria-label="任务分配汇总">
           <n-tag size="small" type="info" :bordered="false">模板任务 {{ taskTemplateCount }}</n-tag>
           <n-tag size="small" :bordered="false">可下发 {{ availableTaskCount }}</n-tag>
@@ -827,6 +927,39 @@ onMounted(() => void loadData());
           </div>
         </div>
         <div v-else class="task-allocation-empty">请选择至少一个含有打分账号的团队。</div>
+        </template>
+        <template v-else>
+          <div class="task-allocation-summary" aria-label="精确任务分配汇总">
+            <n-tag size="small" type="info" :bordered="false">模板任务 {{ taskTemplateCount }}</n-tag>
+            <n-tag size="small" :bordered="false">可下发 {{ availableTaskCount }}</n-tag>
+            <n-tag v-if="exactAssignmentSummary" size="small" type="success" :bordered="false">
+              清单任务 {{ exactAssignmentSummary.taskCount }}
+            </n-tag>
+            <n-tag v-if="exactAssignmentSummary" size="small" :bordered="false">
+              原人 {{ exactAssignmentSummary.mappedScorerCount }}
+            </n-tag>
+            <n-tag v-if="exactAssignmentSummary" size="small" type="warning" :bordered="false">
+              兜底 {{ exactAssignmentSummary.fallbackTaskCount }}
+            </n-tag>
+          </div>
+          <div class="exact-task-assignment-panel">
+            <n-form-item label="精确分配清单">
+              <n-upload accept=".json,application/json" :show-file-list="false" :custom-request="readExactAssignmentFile">
+                <n-button secondary>选择 JSON 清单</n-button>
+              </n-upload>
+              <n-text v-if="exactAssignmentFile" depth="3" class="exact-task-assignment-filename">
+                {{ exactAssignmentFile.name }}
+              </n-text>
+            </n-form-item>
+            <n-form-item label="未匹配任务兜底账号">
+              <n-select v-model:value="exactFallbackScorer" filterable clearable :options="taskScorerOptions"
+                :loading="taskScorersLoading" placeholder="选择测试账号" />
+            </n-form-item>
+            <n-alert type="info" :show-icon="false">
+              清单按 sourceTaskId 精确匹配当前项目图包；已填写 scorer 或 sourceScorer 的任务分给原打分人，其余任务分给兜底账号。
+            </n-alert>
+          </div>
+        </template>
       </n-form>
       <n-space justify="end">
         <n-button @click="taskModalVisible = false">取消</n-button>

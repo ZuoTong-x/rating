@@ -749,6 +749,31 @@ export const imageApi = {
       })
     });
   },
+  generateExactProjectTasks(projectId: string, assignment: {
+    file: File;
+    teamIds: string[];
+    teamMatchMode: 'all' | 'any';
+    fallbackScorer: string;
+  }) {
+    const body = new FormData();
+    body.append('file', assignment.file, assignment.file.name);
+    body.append('teamIds', JSON.stringify(assignment.teamIds));
+    body.append('teamMatchMode', assignment.teamMatchMode);
+    body.append('fallbackScorer', assignment.fallbackScorer);
+    return requestJson<{
+      jobId: string;
+      subjectId: string;
+      projectId: string;
+      status: 'queued' | 'running' | 'completed' | 'failed';
+      stage: string;
+      progress: number;
+      message: string | null;
+      result?: { project: ProjectItem; taskCount: number; createdCount: number; assignedCount: number; baseAssignedCount?: number; backtestCount?: number; backtestRatio?: number; fallbackScorer?: string; fallbackTaskCount?: number; unassignedCount: number; taskVersion: string };
+    }>(`/api/projects/${encodeURIComponent(projectId)}/tasks/generate/exact`, {
+      method: 'POST',
+      body
+    });
+  },
   projectTaskGenerationStatus(projectId: string, jobId: string) {
     return requestJsonWithRetry<{
       jobId: string;
