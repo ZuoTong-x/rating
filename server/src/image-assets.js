@@ -3,19 +3,19 @@ import path from "node:path";
 import sharp from "sharp";
 
 const thumbnailMaxSize = Math.max(
-  160,
-  Number.parseInt(process.env.IMAGE_THUMBNAIL_SIZE || "640", 10) || 640,
+  40,
+  Number.parseInt(process.env.IMAGE_THUMBNAIL_SIZE || "600", 10) || 600,
 );
 const thumbnailQuality = Math.min(
   90,
   Math.max(
     50,
-    Number.parseInt(process.env.IMAGE_THUMBNAIL_QUALITY || "76", 10) || 76,
+    Number.parseInt(process.env.IMAGE_THUMBNAIL_QUALITY || "60", 10) || 60,
   ),
 );
 const thumbnailEffort = Math.min(
   6,
-  Math.max(0, Number.parseInt(process.env.IMAGE_THUMBNAIL_EFFORT || "2", 10) || 2),
+  Math.max(0, Number.parseInt(process.env.IMAGE_THUMBNAIL_EFFORT || "0", 10) || 0),
 );
 
 function normalizedStoragePath(storagePath) {

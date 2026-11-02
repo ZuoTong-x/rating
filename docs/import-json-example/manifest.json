@@ -1,0 +1,58 @@
+{
+  "rows": [
+    {
+      "src_rel_path": "images/cat-001.png",
+      "dest_rel_path": "images/cat-001.png",
+      "image_filename": "cat-001.png",
+      "actual_input_prompt": "a cat sitting by a window",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "src_rel_path": "images/cat-002.png",
+      "dest_rel_path": "images/cat-002.png",
+      "image_filename": "cat-002.png",
+      "actual_input_prompt": "a cat sitting by a window",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "src_rel_path": "images/cat-003.png",
+      "dest_rel_path": "images/cat-003.png",
+      "image_filename": "cat-003.png",
+      "actual_input_prompt": "a cat sitting by a window",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "src_rel_path": "images/dog-001.jpg",
+      "dest_rel_path": "images/dog-001.jpg",
+      "image_filename": "dog-001.jpg",
+      "actual_input_prompt": "a dog running on a beach",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "src_rel_path": "images/dog-002.jpg",
+      "dest_rel_path": "images/dog-002.jpg",
+      "image_filename": "dog-002.jpg",
+      "actual_input_prompt": "a dog running on a beach",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    },
+    {
+      "src_rel_path": "images/dog-003.jpg",
+      "dest_rel_path": "images/dog-003.jpg",
+      "image_filename": "dog-003.jpg",
+      "actual_input_prompt": "a dog running on a beach",
+      "model_name": "example-model-v1",
+      "width": 1024,
+      "height": 1024
+    }
+  ]
+}

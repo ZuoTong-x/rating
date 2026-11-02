@@ -26,6 +26,14 @@
         "目录2/openfind__e83b885f2f__3）情绪与意境传达-7-8_16.webp",
         "目录2/openfind__e86ecbd21c__6）光照-光影-7-8_1.jpg"
       ]
+    },
+    {
+      "id": "saturation-0001",
+      "criterion": "saturation",
+      "images": [
+        { "src_rel_path": "目录1/saturation-a.png", "role": "target" },
+        { "src_rel_path": "目录1/saturation-b.png", "role": "target" }
+      ]
     }
   ]
 }

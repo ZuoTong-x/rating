@@ -253,6 +253,20 @@ create table if not exists images (
     unique (subjectid, originalpath)
   );
 
+create table if not exists thumbnail_jobs (
+    imageid text primary key,
+    status text not null default 'pending' check (status in ('pending', 'processing', 'ready', 'failed')),
+    attempts integer not null default 0,
+    workerid text,
+    lockeduntil timestamptz,
+    nextretryat timestamptz,
+    lasterror text,
+    createdat timestamptz not null,
+    updatedat timestamptz not null,
+    completedat timestamptz,
+    foreign key (imageid) references images(id) on delete cascade
+  );
+
 create table if not exists rating_tasks (
     id text primary key,
     subjectid text not null,
@@ -671,6 +685,10 @@ create index if not exists idx_rating_tasks_project_scorer_assignment on rating_
 create index if not exists idx_rating_tasks_project_backtest on rating_tasks(projectid, taskversion, isbacktest);
 create index if not exists idx_subject_task_templates_selection on subject_task_templates(subjectid, selectionkey, id);
 create index if not exists idx_images_thumbnail_path on images(thumbnailpath);
+create index if not exists idx_thumbnail_jobs_claim
+    on thumbnail_jobs(status, nextretryat, lockeduntil, createdat);
+create index if not exists idx_thumbnail_jobs_updated
+    on thumbnail_jobs(updatedat desc);
 create unique index if not exists idx_teams_name_ci on teams(lower(name));
 create unique index if not exists idx_projects_active_name_ci on projects(lower(trim(name))) where deletionrequestedat is null;
 

@@ -1,0 +1,55 @@
+{
+  "version": 1,
+  "tasks": [
+    {
+      "id": "overall-0001",
+      "criterion": "overall",
+      "images": [
+        {
+          "src_rel_path": "images/cat-001.png",
+          "role": "target"
+        },
+        {
+          "src_rel_path": "images/cat-002.png",
+          "role": "filler"
+        },
+        {
+          "src_rel_path": "images/cat-003.png",
+          "role": "filler"
+        }
+      ]
+    },
+    {
+      "id": "color-0001",
+      "criterion": "color",
+      "images": [
+        {
+          "src_rel_path": "images/dog-001.jpg",
+          "role": "target"
+        },
+        {
+          "src_rel_path": "images/dog-002.jpg",
+          "role": "anchor_low"
+        },
+        {
+          "src_rel_path": "images/dog-003.jpg",
+          "role": "anchor_high"
+        }
+      ]
+    },
+    {
+      "id": "saturation-0001",
+      "criterion": "saturation",
+      "images": [
+        {
+          "src_rel_path": "images/cat-001.png",
+          "role": "target"
+        },
+        {
+          "src_rel_path": "images/cat-002.png",
+          "role": "target"
+        }
+      ]
+    }
+  ]
+}

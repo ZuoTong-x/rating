@@ -1007,6 +1007,7 @@ creativity
 mood
 composition
 color
+saturation
 lighting
 realism
 detail
@@ -1016,6 +1017,7 @@ anatomyNormality
 informationClarity
 designQuality
 typography
+highInfoAes
 ```
 
 支持的图片角色：
@@ -1031,7 +1033,7 @@ boundary
 校验规则：
 
 - 每个任务 ID 在当前 ZIP 内唯一。
-- 每个任务包含 1 到 5 张图片。
+- 普通任务包含 1 到 5 张图片；`saturation`（饱和度）任务必须正好包含 2 张图片。
 - 同一个任务中图片不能重复。
 - 图片引用必须能唯一匹配到 ZIP 中的图片。
 - 相同评分维度和相同图片集合不能重复。

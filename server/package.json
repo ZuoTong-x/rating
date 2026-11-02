@@ -6,6 +6,7 @@
     "dev": "node --watch src/index.js",
     "import:local": "node src/import-local.js",
     "thumbnails:backfill": "node src/backfill-thumbnails.js",
+    "thumbnails:worker": "node src/thumbnail-worker.js",
     "migrate:sqlite": "node src/migrate-sqlite-to-postgres.js"
   },
   "dependencies": {

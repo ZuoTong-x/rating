@@ -1,0 +1,120 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>100人并发打分性能测试报告</title>
+  <style>
+    :root { --bg:#f5f7fb; --surface:#fff; --ink:#172033; --muted:#667085; --line:#e5e7eb; --blue:#2563eb; --green:#16803c; --orange:#b45309; --red:#b42318; }
+    * { box-sizing:border-box; }
+    body { margin:0; background:var(--bg); color:var(--ink); font:15px/1.65 "Microsoft YaHei", "Segoe UI", sans-serif; }
+    .wrap { max-width:1120px; margin:0 auto; padding:36px 22px 60px; }
+    header { display:flex; justify-content:space-between; gap:20px; align-items:flex-start; margin-bottom:26px; }
+    h1 { margin:0 0 6px; font-size:30px; line-height:1.25; letter-spacing:0; }
+    h2 { margin:32px 0 14px; font-size:21px; line-height:1.3; }
+    h3 { margin:0 0 8px; font-size:16px; }
+    p { margin:6px 0; }
+    .subtitle, .note { color:var(--muted); }
+    .tag { display:inline-block; padding:5px 10px; border-radius:999px; background:#e8f7ee; color:var(--green); font-weight:600; white-space:nowrap; }
+    .grid { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); gap:12px; }
+    .card { background:var(--surface); border:1px solid var(--line); border-radius:10px; padding:18px; }
+    .metric .label { color:var(--muted); font-size:13px; }
+    .metric .value { margin-top:3px; font-size:27px; font-weight:700; line-height:1.2; }
+    .metric .hint { margin-top:5px; color:var(--muted); font-size:12px; }
+    .good { color:var(--green); } .warn { color:var(--orange); } .bad { color:var(--red); }
+    .columns { display:grid; grid-template-columns:1fr 1fr; gap:16px; }
+    .bar-row { display:grid; grid-template-columns:92px 1fr 70px; gap:10px; align-items:center; margin:12px 0; }
+    .bar-label { color:var(--muted); font-size:13px; }
+    .track { height:12px; background:#edf0f5; border-radius:8px; overflow:hidden; }
+    .bar { height:100%; border-radius:8px; background:var(--blue); }
+    .bar.green { background:var(--green); } .bar.orange { background:#d97706; } .bar.red { background:var(--red); }
+    .bar-value { text-align:right; font-variant-numeric:tabular-nums; font-size:13px; }
+    table { width:100%; border-collapse:collapse; background:var(--surface); border:1px solid var(--line); border-radius:10px; overflow:hidden; }
+    th, td { padding:11px 13px; border-bottom:1px solid var(--line); text-align:left; vertical-align:top; }
+    th { background:#f8fafc; font-weight:600; }
+    tr:last-child td { border-bottom:0; }
+    code { padding:2px 5px; background:#f1f3f6; border-radius:4px; font-family:Consolas, monospace; font-size:12px; }
+    .callout { border-left:4px solid var(--blue); background:#eef4ff; padding:14px 16px; border-radius:7px; }
+    .callout.warn { border-left-color:var(--orange); background:#fff8eb; }
+    .footer { margin-top:30px; color:var(--muted); font-size:12px; }
+    @media (max-width:760px) { .grid,.columns { grid-template-columns:1fr 1fr; } header { display:block; } .tag { margin-top:12px; } }
+    @media (max-width:520px) { .wrap { padding:24px 14px 40px; } .grid,.columns { grid-template-columns:1fr; } h1 { font-size:25px; } .bar-row { grid-template-columns:78px 1fr 62px; gap:7px; } }
+  </style>
+</head>
+<body>
+  <main class="wrap">
+    <header>
+      <div>
+        <h1>100 人同时打分性能测试</h1>
+        <p class="subtitle">测试项目：<code>LOAD_TEST_100_USERS_20261023</code> · API 地址：<code>http://101.89.57.33:8001</code></p>
+        <p class="subtitle">测试时间：2026-10-23（北京时间） · 原始报告：<code>loadtest-report.json</code></p>
+      </div>
+      <span class="tag">最终数据一致</span>
+    </header>
+
+    <section class="grid" aria-label="核心结论">
+      <div class="card metric"><div class="label">并发账号</div><div class="value">100</div><div class="hint">每个账号 10 条任务</div></div>
+      <div class="card metric"><div class="label">最终完成任务</div><div class="value good">1,000 / 1,000</div><div class="hint">复核后全部落库</div></div>
+      <div class="card metric"><div class="label">列表请求成功率</div><div class="value good">100%</div><div class="hint">100 / 100</div></div>
+      <div class="card metric"><div class="label">提交最终成功率</div><div class="value good">100%</div><div class="hint">含 1 条超时任务重试</div></div>
+    </section>
+
+    <h2>一眼看懂</h2>
+    <div class="callout">
+      <strong>结论：</strong>在本次 100 用户并发 API 测试中，任务列表接口整体稳定，绝大多数提交请求在 200ms 内完成。唯一异常是一次连接层超时，服务端检查确认该任务没有重复落库，随后重试成功；最终 1,000 条测试任务全部完成。
+    </div>
+
+    <h2>接口耗时</h2>
+    <div class="columns">
+      <div class="card">
+        <h3>任务列表查询</h3>
+        <div class="bar-row"><span class="bar-label">P50</span><div class="track"><div class="bar" style="width:20.6%"></div></div><span class="bar-value">115 ms</span></div>
+        <div class="bar-row"><span class="bar-label">平均</span><div class="track"><div class="bar" style="width:30.2%"></div></div><span class="bar-value">168.6 ms</span></div>
+        <div class="bar-row"><span class="bar-label">P95</span><div class="track"><div class="bar orange" style="width:88.5%"></div></div><span class="bar-value">494 ms</span></div>
+        <div class="bar-row"><span class="bar-label">P99</span><div class="track"><div class="bar orange" style="width:99.8%"></div></div><span class="bar-value">557 ms</span></div>
+        <div class="bar-row"><span class="bar-label">最大</span><div class="track"><div class="bar red" style="width:100%"></div></div><span class="bar-value">558 ms</span></div>
+      </div>
+      <div class="card">
+        <h3>任务提交</h3>
+        <div class="bar-row"><span class="bar-label">P50</span><div class="track"><div class="bar green" style="width:63.8%"></div></div><span class="bar-value">133 ms</span></div>
+        <div class="bar-row"><span class="bar-label">平均</span><div class="track"><div class="bar green" style="width:65%"></div></div><span class="bar-value">135.2 ms</span></div>
+        <div class="bar-row"><span class="bar-label">P95</span><div class="track"><div class="bar green" style="width:88.9%"></div></div><span class="bar-value">185 ms</span></div>
+        <div class="bar-row"><span class="bar-label">P99</span><div class="track"><div class="bar green" style="width:99.5%"></div></div><span class="bar-value">207 ms</span></div>
+        <div class="bar-row"><span class="bar-label">正常最大</span><div class="track"><div class="bar green" style="width:100%"></div></div><span class="bar-value">326 ms</span></div>
+        <p class="note">原始记录另有 1 次 21,071 ms 连接超时，未计入正常耗时分布。</p>
+      </div>
+    </div>
+
+    <h2>原始请求结果</h2>
+    <table>
+      <thead><tr><th>阶段</th><th>请求数</th><th>成功</th><th>异常</th><th>说明</th></tr></thead>
+      <tbody>
+        <tr><td>100 人并发读取任务列表</td><td>100</td><td class="good">100</td><td>0</td><td>每个账号返回 10 条任务</td></tr>
+        <tr><td>并发提交任务</td><td>999</td><td class="good">998</td><td class="warn">1</td><td>异常为客户端连接超时，状态码为 0</td></tr>
+        <tr><td>超时任务复核与重试</td><td>1</td><td class="good">1</td><td>0</td><td>复核时仍为 assigned，确认未重复提交；重试耗时 107 ms</td></tr>
+        <tr><td>最终状态校验</td><td>100 个账号</td><td class="good">100</td><td>0</td><td>未完成任务 0，每个账号完成 10 条</td></tr>
+      </tbody>
+    </table>
+
+    <h2>异常说明</h2>
+    <div class="callout warn">
+      <strong>一次连接超时不等于数据丢失。</strong>账号 <code>loadtest_005_20261023</code> 的任务 <code>70871bc247412106bd1fc9d5dda751bd</code> 请求等待约 21 秒后连接失败。随后查询数据库和任务列表，任务仍为 <code>assigned</code>，说明服务端没有完成提交；重试后返回 200，任务状态变为 <code>completed</code>。因此本次测试最终没有漏提交或重复提交。
+    </div>
+
+    <h2>数据隔离与清理</h2>
+    <table>
+      <thead><tr><th>检查项</th><th>结果</th><th>含义</th></tr></thead>
+      <tbody>
+        <tr><td>正式图包 <code>V030_images_20G_1</code></td><td class="good">17,260 张，未修改</td><td>只读取图片模板</td></tr>
+        <tr><td>正式项目 <code>V030_20G_001_TIME3</code></td><td class="good">100,635 条任务</td><td>测试前后未作为写入目标</td></tr>
+        <tr><td>正式项目 <code>V030_images_KPS</code></td><td class="good">63,840 条任务</td><td>测试前后未作为写入目标</td></tr>
+        <tr><td>临时测试资源</td><td class="good">已清理</td><td>项目、任务、任务项、账号、团队、会话、统计记录均已删除</td></tr>
+      </tbody>
+    </table>
+
+    <h2>测试边界</h2>
+    <p class="note">本次测试覆盖 API 层的并发任务列表查询和提交落库，验证了 100 个账号同时访问时的服务端处理能力。它没有模拟浏览器渲染、真实鼠标拖拽、图片下载带宽或大图预加载，因此不能直接代表前端页面在图片高并发加载下的完整体验。</p>
+    <p class="footer">报告依据：loadtest-report.json 及测试结束后的任务状态复核结果。</p>
+  </main>
+</body>
+</html>

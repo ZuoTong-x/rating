@@ -57,6 +57,34 @@ services:
       postgres:
         condition: service_healthy
 
+  thumbnail-worker:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: ["npm", "run", "thumbnails:worker"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://image_rating:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-image_rating}}
+      UPLOAD_DIR: /app/uploads
+      IMAGE_THUMBNAIL_SIZE: ${IMAGE_THUMBNAIL_SIZE:-}
+      IMAGE_THUMBNAIL_QUALITY: ${IMAGE_THUMBNAIL_QUALITY:-}
+      IMAGE_THUMBNAIL_EFFORT: ${IMAGE_THUMBNAIL_EFFORT:-}
+      THUMBNAIL_WORKER: "1"
+      THUMBNAIL_WORKER_CONCURRENCY: ${THUMBNAIL_WORKER_CONCURRENCY:-2}
+      THUMBNAIL_MAX_ATTEMPTS: ${THUMBNAIL_MAX_ATTEMPTS:-5}
+      THUMBNAIL_JOB_LEASE_MS: ${THUMBNAIL_JOB_LEASE_MS:-1800000}
+      THUMBNAIL_RETRY_BASE_MS: ${THUMBNAIL_RETRY_BASE_MS:-5000}
+      THUMBNAIL_POLL_MS: ${THUMBNAIL_POLL_MS:-2000}
+      THUMBNAIL_QUEUE_REPAIR_INTERVAL_MS: ${THUMBNAIL_QUEUE_REPAIR_INTERVAL_MS:-30000}
+      THUMBNAIL_WORKER_PG_POOL_MAX: ${THUMBNAIL_WORKER_PG_POOL_MAX:-4}
+      PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-60000}
+      PG_LOCK_TIMEOUT_MS: ${PG_LOCK_TIMEOUT_MS:-2000}
+    volumes:
+      - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/uploads:/app/uploads
+    depends_on:
+      api:
+        condition: service_started
+
   image-files:
     build:
       context: .

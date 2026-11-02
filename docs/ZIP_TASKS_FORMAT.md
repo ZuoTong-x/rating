@@ -36,10 +36,12 @@ Rules:
 
 - Each `id` is unique within the ZIP.
 - `criterion` must be one of:
-  `overall`, `creativity`, `mood`, `composition`, `color`, `lighting`,
+  `overall`, `creativity`, `mood`, `composition`, `color`, `saturation`, `lighting`,
   `realism`, `detail`, `promptAlignment`, `textCorrectness`,
-  `anatomyNormality`, `informationClarity`, `designQuality`, `typography`.
-- `images` contains 1 to 5 unique image references. Use the ZIP relative path
+  `anatomyNormality`, `informationClarity`, `designQuality`, `typography`,
+  `highInfoAes`.
+- `images` contains 1 to 5 unique image references. The `saturation` criterion
+  must contain exactly 2 images. Use the ZIP relative path
   when possible, such as `目录1/a.png`, or an object with `src_rel_path` and an
   optional `role`. `originalPath` and `path` are also accepted. A plain filename
   remains supported for legacy packages, but it must be unique across the ZIP.

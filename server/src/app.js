@@ -14,11 +14,7 @@ import ExcelJS from "exceljs";
 import iconv from "iconv-lite";
 import sharp from "sharp";
 import yauzl from "yauzl";
-import {
-  createThumbnail,
-  thumbnailStoragePath,
-  uploadFilePath,
-} from "./image-assets.js";
+import { uploadFilePath } from "./image-assets.js";
 import {
   db,
   imageSelectColumns,
@@ -109,7 +105,7 @@ function setShortApiCache(res) {
 }
 
 const maxZipBytes = positiveLimit("MAX_ZIP_BYTES", 1024 * 1024 * 1024 * 100)
-const maxArchiveEntries = positiveLimit("MAX_ARCHIVE_ENTRIES", 50000);
+const maxArchiveEntries = positiveLimit("MAX_ARCHIVE_ENTRIES", 100000);
 const maxArchiveUncompressedBytes = positiveLimit(
   "MAX_ARCHIVE_UNCOMPRESSED_BYTES",
   20 * 1024 * 1024 * 1024,
@@ -1211,6 +1207,7 @@ const taskCriteria = [
   "mood",
   "composition",
   "color",
+  "saturation",
   "lighting",
   "realism",
   "detail",
@@ -1220,6 +1217,7 @@ const taskCriteria = [
   "informationClarity",
   "designQuality",
   "typography",
+  "highInfoAes",
 ];
 const taskExclusionCriteria = new Set([
   "realism",
@@ -1236,6 +1234,7 @@ const taskCriterionLabels = {
   mood: "情绪与意境传达",
   composition: "构图与视觉层级",
   color: "色彩配比",
+  saturation: "饱和度",
   lighting: "光照/光影",
   realism: "（肖像/摄像）真实感",
   detail: "细节与逻辑分辨率",
@@ -1246,6 +1245,7 @@ const taskCriterionLabels = {
   informationClarity: "信息传达是否突出/明确",
   designQuality: "整体设计感",
   typography: "文字设计感",
+  highInfoAes: "高密度信息图美感",
 };
 
 const selectTaskRowsPageStmt = db.prepare(`
@@ -2344,6 +2344,9 @@ function validateTaskManifest(taskManifest, imageRecords) {
       if (!Array.isArray(rawTask.images) || rawTask.images.length < 1 || rawTask.images.length > 5) {
         throw archiveImportError(422, `tasks[${index}].images must contain 1 to 5 images`);
       }
+      if (criterion === "saturation" && rawTask.images.length !== 2) {
+        throw archiveImportError(422, `tasks[${index}].images must contain exactly 2 images for saturation`);
+      }
 
       const usedImageIds = new Set();
       const items = rawTask.images.map((rawItem, itemIndex) => {
@@ -3068,9 +3071,7 @@ async function importZipArchive(
         relativeDir === "." ? "" : relativeDir,
         `${imageId}${ext}`,
       );
-      let thumbnailPath = thumbnailStoragePath(storagePath);
       const storedPath = uploadFilePath(uploadDir, storagePath);
-      let storedThumbnailPath = uploadFilePath(uploadDir, thumbnailPath);
 
       try {
         await fs.mkdir(path.dirname(storedPath), { recursive: true });
@@ -3081,7 +3082,6 @@ async function importZipArchive(
         );
       } catch (error) {
         await fs.unlink(storedPath).catch(() => {});
-        await fs.unlink(storedThumbnailPath).catch(() => {});
         if (
           error?.code === "ENOSPC" ||
           error?.code === "EACCES" ||
@@ -3095,22 +3095,13 @@ async function importZipArchive(
         }
         return { skipped: 1 };
       }
-
-      try {
-        await createThumbnail(storedPath, storedThumbnailPath);
-      } catch (error) {
-        // A bad extension or unsupported encoding must not discard the original.
-        console.warn(`Thumbnail generation failed for ${relative}; using original image`, error);
-        thumbnailPath = storagePath;
-        storedThumbnailPath = storedPath;
-      }
       return { record: {
         id: imageId,
         subjectId,
         filename: path.basename(relative),
         originalPath: relative,
         storagePath,
-        thumbnailPath,
+        thumbnailPath: null,
         mimeType:
           ext === ".jpg" || ext === ".jpeg"
             ? "image/jpeg"
@@ -3144,7 +3135,7 @@ async function importZipArchive(
         imported++;
       }
       await onProgress?.({
-        stage: "正在解压图片并生成缩略图",
+        stage: "正在解压图片",
         progress: 5 + Math.round((Math.min(start + imageImportConcurrency, imageEntries.length) / imageEntries.length) * 80),
         current: Math.min(start + imageImportConcurrency, imageEntries.length),
         total: imageEntries.length,
@@ -3190,6 +3181,7 @@ async function importZipArchive(
       updatedAt: createdAt,
     });
     await bulkInsertImageRecords(imageRecords);
+    await bulkInsertThumbnailJobs(imageRecords, createdAt);
     await onProgress?.({ stage: "正在写入图片数据", progress: 95, current: imageRecords.length, total: imageRecords.length });
     await bulkInsertSubjectTaskTemplates(taskTemplates);
     await refreshSubjectTaskTemplateStats(subjectId, createdAt);
@@ -3590,6 +3582,24 @@ async function bulkInsertImageRecords(imageRows) {
     if (result.changes !== batch.length) {
       throw archiveImportError(409, "图片记录重复，无法导入");
     }
+  }
+}
+
+async function bulkInsertThumbnailJobs(imageRows, createdAt) {
+  for (let start = 0; start < imageRows.length; start += importDbItemBatchSize) {
+    const batch = imageRows.slice(start, start + importDbItemBatchSize);
+    const sql = `
+      INSERT INTO thumbnail_jobs (
+        imageId, status, attempts, workerId, lockedUntil, nextRetryAt, lastError,
+        createdAt, updatedAt, completedAt
+      ) VALUES ${batch.map(() => "(?, 'pending', 0, NULL, NULL, ?, NULL, ?, ?, NULL)").join(", ")}
+      ON CONFLICT (imageId) DO NOTHING
+    `;
+    const params = [];
+    batch.forEach((row) => {
+      params.push(row.id, createdAt, createdAt, createdAt);
+    });
+    await db.prepare(sql).run(...params);
   }
 }
 

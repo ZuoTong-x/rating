@@ -2,7 +2,7 @@
   "name": "image-rating-platform",
   "private": true,
   "scripts": {
-    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\" \"npm --prefix server run thumbnails:worker\"",
     "install:all": "npm --prefix server install && npm --prefix client install"
   },
   "devDependencies": { "concurrently": "^9.1.2" }

@@ -30,10 +30,16 @@ export const imageSelectColumns = `id AS _id, subjectId, filename, originalPath,
 export const userSelectColumns = "id, username, role, status, mustChangePassword, lastLoginAt, createdAt, updatedAt";
 
 const isTaskGenerationWorker = process.env.TASK_GENERATION_WORKER === "1";
+const isThumbnailWorker = process.env.THUMBNAIL_WORKER === "1";
+const isBackgroundWorker = isTaskGenerationWorker || isThumbnailWorker;
 const defaultPoolMax = 24;
 const configuredPoolMax = Number.parseInt(process.env.PG_POOL_MAX || "", 10);
 const configuredWorkerPoolMax = Number.parseInt(
   process.env.PG_TASK_GENERATION_POOL_MAX || "",
+  10,
+);
+const configuredThumbnailWorkerPoolMax = Number.parseInt(
+  process.env.THUMBNAIL_WORKER_PG_POOL_MAX || "",
   10,
 );
 const defaultStatementTimeout = 60000;
@@ -50,6 +56,12 @@ const pool = new Pool({
         ? configuredWorkerPoolMax
         : 4
     )
+    : isThumbnailWorker
+      ? (
+        Number.isInteger(configuredThumbnailWorkerPoolMax) && configuredThumbnailWorkerPoolMax > 0
+          ? configuredThumbnailWorkerPoolMax
+          : 4
+      )
     : (
       Number.isInteger(configuredPoolMax) && configuredPoolMax > 0
         ? configuredPoolMax
@@ -168,7 +180,7 @@ export const db = {
   exec,
 };
 
-if (!isTaskGenerationWorker) {
+if (!isBackgroundWorker) {
   const schema = await fs.readFile(new URL("./postgres-schema.sql", import.meta.url), "utf8");
   await pool.query(schema);
 }

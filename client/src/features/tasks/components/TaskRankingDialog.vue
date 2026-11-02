@@ -109,6 +109,7 @@ const excludedItems = computed(() => {
     .filter(item => excludedIdSet.value.has(item.imageId))
     .sort((left, right) => left.position - right.position);
 });
+const rankingImageCount = computed(() => displayedItems.value.length + excludedItems.value.length);
 const rankingComplete = computed(() => {
   const task = props.task;
   if (!task) return false;
@@ -141,6 +142,7 @@ const rulePoints: Record<string, string[]> = {
     '请选择色彩协调、或有明确控制且协调、或用色大胆（撞色/黑白）且协调的数据，只要色彩协调感高/高级，就可以在排序中得高分。',
     commonRulePoint
   ],
+  saturation: [largeImageRulePoint, '比较两张图片的色彩饱和度，色彩表现更饱满、鲜明且协调的图片应排在前面。', '画面饱和度是否和谐。', commonRulePoint],
   lighting: [largeImageRulePoint, '光影和谐美观性、光影为画面的加分度、明暗层级是否协调。', commonRulePoint],
   realism: [largeImageRulePoint, '皮肤质感真实、材质可信度、摄影美观度、摄影真实性。', commonRulePoint],
   detail: [largeImageRulePoint, '画面细节性。', commonRulePoint],
@@ -150,7 +152,8 @@ const rulePoints: Record<string, string[]> = {
   anatomyNormality: [largeImageRulePoint, '肢体、关节、五官和身体比例是否自然。', commonRulePoint],
   informationClarity: [largeImageRulePoint, '信息传达是否突出、明确。', commonRulePoint],
   designQuality: [largeImageRulePoint, '整体布局、视觉系统与设计完成度。', commonRulePoint],
-  typography: [largeImageRulePoint, '文字排版、字形选择和信息层级是否协调。', commonRulePoint]
+  typography: [largeImageRulePoint, '文字排版、字形选择和信息层级是否协调。', commonRulePoint],
+  highInfoAes: [largeImageRulePoint, '信息密度高但不拥挤，信息层级清晰，图文关系和整体视觉呈现协调。', commonRulePoint]
 };
 
 const currentRulePoints = computed(() => criterion.value ? rulePoints[criterion.value] : rulePoints.overall);
@@ -565,7 +568,8 @@ async function retryNextTask() {
 
     <div class="task-ranking-layout" style="padding-top:20px">
       <section class="task-ranking-board" aria-label="图片排序">
-        <div class="task-ranking-list" :class="{ 'is-correctness-list': isCorrectnessCriterion }">
+        <div class="task-ranking-list" :class="{ 'is-correctness-list': isCorrectnessCriterion, 'is-adaptive-list': rankingImageCount > 0 }"
+          :data-image-count="rankingImageCount">
           <template v-for="(item, index) in displayedItems" :key="item.imageId">
             <article class="task-ranking-item"
               :class="{ 'is-dragging': draggingIndex === index, 'is-correctness': isCorrectnessCriterion, 'is-correct': correctIdSet.has(item.imageId) }"

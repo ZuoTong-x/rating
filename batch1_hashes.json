@@ -1,0 +1,32 @@
+[
+  {
+    "path": "D:\\images\\saturation_packages_20261030\\new_model_pairs\\new_model_pairs_part_01.zip",
+    "name": "new_model_pairs_part_01.zip",
+    "bytes": 21205165144,
+    "sha256": "e18c06282075f27cd721d5a8ce04b6f360cd46d7687b38b46223cbed8d6949a1"
+  },
+  {
+    "path": "D:\\images\\saturation_packages_20261030\\new_model_pairs\\new_model_pairs_part_02.zip",
+    "name": "new_model_pairs_part_02.zip",
+    "bytes": 21206092012,
+    "sha256": "604742e4d0a0aff28010e7dac15fba77f4b2031b91463b77cf7e62b786f5ab05"
+  },
+  {
+    "path": "D:\\images\\saturation_packages_20261030\\new_model_pairs\\new_model_pairs_part_03.zip",
+    "name": "new_model_pairs_part_03.zip",
+    "bytes": 9947338175,
+    "sha256": "67a8a9f2cf400f468fed33e84f31b2fd077b1f5afd9b328c4c3a3303e7774008"
+  },
+  {
+    "path": "D:\\images\\saturation_packages_20261030\\part_a_original_pairs\\part_a_original_pairs_part_01.zip",
+    "name": "part_a_original_pairs_part_01.zip",
+    "bytes": 21204359475,
+    "sha256": "1cc22bc5c9766069c3676d8904c36cb459cd3aa016fe4163b00b24cd07b4de1f"
+  },
+  {
+    "path": "D:\\images\\saturation_packages_20261030\\part_a_original_pairs\\part_a_original_pairs_part_02.zip",
+    "name": "part_a_original_pairs_part_02.zip",
+    "bytes": 21203994489,
+    "sha256": "64adc199688b29a3a7473cfe5ab2b19bb9cf72b7248012db34aa5563baa79b3a"
+  }
+]
