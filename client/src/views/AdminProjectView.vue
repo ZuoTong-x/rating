@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, h, onMounted, ref } from 'vue';
+import { computed, h, onMounted, ref, watch } from 'vue';
 import { NButton, NProgress, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { createUploadId, imageApi, type ImportJob } from '../services/images';
@@ -24,11 +24,26 @@ const loading = ref(false);
 const importing = ref(false);
 const packages = ref<SubjectItem[]>([]);
 const uploadRows = ref<PackageRow[]>([]);
+const packagePage = ref(1);
+const packagePageSize = ref(10);
 
 const rows = computed<PackageRow[]>(() => [
   ...uploadRows.value,
   ...packages.value,
 ]);
+const pagedRows = computed(() => rows.value.slice(
+  (packagePage.value - 1) * packagePageSize.value,
+  packagePage.value * packagePageSize.value
+));
+
+watch(() => rows.value.length, total => {
+  packagePage.value = Math.min(packagePage.value, Math.max(1, Math.ceil(total / packagePageSize.value)));
+});
+
+function changePackagePageSize(size: number) {
+  packagePageSize.value = size;
+  packagePage.value = 1;
+}
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : '请求失败';
@@ -105,6 +120,7 @@ function removeUploadRow(uploadId: string) {
 
 function upsertPackage(item: SubjectItem) {
   packages.value = [item, ...packages.value.filter(row => row._id !== item._id)];
+  packagePage.value = 1;
 }
 
 async function loadPackages() {
@@ -346,8 +362,13 @@ onMounted(() => void loadPackages());
           <n-button type="primary" :loading="importing">上传图包</n-button>
         </n-upload>
       </div>
-      <n-data-table v-if="rows.length" :columns="columns" :data="rows" :loading="loading" :bordered="false" :scroll-x="880" />
+      <n-data-table v-if="rows.length" :columns="columns" :data="pagedRows" :loading="loading" :bordered="false" :scroll-x="880" />
       <div v-else class="empty">{{ loading ? '正在加载图包...' : '暂无图包，请上传 ZIP 文件' }}</div>
+      <div v-if="rows.length" class="table-shell-footer">
+        <n-pagination :page="packagePage" :page-size="packagePageSize" :item-count="rows.length"
+          show-size-picker :page-sizes="[10, 20, 50, 100]"
+          @update:page="packagePage = $event" @update:page-size="changePackagePageSize" />
+      </div>
     </div>
   </div>
 </template>

@@ -1,4 +1,4 @@
-import type { AdminDashboard, AdminDashboardAverageDuration, AdminDashboardCharts, AdminDashboardProjectSection, AdminDashboardStats, AdminDashboardWorkloadSection, AdminExportJob, AdminExportType, AdminTaskListItem, FeedbackPage, FeedbackStatus, FeedbackType, ImageItem, ImagePage, ImageQuery, ImageScore, ProjectItem, ProjectPage, RankingRelation, RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem, ScoringManagementSummary, ScoringRollbackJob, ScoringRollbackPreview, ScoringTaskRecordPage, SubjectItem, SubjectTaskReport, TaskListPage, TaskSubmissionMode, TaskSubmissionModeFilter } from '../types/image';
+import type { AdminDashboard, AdminDashboardAverageDuration, AdminDashboardCharts, AdminDashboardProjectSection, AdminDashboardStats, AdminDashboardWorkloadSection, AdminExportJob, AdminExportType, AdminOperationalLogPage, AdminSystemStatus, AdminTaskListItem, FeedbackPage, FeedbackStatus, FeedbackType, ImageItem, ImagePage, ImageQuery, ImageScore, ProjectItem, ProjectPage, RankingRelation, RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem, ScoringManagementSummary, ScoringRollbackJob, ScoringRollbackPreview, ScoringTaskRecordPage, SubjectItem, SubjectTaskReport, TaskListPage, TaskSubmissionMode, TaskSubmissionModeFilter, ThumbnailQueueOverview, ThumbnailQueueSettings } from '../types/image';
 import { handleUnauthorized, requestJson, requestJsonWithRetry, requestResponse } from './http';
 
 function downloadFilename(contentDisposition: string | null, fallback: string) {
@@ -389,6 +389,13 @@ export const imageApi = {
       body: JSON.stringify(payload)
     });
   },
+  updateProjectTaskLock(id: string, locked: boolean) {
+    return requestJson<{ project: ProjectItem }>(`/api/projects/${encodeURIComponent(id)}/task-lock`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ locked })
+    });
+  },
   deleteProject(id: string) {
     return requestJson<{ deleted: boolean; deletedTaskCount: number }>(`/api/projects/${encodeURIComponent(id)}`, { method: 'DELETE' });
   },
@@ -425,6 +432,60 @@ export const imageApi = {
     if (query.teamId) params.set('teamId', query.teamId);
     if (query.mode) params.set('mode', query.mode);
     return requestJson<AdminDashboardWorkloadSection>(`/api/admin/dashboard/workload${params.toString() ? `?${params}` : ''}`);
+  },
+  thumbnailQueueOverview() {
+    return requestJson<ThumbnailQueueOverview>('/api/admin/thumbnails');
+  },
+  adminSystemStatus() {
+    return requestJson<AdminSystemStatus>('/api/admin/system/status');
+  },
+  adminOperationalLogs(query: {
+    page?: number;
+    pageSize?: number;
+    level?: string | null;
+    source?: string | null;
+    code?: string | null;
+    search?: string | null;
+  } = {}) {
+    const params = new URLSearchParams();
+    if (query.page) params.set('page', String(query.page));
+    if (query.pageSize) params.set('pageSize', String(query.pageSize));
+    if (query.level) params.set('level', query.level);
+    if (query.source) params.set('source', query.source);
+    if (query.code) params.set('code', query.code);
+    if (query.search) params.set('search', query.search);
+    return requestJson<AdminOperationalLogPage>(`/api/admin/logs${params.toString() ? `?${params}` : ''}`);
+  },
+  updateThumbnailQueueSettings(payload: Partial<Pick<ThumbnailQueueSettings,
+    'globallyPaused' | 'daytimeConcurrency' | 'nighttimeConcurrency' | 'nightStartHour' | 'nightEndHour' | 'timeZone'>>) {
+    return requestJson<{ settings: ThumbnailQueueSettings }>('/api/admin/thumbnails/settings', {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+  },
+  updateThumbnailPackageControl(subjectId: string, payload: {
+    generationEnabled?: boolean;
+    paused?: boolean;
+    priority?: number;
+  }) {
+    return requestJson<{ control: { subjectId: string; generationEnabled: boolean; paused: boolean; priority: number } }>(
+      `/api/admin/thumbnails/packages/${encodeURIComponent(subjectId)}`,
+      {
+        method: 'PATCH',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      }
+    );
+  },
+  retryThumbnailPackageFailed(subjectId: string) {
+    return requestJson<{ subjectId: string; retried: number }>(
+      `/api/admin/thumbnails/packages/${encodeURIComponent(subjectId)}/retry-failed`,
+      { method: 'POST' }
+    );
+  },
+  retryAllThumbnailFailed() {
+    return requestJson<{ retried: number }>('/api/admin/thumbnails/retry-failed', { method: 'POST' });
   },
   adminScoringSummary(query: {
     page?: number;

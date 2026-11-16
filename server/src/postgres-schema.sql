@@ -67,9 +67,27 @@ create table if not exists auth_captcha_challenges (
     createdat timestamptz not null
   );
 
-alter table import_jobs
-    alter column uploadlength type bigint using uploadlength::bigint,
-    alter column uploadoffset type bigint using uploadoffset::bigint;
+do $$
+begin
+  -- Avoid rewriting pg_attribute on every API start once these columns are already bigint.
+  if exists (
+    select 1
+    from pg_attribute
+    where attrelid = 'import_jobs'::regclass
+      and attname = 'uploadlength'
+      and atttypid <> 'int8'::regtype
+  ) or exists (
+    select 1
+    from pg_attribute
+    where attrelid = 'import_jobs'::regclass
+      and attname = 'uploadoffset'
+      and atttypid <> 'int8'::regtype
+  ) then
+    alter table import_jobs
+      alter column uploadlength type bigint using uploadlength::bigint,
+      alter column uploadoffset type bigint using uploadoffset::bigint;
+  end if;
+end $$;
 do $$
 begin
   if not exists (
@@ -114,11 +132,20 @@ create table if not exists projects (
     icon text not null default 'archive',
     packageid text not null,
     taskstatus text not null default 'task_pending' check (taskstatus in ('task_pending', 'scoring', 'task_completed')),
+    taskslocked boolean not null default true,
     deletionrequestedat timestamptz,
     createdat timestamptz not null,
     updatedat timestamptz not null,
     foreign key (packageid) references subjects(id) on delete restrict
   );
+
+-- Existing projects remain visible when this column is first introduced;
+-- newly created projects use the table default and start locked.
+alter table projects
+    add column if not exists taskslocked boolean not null default false;
+
+alter table projects
+    alter column taskslocked set default true;
 
 create table if not exists task_generation_jobs (
     jobid text primary key,
@@ -265,6 +292,35 @@ create table if not exists thumbnail_jobs (
     updatedat timestamptz not null,
     completedat timestamptz,
     foreign key (imageid) references images(id) on delete cascade
+  );
+
+create table if not exists thumbnail_queue_settings (
+    id text primary key check (id = 'default'),
+    globallypaused boolean not null default false,
+    daytimeconcurrency integer not null default 2 check (daytimeconcurrency between 1 and 16),
+    nighttimeconcurrency integer not null default 6 check (nighttimeconcurrency between 1 and 16),
+    nightstarthour integer not null default 22 check (nightstarthour between 0 and 23),
+    nightendhour integer not null default 8 check (nightendhour between 0 and 23),
+    timezone text not null default 'Asia/Shanghai',
+    updatedat timestamptz not null,
+    updatedby text
+  );
+
+insert into thumbnail_queue_settings (
+    id, globallypaused, daytimeconcurrency, nighttimeconcurrency,
+    nightstarthour, nightendhour, timezone, updatedat, updatedby
+  ) values (
+    'default', false, 2, 6, 22, 8, 'Asia/Shanghai', now(), null
+  ) on conflict (id) do nothing;
+
+create table if not exists thumbnail_subject_controls (
+    subjectid text primary key,
+    generationenabled boolean not null default true,
+    paused boolean not null default false,
+    priority integer not null default 0 check (priority between -100000 and 100000),
+    updatedat timestamptz not null,
+    updatedby text,
+    foreign key (subjectid) references subjects(id) on delete cascade
   );
 
 create table if not exists rating_tasks (
@@ -689,6 +745,10 @@ create index if not exists idx_thumbnail_jobs_claim
     on thumbnail_jobs(status, nextretryat, lockeduntil, createdat);
 create index if not exists idx_thumbnail_jobs_updated
     on thumbnail_jobs(updatedat desc);
+create index if not exists idx_thumbnail_jobs_completed
+    on thumbnail_jobs(completedat desc) where status = 'ready';
+create index if not exists idx_thumbnail_subject_controls_priority
+    on thumbnail_subject_controls(generationenabled, paused, priority desc, updatedat desc);
 create unique index if not exists idx_teams_name_ci on teams(lower(name));
 create unique index if not exists idx_projects_active_name_ci on projects(lower(trim(name))) where deletionrequestedat is null;
 

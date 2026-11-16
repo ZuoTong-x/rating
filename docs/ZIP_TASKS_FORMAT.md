@@ -39,14 +39,17 @@ Rules:
   `overall`, `creativity`, `mood`, `composition`, `color`, `saturation`, `lighting`,
   `realism`, `detail`, `promptAlignment`, `textCorrectness`,
   `anatomyNormality`, `informationClarity`, `designQuality`, `typography`,
-  `highInfoAes`.
+  `highInfoAes`, `ss_infographic_v2`, `sparse_info`, `illustration`, `photography`, `portrait`,
+  `poster`.
 - `images` contains 1 to 5 unique image references. The `saturation` criterion
   must contain exactly 2 images. Use the ZIP relative path
   when possible, such as `目录1/a.png`, or an object with `src_rel_path` and an
   optional `role`. `originalPath` and `path` are also accepted. A plain filename
   remains supported for legacy packages, but it must be unique across the ZIP.
 - Valid roles are `target`, `filler`, `anchor_low`, `anchor_high`, and
-  `boundary`; omit it to use `target`.
+  `boundary`; omit it to use `target`. `filler` is displayed as a reference
+  image with a distinct visual marker and is placed first by default. It still
+  participates in ranking and can be dragged like any other task image.
 - Every task image reference must resolve to exactly one imported image. Invalid
   task JSON rejects the ZIP import and leaves no package record behind.
 

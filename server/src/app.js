@@ -28,8 +28,38 @@ import {
 } from "./postgres.js";
 import { createAdminDashboardService } from "./services/admin-dashboard.js";
 import { createAdminScoringService } from "./services/admin-scoring.js";
+import { createAdminThumbnailService } from "./services/admin-thumbnails.js";
+import { createThumbnailImportScheduler } from "./services/thumbnail-import.js";
+import { createAdminSystemService, createApiActivityTracker } from "./services/admin-system.js";
+import { createAdminLogService } from "./services/admin-logs.js";
+import { createOperationalLogger, requestLogMetadata } from "./operational-logger.js";
+import { retryTaskStatsRefresh } from "./task-stats-retry.js";
+import { registerAdminDashboardRoutes } from "./routes/admin-dashboard.js";
+import { registerAdminThumbnailRoutes } from "./routes/admin-thumbnails.js";
+import { registerAdminSystemRoutes } from "./routes/admin-system.js";
+import { registerAdminScoringRoutes } from "./routes/admin-scoring.js";
+import { registerPublicAuthRoutes, registerSessionAuthRoutes } from "./routes/auth.js";
+import { registerScorerTaskListRoutes, registerScorerTaskDetailRoutes } from "./routes/scorer-tasks.js";
+import { registerFeedbackRoutes } from "./routes/feedback.js";
+import { registerAdminAccountRoutes } from "./routes/admin-accounts.js";
+import { registerAdminExportRoutes } from "./routes/admin-exports.js";
 
 const app = express();
+const startupState = {
+  status: process.env.TASK_GENERATION_WORKER === "1" || process.env.THUMBNAIL_WORKER === "1"
+    ? "worker"
+    : "starting",
+  startedAt: new Date().toISOString(),
+  completedAt: null,
+  error: null,
+};
+const apiActivity = createApiActivityTracker();
+const logDir = path.resolve(process.env.LOG_DIR || "logs");
+const operationalLogger = createOperationalLogger({
+  source: process.env.TASK_GENERATION_WORKER === "1" ? "task-generation-worker" : "api",
+  logDir,
+});
+operationalLogger.installConsoleCapture();
 if (process.env.TRUST_PROXY) app.set("trust proxy", process.env.TRUST_PROXY);
 const taskImageSelectColumns =
   "id AS _id, subjectId, filename, originalPath, storagePath, thumbnailPath, category, directory, isInfographic, prompt";
@@ -86,7 +116,27 @@ app.use(
   }),
 );
 app.use(express.json({ limit: "2mb" }));
+app.use((req, res, next) => {
+  req.requestId = String(req.headers["x-request-id"] || crypto.randomUUID()).slice(0, 120);
+  res.setHeader("X-Request-Id", req.requestId);
+  next();
+});
 app.use((_req, _res, next) => runWithDatabaseContext(() => next()));
+app.use(apiActivity.middleware);
+
+app.get("/healthz", (_req, res) => {
+  res.status(200).json({ status: "ok", service: "api" });
+});
+
+app.get("/readyz", (_req, res) => {
+  const ready = startupState.status === "ready" || startupState.status === "worker";
+  res.status(ready ? 200 : 503).json({
+    status: startupState.status,
+    startedAt: startupState.startedAt,
+    completedAt: startupState.completedAt,
+    error: startupState.error,
+  });
+});
 
 function positiveLimit(name, fallback) {
   const configured = Number(process.env[name]);
@@ -296,6 +346,11 @@ const selectActiveTaskGenerationJobStmt = db.prepare(`
   ORDER BY updatedAt DESC, createdAt DESC
   LIMIT 1
 `);
+const selectActiveTaskGenerationSubjectsStmt = db.prepare(`
+  SELECT DISTINCT subjectId
+  FROM task_generation_jobs
+  WHERE status IN ('queued', 'running')
+`);
 const upsertTaskGenerationJobStmt = db.prepare(`
   INSERT INTO task_generation_jobs (
     jobId, subjectId, status, stage, progress, message, requestJson, stageEventsJson, resultJson,
@@ -337,10 +392,17 @@ const sessionSeenWriteIntervalMs = 5 * 60 * 1000;
 // Keep large task jobs bounded while avoiding thousands of tiny transactions.
 // These can be tuned per deployment without changing the allocation logic.
 const configuredTaskWriteBatchSize = Number.parseInt(process.env.TASK_WRITE_BATCH_SIZE || "1000", 10);
+const configuredTaskWriteTransactionSize = Number.parseInt(
+  process.env.TASK_WRITE_TRANSACTION_SIZE || String(configuredTaskWriteBatchSize),
+  10,
+);
 const configuredTaskAssignBatchSize = Number.parseInt(process.env.TASK_ASSIGN_BATCH_SIZE || "1000", 10);
 const TASK_WRITE_BATCH_SIZE = Number.isInteger(configuredTaskWriteBatchSize)
-  ? Math.min(5000, Math.max(100, configuredTaskWriteBatchSize))
+  ? Math.min(1000, Math.max(100, configuredTaskWriteBatchSize))
   : 1000;
+const TASK_WRITE_TRANSACTION_SIZE = Number.isInteger(configuredTaskWriteTransactionSize)
+  ? Math.min(1000, Math.max(TASK_WRITE_BATCH_SIZE, configuredTaskWriteTransactionSize))
+  : TASK_WRITE_BATCH_SIZE;
 const TASK_ASSIGN_BATCH_SIZE = Number.isInteger(configuredTaskAssignBatchSize)
   ? Math.min(5000, Math.max(100, configuredTaskAssignBatchSize))
   : 1000;
@@ -501,12 +563,13 @@ async function getAnyActiveTaskGenerationJob() {
 
 function scheduleTaskGenerationJobCleanup(job) {
   if (job.cleanupTimer) return;
+  const delayMs = Math.max(0, new Date(job.expiresAt).getTime() - Date.now());
   job.cleanupTimer = setTimeout(() => {
     void deleteTaskGenerationJob(job.jobId).catch((error) => {
       console.error(`Failed to delete task generation job (${job.jobId})`, error);
     });
     delete job.cleanupTimer;
-  }, taskGenerationJobTtlMs).unref();
+  }, delayMs).unref();
 }
 
 async function deleteTaskGenerationJob(jobId) {
@@ -777,6 +840,13 @@ const updateSubjectCountsStmt = db.prepare(`
       updatedAt = @updatedAt
   WHERE id = @id
 `);
+const markSubjectImportFailedStmt = db.prepare(`
+  UPDATE subjects
+  SET status = 'failed',
+      updatedAt = @updatedAt
+  WHERE id = @id
+    AND status = 'importing'
+`);
 
 const selectSubjectByIdStmt = db.prepare(
   `SELECT ${subjectSelectColumns}
@@ -792,6 +862,7 @@ const selectSubjectsStmt = db.prepare(
   `SELECT ${subjectSelectColumns}
    FROM subjects
    WHERE deletionRequestedAt IS NULL
+     AND status = 'imported'
    ORDER BY createdAt DESC`,
 );
 const selectProjectByIdStmt = db.prepare(`
@@ -841,9 +912,9 @@ const selectProjectPackagesStmt = db.prepare(`
 `);
 const insertProjectStmt = db.prepare(`
   INSERT INTO projects (
-    id, name, icon, packageId, taskStatus, createdAt, updatedAt
+    id, name, icon, packageId, taskStatus, tasksLocked, createdAt, updatedAt
   ) VALUES (
-    @id, @name, @icon, @packageId, 'task_pending', @createdAt, @updatedAt
+    @id, @name, @icon, @packageId, 'task_pending', true, @createdAt, @updatedAt
   )
 `);
 const insertProjectPackageStmt = db.prepare(`
@@ -868,6 +939,24 @@ const updateProjectTaskStatusStmt = db.prepare(`
   SET taskStatus = @taskStatus,
       updatedAt = @updatedAt
   WHERE id = @id
+`);
+const updateProjectTaskLockStmt = db.prepare(`
+  UPDATE projects
+  SET tasksLocked = @tasksLocked,
+      updatedAt = @updatedAt
+  WHERE id = @id
+    AND deletionRequestedAt IS NULL
+`);
+const clearProjectTaskClaimsStmt = db.prepare(`
+  UPDATE rating_tasks
+  SET claimToken = NULL,
+      claimedAt = NULL,
+      claimExpiresAt = NULL,
+      updatedAt = @updatedAt
+  WHERE projectId = @projectId
+    AND taskVersion = @taskVersion
+    AND status = 'assigned'
+    AND claimToken IS NOT NULL
 `);
 const selectProjectTaskCountStmt = db.prepare(
   "SELECT COUNT(*) AS total FROM rating_tasks WHERE projectId = ?",
@@ -1218,6 +1307,12 @@ const taskCriteria = [
   "designQuality",
   "typography",
   "highInfoAes",
+  "ss_infographic_v2",
+  "sparse_info",
+  "illustration",
+  "photography",
+  "portrait",
+  "poster",
 ];
 const taskExclusionCriteria = new Set([
   "realism",
@@ -1246,6 +1341,12 @@ const taskCriterionLabels = {
   designQuality: "整体设计感",
   typography: "文字设计感",
   highInfoAes: "高密度信息图美感",
+  ss_infographic_v2: "高密度信息图",
+  sparse_info: "中低密度信息图美感",
+  illustration: "插画",
+  photography: "摄影",
+  portrait: "人像",
+  poster: "海报",
 };
 
 const selectTaskRowsPageStmt = db.prepare(`
@@ -1288,33 +1389,42 @@ const selectAssignedTaskCountStmt = db.prepare(`
 `);
 const selectScorerTaskStatsStmt = db.prepare(`
   SELECT
-    COALESCE(SUM(assigned), 0) AS pendingTasks,
-    COALESCE(SUM(completed), 0) AS completedTasks
-  FROM scorer_task_stats
-  WHERE taskVersion = ?
-    AND scorer = ?
-    AND (?::text IS NULL OR projectId = ?)
+    COALESCE(SUM(stats.assigned), 0) AS pendingTasks,
+    COALESCE(SUM(stats.completed), 0) AS completedTasks
+  FROM scorer_task_stats stats
+  JOIN projects ON projects.id = stats.projectId
+  WHERE stats.taskVersion = ?
+    AND stats.scorer = ?
+    AND projects.tasksLocked = false
+    AND projects.deletionRequestedAt IS NULL
+    AND (?::text IS NULL OR stats.projectId = ?)
 `);
 const selectScorerTaskListTotalStmt = db.prepare(`
   SELECT COALESCE(SUM(
     CASE
-      WHEN ?::text = 'assigned' THEN assigned
-      WHEN ?::text = 'completed' THEN completed
-      ELSE assigned + completed
+      WHEN ?::text = 'assigned' THEN stats.assigned
+      WHEN ?::text = 'completed' THEN stats.completed
+      ELSE stats.assigned + stats.completed
     END
   ), 0) AS total
-  FROM scorer_task_stats
-  WHERE taskVersion = ?
-    AND scorer = ?
-    AND (?::text IS NULL OR projectId = ?)
+  FROM scorer_task_stats stats
+  JOIN projects ON projects.id = stats.projectId
+  WHERE stats.taskVersion = ?
+    AND stats.scorer = ?
+    AND projects.tasksLocked = false
+    AND projects.deletionRequestedAt IS NULL
+    AND (?::text IS NULL OR stats.projectId = ?)
 `);
 const selectScorerProjectCountStmt = db.prepare(`
   SELECT COUNT(*) AS total
-  FROM scorer_task_stats
-  WHERE taskVersion = ?
-    AND scorer = ?
-    AND projectId <> ''
-    AND (assigned + completed) > 0
+  FROM scorer_task_stats stats
+  JOIN projects ON projects.id = stats.projectId
+  WHERE stats.taskVersion = ?
+    AND stats.scorer = ?
+    AND stats.projectId <> ''
+    AND (stats.assigned + stats.completed) > 0
+    AND projects.tasksLocked = false
+    AND projects.deletionRequestedAt IS NULL
 `);
 const selectTaskByIdStmt = db.prepare(`
   SELECT id, subjectId, projectId, taskVersion, taskType, status, scorer, ranking, excludedImageIds, correctImageIds, rankingRelations,
@@ -1337,6 +1447,12 @@ const claimAssignedTaskStmt = db.prepare(`
     AND taskVersion = @taskVersion
     AND scorer = @scorer
     AND status = 'assigned'
+    AND EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.id = rating_tasks.projectId
+        AND projects.tasksLocked = false
+        AND projects.deletionRequestedAt IS NULL
+    )
     AND (
       (
         @requestedClaimToken <> ''
@@ -1402,6 +1518,12 @@ const completeAssignedTaskStmt = db.prepare(`
   WHERE id = @id
     AND status = 'assigned'
     AND scorer = @scorer
+    AND EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.id = rating_tasks.projectId
+        AND projects.tasksLocked = false
+        AND projects.deletionRequestedAt IS NULL
+    )
 `);
 const updateCompletedTaskStmt = db.prepare(`
   UPDATE rating_tasks
@@ -1429,6 +1551,12 @@ const updateCompletedTaskStmt = db.prepare(`
   WHERE id = @id
     AND status = 'completed'
     AND scorer = @scorer
+    AND EXISTS (
+      SELECT 1 FROM projects
+      WHERE projects.id = rating_tasks.projectId
+        AND projects.tasksLocked = false
+        AND projects.deletionRequestedAt IS NULL
+    )
 `);
 const insertRatingTaskStmt = db.prepare(`
   INSERT INTO rating_tasks (
@@ -1698,6 +1826,9 @@ const markTaskStatsEventsProcessedByIdsStmt = (eventCount) => db.prepare(`
 `);
 const tryTaskStatsMaintenanceLockStmt = db.prepare(`
   SELECT pg_try_advisory_xact_lock(2026091401) AS locked
+`);
+const lockTaskStatsMaintenanceStmt = db.prepare(`
+  SELECT pg_advisory_xact_lock(2026091401) AS locked
 `);
 const updateProjectTaskStatsDeltaStmt = db.prepare(`
   UPDATE project_task_stats
@@ -2369,7 +2500,6 @@ function validateTaskManifest(taskManifest, imageRecords) {
           role: taskItemRole(rawItem),
         };
       });
-
       const imageKey = items.map((item) => item.image.id).sort().join("|");
       const taskKey = `${criterion}|${imageKey}`;
       if (taskKeys.has(taskKey)) {
@@ -2963,7 +3093,7 @@ async function importZipArchive(
     originalFilename;
   const createdAt = nowIso();
   let subjectDir;
-  let transactionOpen = false;
+  let subjectCreated = false;
   let zip;
 
   try {
@@ -3033,7 +3163,6 @@ async function importZipArchive(
       subjectId,
     );
     subjectDir = path.join(uploadDir, storageRoot);
-    const sourceZipPath = path.posix.join(storageRoot, "source.zip");
     let imported = 0;
     let skipped = 0;
     let catalogMatched = 0;
@@ -3042,7 +3171,6 @@ async function importZipArchive(
     const seenOriginalPaths = new Set();
 
     await fs.mkdir(subjectDir, { recursive: true });
-    await fs.copyFile(zipPath, uploadFilePath(uploadDir, sourceZipPath));
 
     const processImageEntry = async (entry, entryIndex) => {
       if (entry.type === "Directory") return null;
@@ -3165,30 +3293,51 @@ async function importZipArchive(
     }
     await onProgress?.({ stage: "正在准备数据库写入", progress: 90, current: 1, total: 1 });
 
-    // All archive I/O and image validation has completed before this write
-    // transaction. Keep read indexes in place so imports do not rebuild the
-    // entire images table while holding a write transaction.
-    await db.exec("BEGIN");
-    transactionOpen = true;
+    // Publish through the existing subject status instead of holding one large
+    // transaction across every image, template, relation and index update.
+    // In-progress subjects stay hidden from normal package listings.
     await insertSubjectStmt.run({
       id: subjectId,
       name: subjectName,
       originalFilename,
       importBatch: batch,
       storageRoot,
-      sourceZipPath,
+      // The uploaded archive is only an import transport. Keeping another
+      // copy under the subject directory doubles storage use and no runtime
+      // feature reads it after a successful import.
+      sourceZipPath: null,
       createdAt,
       updatedAt: createdAt,
     });
-    await bulkInsertImageRecords(imageRecords);
-    await bulkInsertThumbnailJobs(imageRecords, createdAt);
-    await onProgress?.({ stage: "正在写入图片数据", progress: 95, current: imageRecords.length, total: imageRecords.length });
-    await bulkInsertSubjectTaskTemplates(taskTemplates);
+    subjectCreated = true;
+    await bulkInsertImageRecords(imageRecords, async ({ current, total }) => {
+      await onProgress?.({
+        stage: "正在分批写入图片数据",
+        progress: 90 + Math.round((current / total) * 3),
+        current,
+        total,
+      });
+    });
+    await bulkInsertSubjectTaskTemplates(taskTemplates, async ({ current, total }) => {
+      await onProgress?.({
+        stage: "正在分批写入任务模板",
+        progress: 93 + Math.round((current / total) * 3),
+        current,
+        total,
+      });
+    });
     await refreshSubjectTaskTemplateStats(subjectId, createdAt);
-    await bulkInsertSubjectTaskTemplateItems(taskTemplates);
-    await onProgress?.({ stage: "正在写入任务模板", progress: 98, current: taskTemplates.length, total: taskTemplates.length });
+    await bulkInsertSubjectTaskTemplateItems(taskTemplates, async ({ current, total }) => {
+      await onProgress?.({
+        stage: "正在分批写入模板图片关系",
+        progress: 96 + Math.round((current / total) * 3),
+        current,
+        total,
+      });
+    });
 
     const updatedAt = nowIso();
+    await onProgress?.({ stage: "正在发布图包", progress: 99, current: 1, total: 1 });
     await updateSubjectCountsStmt.run({
       id: subjectId,
       imageCount: imported,
@@ -3196,9 +3345,11 @@ async function importZipArchive(
       status: "imported",
       updatedAt,
     });
-
-    await db.exec("COMMIT");
-    transactionOpen = false;
+    scheduleImportedThumbnailJobs(
+      imageRecords.map(({ id }) => ({ id })),
+      createdAt,
+      subjectId,
+    );
     const subject = await selectSubjectByIdStmt.get(subjectId);
     return {
       subject: subjectDto(subject),
@@ -3212,11 +3363,14 @@ async function importZipArchive(
       taskFailures: failedTasks,
     };
   } catch (error) {
-    if (transactionOpen) {
+    if (subjectCreated) {
       try {
-        await db.exec("ROLLBACK");
-      } catch (rollbackError) {
-        console.error("Failed to roll back ZIP import", rollbackError);
+        await markSubjectImportFailedStmt.run({
+          id: subjectId,
+          updatedAt: nowIso(),
+        });
+      } catch (markFailedError) {
+        console.error("Failed to mark ZIP import as failed", markFailedError);
       }
     }
 
@@ -3547,7 +3701,7 @@ async function runSupplementalJsonImportJob(job, supplementalZipPath) {
   }
 }
 
-async function bulkInsertImageRecords(imageRows) {
+async function bulkInsertImageRecords(imageRows, onBatch) {
   for (let start = 0; start < imageRows.length; start += importDbBatchSize) {
     const batch = imageRows.slice(start, start + importDbBatchSize);
     const sql = `
@@ -3582,28 +3736,21 @@ async function bulkInsertImageRecords(imageRows) {
     if (result.changes !== batch.length) {
       throw archiveImportError(409, "图片记录重复，无法导入");
     }
-  }
-}
-
-async function bulkInsertThumbnailJobs(imageRows, createdAt) {
-  for (let start = 0; start < imageRows.length; start += importDbItemBatchSize) {
-    const batch = imageRows.slice(start, start + importDbItemBatchSize);
-    const sql = `
-      INSERT INTO thumbnail_jobs (
-        imageId, status, attempts, workerId, lockedUntil, nextRetryAt, lastError,
-        createdAt, updatedAt, completedAt
-      ) VALUES ${batch.map(() => "(?, 'pending', 0, NULL, NULL, ?, NULL, ?, ?, NULL)").join(", ")}
-      ON CONFLICT (imageId) DO NOTHING
-    `;
-    const params = [];
-    batch.forEach((row) => {
-      params.push(row.id, createdAt, createdAt, createdAt);
+    await onBatch?.({
+      current: Math.min(start + batch.length, imageRows.length),
+      total: imageRows.length,
     });
-    await db.prepare(sql).run(...params);
   }
 }
 
-async function bulkInsertSubjectTaskTemplates(taskTemplates) {
+const scheduleImportedThumbnailJobs = createThumbnailImportScheduler({
+  db,
+  runWithDatabaseContext,
+  operationalLogger,
+  batchSize: importDbItemBatchSize,
+});
+
+async function bulkInsertSubjectTaskTemplates(taskTemplates, onBatch) {
   for (let start = 0; start < taskTemplates.length; start += importDbBatchSize) {
     const batch = taskTemplates.slice(start, start + importDbBatchSize);
     const sql = `
@@ -3625,6 +3772,10 @@ async function bulkInsertSubjectTaskTemplates(taskTemplates) {
       );
     });
     await db.prepare(sql).run(...params);
+    await onBatch?.({
+      current: Math.min(start + batch.length, taskTemplates.length),
+      total: taskTemplates.length,
+    });
   }
 }
 
@@ -3653,7 +3804,7 @@ function queueProjectTaskBaseStatsBackfill() {
   });
 }
 
-async function bulkInsertSubjectTaskTemplateItems(taskTemplates) {
+async function bulkInsertSubjectTaskTemplateItems(taskTemplates, onBatch) {
   const itemRows = taskTemplates.flatMap((template) =>
     template.items.map((item) => ({
       templateId: template.id,
@@ -3671,6 +3822,10 @@ async function bulkInsertSubjectTaskTemplateItems(taskTemplates) {
       params.push(row.templateId, row.imageId, row.position, row.role);
     });
     await db.prepare(sql).run(...params);
+    await onBatch?.({
+      current: Math.min(start + batch.length, itemRows.length),
+      total: itemRows.length,
+    });
   }
 }
 
@@ -4588,13 +4743,23 @@ function queueProjectTaskSummary(projectId) {
   queuedProjectTaskSummaries.add(projectId);
   setImmediate(async () => {
     try {
+      const project = await selectProjectByIdStmt.get(projectId);
+      if (!project) return;
       const taskStats = await getProjectTaskStats(projectId);
-      if (taskStats.pending + taskStats.assigned !== 0) return;
-      await updateSubjectTaskStatusStmt.run({
-        id: projectId,
-        taskStatus: "task_completed",
-        updatedAt: nowIso(),
-      });
+      if (!taskStats.total) return;
+      const capacity = taskStats.pending + taskStats.assigned === 0
+        ? await getTaskGenerationCapacity(projectId)
+        : null;
+      const taskStatus = capacity?.availableTaskCount === 0
+        ? "task_completed"
+        : "scoring";
+      if (project.taskStatus !== taskStatus) {
+        await updateSubjectTaskStatusStmt.run({
+          id: projectId,
+          taskStatus,
+          updatedAt: nowIso(),
+        });
+      }
     } catch (error) {
       // ponytail: eventual-consistency summary update; use a durable job if
       // recovery after process loss becomes a requirement.
@@ -4630,6 +4795,23 @@ async function runTaskStatsRefreshTransaction(callback, { repeatableRead = false
       } catch {}
       throw error;
     }
+  });
+}
+
+async function refreshGeneratedProjectTaskStats(projectId) {
+  await retryTaskStatsRefresh(async () => {
+    await runTaskStatsRefreshTransaction(async () => {
+      // The API event flusher and generation workers run in different processes.
+      await db.exec("SET LOCAL lock_timeout = '30000ms'");
+      await lockTaskStatsMaintenanceStmt.get();
+      await refreshProjectTaskStats(projectId);
+    }, { repeatableRead: true });
+  }, (error, attempt) => {
+    console.warn("Task generation stats refresh retry", {
+      projectId,
+      attempt,
+      code: error.code,
+    });
   });
 }
 
@@ -4676,7 +4858,11 @@ async function flushTaskStatsEvents() {
         cutoff,
         taskStatsEventScanBatchSize,
       );
-      const events = pendingEvents.filter((event) => !hasActiveTaskGeneration(event.projectId));
+      const activeSubjects = new Set(
+        (await selectActiveTaskGenerationSubjectsStmt.all()).map((row) => row.subjectId),
+      );
+      const events = pendingEvents.filter((event) =>
+        !activeSubjects.has(event.projectId) && !hasActiveTaskGeneration(event.projectId));
       if (!events.length) return { processedCount: 0, changedProjectIds: [] };
 
       const processedAt = nowIso();
@@ -4899,6 +5085,12 @@ async function projectDto(row, taskStats = null, related = null) {
   const generatedTaskCount = Math.min(materializedStats.materializedTotal, taskTemplateCount);
   const pendingTaskCount = materializedStats.materializedPending;
   const remainingTemplateCount = Math.max(taskTemplateCount - generatedTaskCount, 0);
+  const availableTaskCount = pendingTaskCount + remainingTemplateCount;
+  const taskStatus = stats.total === 0
+    ? "task_pending"
+    : stats.pending + stats.assigned > 0 || availableTaskCount > 0
+      ? "scoring"
+      : "task_completed";
   return {
     _id: row._id,
     name: row.name,
@@ -4923,10 +5115,14 @@ async function projectDto(row, taskStats = null, related = null) {
     ),
     taskTemplateCount,
     generatedTaskCount,
+    totalTaskCount: stats.total,
+    completedTaskCount: stats.completed,
+    assignedTaskCount: stats.assigned,
     pendingTaskCount,
     remainingTemplateCount,
-    availableTaskCount: pendingTaskCount + remainingTemplateCount,
-    taskStatus: row.taskStatus || "task_pending",
+    availableTaskCount,
+    taskStatus,
+    tasksLocked: Boolean(row.tasksLocked),
     deletionRequestedAt: row.deletionRequestedAt ?? null,
     teams: (related?.teamRows || (await selectProjectTeamsStmt.all(row._id))).map(teamDto),
     createdAt: row.createdAt,
@@ -5262,6 +5458,34 @@ async function updateProject(id, body = {}) {
   return await projectDto(await selectProjectByIdStmt.get(id));
 }
 
+async function updateProjectTaskLock(id, locked) {
+  if (typeof locked !== "boolean") throw httpError(400, "任务锁定状态必须是布尔值");
+  const project = await getProjectOrThrow(id);
+  const now = nowIso();
+  await db.exec("BEGIN");
+  try {
+    const result = await updateProjectTaskLockStmt.run({
+      id: project._id,
+      tasksLocked: locked,
+      updatedAt: now,
+    });
+    if (result.changes !== 1) throw httpError(404, "项目不存在");
+    if (locked) {
+      await clearProjectTaskClaimsStmt.run({
+        projectId: project._id,
+        taskVersion,
+        updatedAt: now,
+      });
+    }
+    await db.exec("COMMIT");
+  } catch (error) {
+    try { await db.exec("ROLLBACK"); } catch {}
+    throw error;
+  }
+  invalidateScorerQueryCaches();
+  return await projectDto(await selectProjectByIdStmt.get(project._id));
+}
+
 async function listVisibleProjects(user, query = {}) {
   if (user?.role === "admin") {
     return hasPaginationQuery(query) ? await listProjectsPage(query) : await listProjects();
@@ -5273,6 +5497,7 @@ async function listVisibleProjects(user, query = {}) {
       JOIN subjects ON subjects.id = projects.packageId
       JOIN rating_tasks ON rating_tasks.projectId = projects.id
       WHERE projects.deletionRequestedAt IS NULL
+        AND projects.tasksLocked = false
         AND rating_tasks.taskVersion = ?
         AND rating_tasks.scorer = ?
         AND rating_tasks.status IN ('assigned', 'completed')
@@ -5718,7 +5943,12 @@ async function assertSubjectAccess(subjectId, user) {
     const assignedToPackage = await db
       .prepare(
         `SELECT 1 FROM rating_tasks
-         WHERE subjectId = ? AND scorer = ? AND status IN ('assigned', 'completed')
+         JOIN projects ON projects.id = rating_tasks.projectId
+         WHERE rating_tasks.subjectId = ?
+           AND rating_tasks.scorer = ?
+           AND rating_tasks.status IN ('assigned', 'completed')
+           AND projects.tasksLocked = false
+           AND projects.deletionRequestedAt IS NULL
          LIMIT 1`,
       )
       .get(subjectId, user?.username || "");
@@ -5726,6 +5956,7 @@ async function assertSubjectAccess(subjectId, user) {
     return subject;
   }
   if (user?.role === "admin") return project;
+  if (project.tasksLocked) throw httpError(403, "该项目任务尚未开放");
 
   const assigned = await db
     .prepare(
@@ -5757,7 +5988,10 @@ async function listVisibleSubjects(user) {
          subjects.updatedAt
        FROM subjects
        JOIN rating_tasks ON rating_tasks.subjectId = subjects.id
+       JOIN projects ON projects.id = rating_tasks.projectId
        WHERE subjects.deletionRequestedAt IS NULL
+         AND projects.tasksLocked = false
+         AND projects.deletionRequestedAt IS NULL
          AND rating_tasks.taskVersion = ?
          AND rating_tasks.scorer = ?
          AND rating_tasks.status IN ('assigned', 'completed')
@@ -6401,6 +6635,58 @@ async function bulkInsertRatingTaskItems(itemRows) {
   return (await db.prepare(sql).run(...params)).changes;
 }
 
+async function writeGeneratedTaskGroup(projectId, phase, taskRows, groupNumber) {
+  const startedAt = performance.now();
+  try {
+    await beginTaskWriteTransaction();
+    const transactionStartedAt = performance.now();
+    let inserted = 0;
+    let itemCount = 0;
+    let taskInsertMs = 0;
+    let itemInsertMs = 0;
+    let statementCount = 0;
+    for (let start = 0; start < taskRows.length; start += TASK_WRITE_BATCH_SIZE) {
+      const batch = taskRows.slice(start, start + TASK_WRITE_BATCH_SIZE);
+      const itemRows = batch.flatMap((task) => task.items);
+      const taskStartedAt = performance.now();
+      const result = await bulkInsertRatingTasks(batch);
+      taskInsertMs += performance.now() - taskStartedAt;
+      if (result !== batch.length) {
+        throw httpError(409, "任务在生成过程中发生变化，请核对实际任务后重试");
+      }
+      const itemsStartedAt = performance.now();
+      await bulkInsertRatingTaskItems(itemRows);
+      itemInsertMs += performance.now() - itemsStartedAt;
+      inserted += result;
+      itemCount += itemRows.length;
+      statementCount += 1;
+    }
+    const commitStartedAt = performance.now();
+    await db.exec("COMMIT");
+    const committedAt = performance.now();
+    console.info(JSON.stringify({
+      event: "task_generation_write_group",
+      projectId,
+      phase,
+      groupNumber,
+      tasks: taskRows.length,
+      items: itemCount,
+      statements: statementCount,
+      transactionMs: Math.round(transactionStartedAt - startedAt),
+      taskInsertMs: Math.round(taskInsertMs),
+      itemInsertMs: Math.round(itemInsertMs),
+      commitMs: Math.round(committedAt - commitStartedAt),
+      totalMs: Math.round(committedAt - startedAt),
+    }));
+    return inserted;
+  } catch (error) {
+    try {
+      await db.exec("ROLLBACK");
+    } catch {}
+    throw error;
+  }
+}
+
 async function loadTaskRecordsForBacktest(taskIds) {
   if (!taskIds.length) return [];
   const taskRows = [];
@@ -6948,12 +7234,6 @@ const adminDashboardService = createAdminDashboardService({
   selectTeamByIdStmt,
 });
 const {
-  listAdminDashboard,
-  getDashboardStats,
-  getDashboardProjectSection,
-  getDashboardCharts,
-  getDashboardAverageDuration,
-  getDashboardWorkloadSection,
   exportCompletedTasks,
   exportScorerTaskSummary,
   exportTeamTaskSummary,
@@ -6976,17 +7256,56 @@ const adminScoringService = createAdminScoringService({
   recordTaskStatsEvents,
 });
 const {
-  listScoringSummary,
-  listScoringTaskRecords,
-  listScoringOptions,
   writeScoringOperationsExport,
   writeScoringRiskReport,
   invalidateSummaryCache,
-  previewRollback,
-  startRollbackJob,
-  getRollbackJob,
-  rollbackJobDto,
 } = adminScoringService;
+
+const adminThumbnailService = createAdminThumbnailService({
+  db,
+  httpError,
+  nowIso,
+});
+function getBackgroundActivity() {
+  const tasks = [];
+  for (const job of taskGenerationJobs.values()) {
+    if (!["queued", "running"].includes(job.status)) continue;
+    tasks.push({
+      type: "task-generation",
+      label: "任务下发",
+      detail: job.stage || "正在生成任务",
+      progress: Number(job.progress || 0),
+    });
+  }
+  for (const job of adminExportJobs.values()) {
+    if (!["queued", "running"].includes(job.status)) continue;
+    tasks.push({
+      type: "admin-export",
+      label: "管理端导出",
+      detail: job.stage || "正在导出",
+      progress: Number(job.progress || 0),
+    });
+  }
+  for (const job of importJobs.values()) {
+    if (["completed", "failed", "awaiting_json"].includes(job.status)) continue;
+    tasks.push({
+      type: "image-import",
+      label: "图片导入",
+      detail: job.stage || job.status || "正在导入",
+      progress: Number(job.progress || 0),
+    });
+  }
+  return tasks;
+}
+
+const adminSystemService = createAdminSystemService({
+  db,
+  uploadDir,
+  nowIso,
+  apiActivity,
+  getBackgroundActivity,
+});
+const adminLogService = createAdminLogService({ logDir });
 
 async function hydrateTaskListRows(rows) {
   const taskIds = rows.map((row) => row.id);
@@ -6997,7 +7316,7 @@ async function hydrateTaskListRows(rows) {
     const itemRows = await db
       .prepare(
         `
-      SELECT taskId, imageId, position
+      SELECT taskId, imageId, position, role
       FROM rating_task_items
       WHERE taskId IN (${taskIdPlaceholders})
       ORDER BY taskId ASC, position ASC
@@ -7028,6 +7347,7 @@ async function hydrateTaskListRows(rows) {
       const currentItems = itemsByTaskId.get(item.taskId) || [];
       currentItems.push({
         position: item.position,
+        role: item.role || "target",
         image,
       });
       itemsByTaskId.set(item.taskId, currentItems);
@@ -7631,6 +7951,12 @@ async function buildScorerTaskFilter(query = {}) {
   } else {
     clauses.push("rating_tasks.status IN ('assigned', 'completed')");
   }
+  clauses.push(`EXISTS (
+    SELECT 1 FROM projects
+    WHERE projects.id = rating_tasks.projectId
+      AND projects.tasksLocked = false
+      AND projects.deletionRequestedAt IS NULL
+  )`);
   if (projectId) {
     clauses.push("rating_tasks.projectId = ?");
     params.push(projectId);
@@ -7761,6 +8087,7 @@ async function assignedTaskOptions(query = {}) {
       AND scorer_task_stats.projectId <> ''
       AND (scorer_task_stats.assigned + scorer_task_stats.completed) > 0
       AND projects.deletionRequestedAt IS NULL
+      AND projects.tasksLocked = false
     ORDER BY projects.createdAt DESC, projects.id ASC
   `).all(taskVersion, scorer);
   return {
@@ -7873,6 +8200,7 @@ async function getTaskDetail(
   if (scorer && task.scorer !== scorer) {
     throw httpError(403, "无权查看该任务");
   }
+  if (scorer) await assertProjectTasksUnlocked(task.projectId || task.subjectId);
   if (scorer && !["assigned", "completed"].includes(task.status)) {
     throw httpError(403, "当前任务不可查看");
   }
@@ -7917,6 +8245,14 @@ async function getScorerDashboard(query = {}) {
     expiresAt: Date.now() + scorerDashboardCacheTtlMs,
   });
   return value;
+}
+
+async function assertProjectTasksUnlocked(projectId) {
+  const project = await selectProjectByIdStmt.get(projectId);
+  if (!project || project.tasksLocked) {
+    throw httpError(423, "该项目任务已锁定，请等待管理员开放", "PROJECT_TASKS_LOCKED");
+  }
+  return project;
 }
 
 function parseTaskExcludedImageIds(value, taskImageIds, taskType) {
@@ -8150,6 +8486,7 @@ async function claimTaskForScorer(taskId, scorer, requestedClaimToken = null) {
     if (result.changes !== 1) {
       const current = await selectTaskByIdStmt.get(taskId);
       if (current?.status === "assigned" && current.scorer === scorer) {
+        await assertProjectTasksUnlocked(current.projectId || current.subjectId);
         await db.exec("COMMIT");
         return current;
       }
@@ -8186,6 +8523,7 @@ async function completeAssignedTask(taskId, body = {}) {
   const task = await selectTaskByIdStmt.get(taskId);
   timer.mark("selectTask");
   if (!task) throw httpError(404, "任务不存在");
+  await assertProjectTasksUnlocked(task.projectId || task.subjectId);
   if (task.status === "completed") {
     if (task.scorer === scorer) {
       const completedTask = completedTaskResultDto(task);
@@ -8364,6 +8702,7 @@ async function updateCompletedTask(taskId, body = {}) {
   if (!scorer) throw httpError(400, "缺少打分人");
   const task = await selectTaskByIdStmt.get(taskId);
   if (!task) throw httpError(404, "任务不存在");
+  await assertProjectTasksUnlocked(task.projectId || task.subjectId);
   if (task.status !== "completed" || task.scorer !== scorer)
     throw httpError(403, "只能修改已分配给当前打分人的已完成任务");
   if (body.projectId && String(body.projectId) !== (task.projectId || task.subjectId))
@@ -9059,7 +9398,7 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
       const batch = assignedTaskIds.slice(start, start + TASK_ASSIGN_BATCH_SIZE);
       await beginTaskWriteTransaction();
       try {
-        await db.prepare(
+        const result = await db.prepare(
           `UPDATE rating_tasks
            SET status = 'pending',
                scorer = NULL,
@@ -9068,6 +9407,9 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
              AND id IN (${placeholders(batch.length)})
              AND status = 'assigned'`,
         ).run(nowIso(), projectId, ...batch);
+        if (result.changes !== batch.length) {
+          throw httpError(409, "已有任务状态变化，停止自动回滚");
+        }
         await db.exec("COMMIT");
       } catch (error) {
         try {
@@ -9080,11 +9422,15 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
       const batch = taskIds.slice(start, start + TASK_WRITE_BATCH_SIZE);
       await beginTaskWriteTransaction();
       try {
-        await db.prepare(
+        const result = await db.prepare(
           `DELETE FROM rating_tasks
            WHERE projectId = ?
-             AND id IN (${placeholders(batch.length)})`,
+             AND id IN (${placeholders(batch.length)})
+             AND status IN ('pending', 'assigned')`,
         ).run(projectId, ...batch);
+        if (result.changes !== batch.length) {
+          throw httpError(409, "已有任务完成或状态变化，停止自动回滚");
+        }
         await db.exec("COMMIT");
       } catch (error) {
         try {
@@ -9100,8 +9446,10 @@ async function rollbackGeneratedTasks(projectId, taskIds, previousTaskStatus, as
     });
     invalidateTaskSummaryCaches(projectId);
     invalidateScorerQueryCaches();
+    return true;
   } catch (cleanupError) {
     console.error(`Failed to roll back generated tasks for ${projectId}`, cleanupError);
+    return false;
   }
 }
 
@@ -9263,6 +9611,7 @@ async function generateExactSubjectTasks(projectId, assignment, onProgress) {
   const previousTaskStatus = project.taskStatus;
   const generatedTaskIds = [];
   const assignedTaskIds = [];
+  let finalizationStarted = false;
 
   try {
     onProgress?.({ stage: "正在读取精确分配清单", progress: 1 });
@@ -9310,25 +9659,13 @@ async function generateExactSubjectTasks(projectId, assignment, onProgress) {
     const pendingTaskRows = taskRows.filter((task) => existingById.has(task.id));
     let createdCount = 0;
     onProgress?.({ stage: "正在按清单创建并分配任务", progress: 15 });
-    for (let start = 0; start < taskRowsToCreate.length; start += TASK_WRITE_BATCH_SIZE) {
-      const batch = taskRowsToCreate.slice(start, start + TASK_WRITE_BATCH_SIZE);
-      const itemRows = batch.flatMap((task) => task.items);
-      await beginTaskWriteTransaction();
-      try {
-        const result = await bulkInsertRatingTasks(batch);
-        if (result !== batch.length) {
-          throw httpError(409, "任务在生成过程中发生变化，请重新发起");
-        }
-        await bulkInsertRatingTaskItems(itemRows);
-        await db.exec("COMMIT");
-        createdCount += result;
-        generatedTaskIds.push(...batch.map((task) => task.id));
-      } catch (error) {
-        try {
-          await db.exec("ROLLBACK");
-        } catch {}
-        throw error;
-      }
+    for (let start = 0; start < taskRowsToCreate.length; start += TASK_WRITE_TRANSACTION_SIZE) {
+      const batch = taskRowsToCreate.slice(start, start + TASK_WRITE_TRANSACTION_SIZE);
+      const result = await writeGeneratedTaskGroup(
+        projectId, "exact", batch, Math.floor(start / TASK_WRITE_TRANSACTION_SIZE) + 1,
+      );
+      createdCount += result;
+      generatedTaskIds.push(...batch.map((task) => task.id));
       const processed = start + batch.length;
       onProgress?.({
         stage: "正在按清单创建并分配任务",
@@ -9352,23 +9689,14 @@ async function generateExactSubjectTasks(projectId, assignment, onProgress) {
     }
 
     onProgress?.({ stage: "正在更新项目统计", progress: 94 });
+    finalizationStarted = true;
     await syncProjectTeams(projectId, assignment.teamIds, nowIso());
     await updateSubjectTaskStatusStmt.run({
       id: projectId,
       taskStatus: "scoring",
       updatedAt: nowIso(),
     });
-    await db.exec("BEGIN");
-    try {
-      await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-      await refreshProjectTaskStats(projectId);
-      await db.exec("COMMIT");
-    } catch (error) {
-      try {
-        await db.exec("ROLLBACK");
-      } catch {}
-      throw error;
-    }
+    await refreshGeneratedProjectTaskStats(projectId);
     invalidateTaskSummaryCaches(projectId);
     invalidateScorerQueryCaches();
     const updatedProject = await selectProjectByIdStmt.get(projectId);
@@ -9388,7 +9716,18 @@ async function generateExactSubjectTasks(projectId, assignment, onProgress) {
       taskVersion,
     };
   } catch (error) {
-    await rollbackGeneratedTasks(projectId, generatedTaskIds, previousTaskStatus, assignedTaskIds);
+    if (finalizationStarted) {
+      error.needsReconciliation = true;
+      error.message = `任务已下发，收尾失败；请核对实际任务和统计后再处理：${error.message}`;
+    } else {
+      const rolledBack = await rollbackGeneratedTasks(
+        projectId, generatedTaskIds, previousTaskStatus, assignedTaskIds,
+      );
+      if (!rolledBack) {
+        error.needsReconciliation = true;
+        error.message = `任务生成中断且自动回滚未完成；请核对实际任务后再处理：${error.message}`;
+      }
+    }
     throw error;
   }
 }
@@ -9409,6 +9748,7 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
   const previousTaskStatus = project.taskStatus;
   const generatedTaskIds = [];
   const assignedTaskIds = [];
+  let finalizationStarted = false;
 
   try {
     let createdCount = 0;
@@ -9460,8 +9800,8 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       progress: templates.length ? 5 : 70,
     });
 
-    for (let start = 0; start < templates.length; start += TASK_WRITE_BATCH_SIZE) {
-      const batch = templates.slice(start, start + TASK_WRITE_BATCH_SIZE);
+    for (let start = 0; start < templates.length; start += TASK_WRITE_TRANSACTION_SIZE) {
+      const batch = templates.slice(start, start + TASK_WRITE_TRANSACTION_SIZE);
       const taskRows = batch.map((template, index) =>
         buildGeneratedTaskRecord(
           projectId,
@@ -9469,22 +9809,12 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
           createdAssigneePlan[start + index] || null,
         ),
       );
-      const itemRows = taskRows.flatMap((task) => task.items);
       taskRows.forEach((task) => rememberBaseTask(task, task.scorer));
-
-      await beginTaskWriteTransaction();
-      try {
-        const result = await bulkInsertRatingTasks(taskRows);
-        await bulkInsertRatingTaskItems(itemRows);
-        await db.exec("COMMIT");
-        createdCount += result;
-        generatedTaskIds.push(...taskRows.map((task) => task.id));
-      } catch (error) {
-        try {
-          await db.exec("ROLLBACK");
-        } catch {}
-        throw error;
-      }
+      const result = await writeGeneratedTaskGroup(
+        projectId, "base", taskRows, Math.floor(start / TASK_WRITE_TRANSACTION_SIZE) + 1,
+      );
+      createdCount += result;
+      generatedTaskIds.push(...taskRows.map((task) => task.id));
 
       onProgress?.({
         stage: "正在生成并分配基础任务",
@@ -9518,23 +9848,13 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
         baseTasksByScorer,
         projectId,
       );
-      for (let start = 0; start < backtestTaskRows.length; start += TASK_WRITE_BATCH_SIZE) {
-        const batch = backtestTaskRows.slice(start, start + TASK_WRITE_BATCH_SIZE);
-        const itemRows = batch.flatMap((task) => task.items);
-
-        await beginTaskWriteTransaction();
-        try {
-          const result = await bulkInsertRatingTasks(batch);
-          await bulkInsertRatingTaskItems(itemRows);
-          await db.exec("COMMIT");
-          backtestCreatedCount += result;
-          generatedTaskIds.push(...batch.map((task) => task.id));
-        } catch (error) {
-          try {
-            await db.exec("ROLLBACK");
-          } catch {}
-          throw error;
-        }
+      for (let start = 0; start < backtestTaskRows.length; start += TASK_WRITE_TRANSACTION_SIZE) {
+        const batch = backtestTaskRows.slice(start, start + TASK_WRITE_TRANSACTION_SIZE);
+        const result = await writeGeneratedTaskGroup(
+          projectId, "backtest", batch, Math.floor(start / TASK_WRITE_TRANSACTION_SIZE) + 1,
+        );
+        backtestCreatedCount += result;
+        generatedTaskIds.push(...batch.map((task) => task.id));
 
         const processed = start + batch.length;
         onProgress?.({
@@ -9547,23 +9867,15 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       assignedCount += backtestCreatedCount;
     }
 
+    finalizationStarted = true;
+    onProgress?.({ stage: "正在更新项目统计", progress: 98 });
     await syncProjectTeams(projectId, assignment.teamIds, nowIso());
     await updateSubjectTaskStatusStmt.run({
       id: projectId,
       taskStatus: "scoring",
       updatedAt: nowIso(),
     });
-    await db.exec("BEGIN");
-    try {
-      await db.exec("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ");
-      await refreshProjectTaskStats(projectId);
-      await db.exec("COMMIT");
-    } catch (error) {
-      try {
-        await db.exec("ROLLBACK");
-      } catch {}
-      throw error;
-    }
+    await refreshGeneratedProjectTaskStats(projectId);
     invalidateTaskSummaryCaches(projectId);
     const updatedProject = await selectProjectByIdStmt.get(projectId);
     const taskStats = await getProjectTaskStats(projectId);
@@ -9583,7 +9895,18 @@ async function generateSubjectTasks(projectId, assignment, onProgress) {
       taskVersion,
     };
   } catch (error) {
-    await rollbackGeneratedTasks(projectId, generatedTaskIds, previousTaskStatus, assignedTaskIds);
+    if (finalizationStarted) {
+      error.needsReconciliation = true;
+      error.message = `任务已下发，收尾失败；请核对实际任务和统计后再处理：${error.message}`;
+    } else {
+      const rolledBack = await rollbackGeneratedTasks(
+        projectId, generatedTaskIds, previousTaskStatus, assignedTaskIds,
+      );
+      if (!rolledBack) {
+        error.needsReconciliation = true;
+        error.message = `任务生成中断且自动回滚未完成；请核对实际任务后再处理：${error.message}`;
+      }
+    }
     throw error;
   }
 }
@@ -9725,9 +10048,12 @@ async function startPreparedTaskGeneration(subjectId, assignment, project) {
         if (terminalStateReceived) return;
         terminalStateReceived = true;
         invalidateGenerationCaches();
+        if (message.needsReconciliation) {
+          job.expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000).toISOString();
+        }
         await commitJobState({
           status: "failed",
-          stage: failedStage,
+          stage: message.needsReconciliation ? "需要核对实际任务及统计结果" : failedStage,
           message: message.message || "任务导入失败，请重试",
         }, { force: true });
         worker.disconnect();
@@ -9790,7 +10116,8 @@ async function startPreparedTaskGeneration(subjectId, assignment, project) {
 
 async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
   const project = await getProjectOrThrow(subjectId);
-  if (!["task_pending", "scoring"].includes(project.taskStatus)) {
+  if (project.taskStatus === "task_completed" &&
+      (await getTaskGenerationCapacity(subjectId, project)).availableTaskCount === 0) {
     throw httpError(409, "当前项目已完成任务，不能继续下发");
   }
   const assignment = await parseTaskGenerationAssignees(assigneesInput);
@@ -9800,7 +10127,8 @@ async function startSubjectTaskGeneration(subjectId, assigneesInput = {}) {
 async function startExactSubjectTaskGeneration(subjectId, body, file) {
   try {
     const project = await getProjectOrThrow(subjectId);
-    if (!["task_pending", "scoring"].includes(project.taskStatus)) {
+    if (project.taskStatus === "task_completed" &&
+        (await getTaskGenerationCapacity(subjectId, project)).availableTaskCount === 0) {
       throw httpError(409, "当前项目已完成任务，不能继续下发");
     }
     const assignment = await parseExactTaskGenerationAssignment(body, file);
@@ -9936,50 +10264,23 @@ app.use(
   }),
 );
 
-app.post("/api/auth/login", async (req, res, next) => {
-  try {
-    const user = await loginUser(req.body, { ip: loginRequestIp(req) });
-    const session = await createSession(user);
-    setSessionCookie(res, session.token, session.expiresAt);
-    res.json({ user });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/auth/captcha", async (_req, res, next) => {
-  try {
-    const captcha = await createLoginCaptcha();
-    res.json({ captchaId: captcha.id, image: captcha.image, expiresAt: captcha.expiresAt });
-  } catch (error) {
-    next(error);
-  }
+registerPublicAuthRoutes(app, {
+  loginUser,
+  loginRequestIp,
+  createSession,
+  setSessionCookie,
+  createLoginCaptcha,
 });
 
 app.use("/api", requireAuth);
 
-app.get("/api/auth/session", (req, res) => {
-  res.json({ user: req.auth });
-});
-
-app.post("/api/auth/change-password", async (req, res, next) => {
-  try {
-    const user = await changeOwnPassword(req.auth.id, req.body);
-    res.json({ user });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/auth/logout", async (req, res) => {
-  const token = cookieValue(req.headers.cookie, "image_rating_session");
-  if (token) {
-    const tokenHash = sessionTokenHash(token);
-    await deleteSessionStmt.run(tokenHash);
-    sessionSeenWriteAt.delete(tokenHash);
-  }
-  clearSessionCookie(res);
-  res.status(204).end();
+registerSessionAuthRoutes(app, {
+  changeOwnPassword,
+  cookieValue,
+  sessionTokenHash,
+  deleteSessionStmt,
+  sessionSeenWriteAt,
+  clearSessionCookie,
 });
 
 app.use("/api", requirePasswordChanged);
@@ -9989,412 +10290,50 @@ app.use("/api/import", requireAdmin);
 app.use("/api/scorer", requireScorer);
 app.use("/api/tasks/assigned", requireScorer);
 
-app.post("/api/admin/exports", async (req, res, next) => {
-  try {
-    const job = await startAdminExportJob(req.body);
-    res.status(202).json(adminExportJobDto(job));
-  } catch (error) {
-    next(error);
-  }
+registerAdminExportRoutes(app, {
+  startAdminExportJob,
+  adminExportJobDto,
+  validateAdminExportJobId,
+  adminExportJobs,
+  httpError,
+  attachmentDisposition,
+  exportCompletedTasks,
+  exportScorerTaskSummary,
+  exportTeamTaskSummary,
 });
+registerAdminDashboardRoutes(app, adminDashboardService);
+registerAdminThumbnailRoutes(app, adminThumbnailService);
+registerAdminSystemRoutes(app, { systemService: adminSystemService, logService: adminLogService });
+registerAdminScoringRoutes(app, adminScoringService, { httpError, setShortApiCache });
 
-app.get("/api/admin/exports/:jobId", async (req, res, next) => {
-  try {
-    validateAdminExportJobId(req.params.jobId);
-    const job = adminExportJobs.get(req.params.jobId);
-    if (!job) throw httpError(404, "导出任务不存在或已过期");
-    res.json(adminExportJobDto(job));
-  } catch (error) {
-    next(error);
-  }
-});
+registerAdminAccountRoutes(app, {
+  listScorerUsers,
+  createScorerUser,
+  createScorerUsers,
+  updateScorerUser,
+  listTeams,
+  createTeam,
+  normalizeTeamIds,
+  normalizeTeamMatchMode,
+  listScorersByTeamIds,
+  updateTeam,
+  deleteTeam,
+  deleteScorerUser,
+}, requireAdmin);
 
-app.get("/api/admin/exports/:jobId/download", async (req, res, next) => {
-  try {
-    validateAdminExportJobId(req.params.jobId);
-    const job = adminExportJobs.get(req.params.jobId);
-    if (!job) throw httpError(404, "导出任务不存在或已过期");
-    if (job.status !== "completed") throw httpError(409, "导出文件尚未生成完成");
-    await fs.access(job.filePath);
-    res.setHeader("Content-Type", job.contentType);
-    res.setHeader("Content-Disposition", attachmentDisposition(job.filename));
-    createReadStream(job.filePath).on("error", next).pipe(res);
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard", async (req, res, next) => {
-  try {
-    res.json(await listAdminDashboard(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard/stats", async (req, res, next) => {
-  try {
-    res.json(await getDashboardStats());
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard/project-summary", async (req, res, next) => {
-  try {
-    res.json(await getDashboardProjectSection(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard/charts", async (req, res, next) => {
-  try {
-    res.json(await getDashboardCharts());
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard/average-duration", async (req, res, next) => {
-  try {
-    res.json(await getDashboardAverageDuration());
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/dashboard/workload", async (req, res, next) => {
-  try {
-    res.json(await getDashboardWorkloadSection(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/tasks/completed/export", async (req, res, next) => {
-  try {
-    await exportCompletedTasks(req, res);
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scorers/task-summary/export", async (req, res, next) => {
-  try {
-    await exportScorerTaskSummary(req, res);
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scorers/completed/export", async (req, res, next) => {
-  try {
-    await exportScorerTaskSummary(req, res);
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/teams/task-summary/export", async (req, res, next) => {
-  try {
-    await exportTeamTaskSummary(req, res);
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scoring/summary", async (req, res, next) => {
-  try {
-    res.json(await listScoringSummary(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scoring/options", async (req, res, next) => {
-  try {
-    setShortApiCache(res);
-    res.json(await listScoringOptions());
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scoring/tasks", async (req, res, next) => {
-  try {
-    res.json(await listScoringTaskRecords(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/admin/scoring/rollback/preview", async (req, res, next) => {
-  try {
-    res.json(await previewRollback(req.body));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/admin/scoring/rollback", async (req, res, next) => {
-  try {
-    res.status(202).json(rollbackJobDto(startRollbackJob(req.body, req.auth)));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/admin/scoring/rollback/:jobId", async (req, res, next) => {
-  try {
-    const job = getRollbackJob(req.params.jobId);
-    if (!job) throw httpError(404, "任务回退作业不存在或已过期");
-    res.json(rollbackJobDto(job));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/users/scorers", async (req, res, next) => {
-  try {
-    res.json(await listScorerUsers(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/users/scorers", async (req, res, next) => {
-  try {
-    res.status(201).json({ user: await createScorerUser(req.body) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/users/scorers/batch", async (req, res, next) => {
-  try {
-    res.status(201).json(await createScorerUsers(req.body));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.patch("/api/users/scorers/:id", async (req, res, next) => {
-  try {
-    res.json({ user: await updateScorerUser(req.params.id, req.body) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/teams", requireAdmin, async (req, res, next) => {
-  try {
-    res.json(await listTeams(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/teams", requireAdmin, async (req, res, next) => {
-  try {
-    res.status(201).json({ team: await createTeam(req.body) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/teams/scorers", requireAdmin, async (req, res, next) => {
-  try {
-    const rawTeamIds = String(req.query.teamIds || "")
-      .split(",")
-      .map((item) => item.trim())
-      .filter(Boolean);
-    const teamIds = await normalizeTeamIds(rawTeamIds, {
-      required: true,
-      enabledOnly: true,
-    });
-    const teamMatchMode = normalizeTeamMatchMode(req.query.teamMatchMode);
-    res.json({ users: await listScorersByTeamIds(teamIds, teamMatchMode) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.patch("/api/teams/:id", requireAdmin, async (req, res, next) => {
-  try {
-    res.json({ team: await updateTeam(req.params.id, req.body) });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.delete("/api/teams/:id", requireAdmin, async (req, res, next) => {
-  try {
-    res.json(await deleteTeam(req.params.id));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.delete("/api/users/scorers/:id", async (req, res, next) => {
-  try {
-    res.json(await deleteScorerUser(req.params.id));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/tasks/assigned/options", async (req, res, next) => {
-  try {
-    setShortApiCache(res);
-    res.json(await assignedTaskOptions({
-      scorer: req.auth.username,
-    }));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/tasks/assigned", async (req, res, next) => {
-  try {
-    setShortApiCache(res);
-    res.json(await listAssignedTasks({
-      ...req.query,
-      scorer: req.auth.username,
-    }));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/scorer/dashboard", async (req, res, next) => {
-  try {
-    setShortApiCache(res);
-    res.json(await getScorerDashboard({
-      ...req.query,
-      scorer: req.auth.username,
-    }));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.get("/api/feedbacks", async (req, res, next) => {
-  try {
-    setShortApiCache(res);
-    res.json(await listFeedbacks(req.query));
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post(
-  "/api/feedbacks",
+registerScorerTaskListRoutes(app, { assignedTaskOptions, listAssignedTasks, getScorerDashboard }, setShortApiCache);
+registerFeedbackRoutes(app, { listFeedbacks, createFeedback, addFeedbackMessage, updateFeedbackStatus }, {
   requireScorer,
-  feedbackUpload.array("images", 5),
-  async (req, res, next) => {
-    try {
-      res.status(201).json({
-        feedback: await createFeedback(req.auth, req.body, req.files || []),
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.put("/api/feedbacks/:id/reply", requireAdmin, async (req, res, next) => {
-  try {
-    res.json({
-      feedback: await addFeedbackMessage(req.params.id, req.body, req.auth),
-    });
-  } catch (error) {
-    next(error);
-  }
+  requireAdmin,
+  feedbackUpload,
+  setShortApiCache,
 });
-
-app.post(
-  "/api/feedbacks/:id/messages",
-  requireScorer,
-  async (req, res, next) => {
-    try {
-      res.json({
-        feedback: await addFeedbackMessage(req.params.id, req.body, req.auth),
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.put("/api/feedbacks/:id/status", async (req, res, next) => {
-  try {
-    res.json({
-      feedback: await updateFeedbackStatus(req.params.id, req.body?.status, req.auth),
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post(
-  "/api/tasks/:id/complete",
-  requireScorer,
-  async (req, res, next) => {
-    try {
-      res.json({
-        task: await completeAssignedTask(req.params.id, {
-          ...req.body,
-          scorer: req.auth.username,
-        }),
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.put(
-  "/api/tasks/:id/complete",
-  requireScorer,
-  async (req, res, next) => {
-    try {
-      res.json({
-        task: await updateCompletedTask(req.params.id, {
-          ...req.body,
-          scorer: req.auth.username,
-        }),
-      });
-    } catch (error) {
-      next(error);
-    }
-  },
-);
-
-app.get("/api/tasks/:id", requireScorer, async (req, res, next) => {
-  try {
-    res.json({
-      task: await getTaskDetail(req.params.id, {
-        scorer: req.auth.username,
-        claimToken: req.query.claimToken,
-      }),
-    });
-  } catch (error) {
-    next(error);
-  }
-});
-
-app.post("/api/tasks/:id/release", requireScorer, async (req, res, next) => {
-  try {
-    res.json(await releaseTaskClaim(
-      req.params.id,
-      req.auth.username,
-      req.body?.claimToken,
-    ));
-  } catch (error) {
-    next(error);
-  }
-});
+registerScorerTaskDetailRoutes(app, {
+  completeAssignedTask,
+  updateCompletedTask,
+  getTaskDetail,
+  releaseTaskClaim,
+}, requireScorer);
 
 app.get("/api/subjects", async (req, res, next) => {
   try {
@@ -10416,6 +10355,7 @@ app.get("/api/projects/:id", async (req, res, next) => {
   try {
     const project = await getProjectOrThrow(req.params.id);
     if (req.auth.role !== "admin") {
+      if (project.tasksLocked) throw httpError(403, "该项目任务尚未开放");
       const allowed = await db.prepare(
         `SELECT 1 FROM rating_tasks
          WHERE projectId = ? AND scorer = ?
@@ -10441,6 +10381,16 @@ app.post("/api/projects", requireAdmin, async (req, res, next) => {
 app.patch("/api/projects/:id", requireAdmin, async (req, res, next) => {
   try {
     res.json({ project: await updateProject(req.params.id, req.body) });
+  } catch (error) {
+    next(error);
+  }
+});
+
+app.patch("/api/projects/:id/task-lock", requireAdmin, async (req, res, next) => {
+  try {
+    res.json({
+      project: await updateProjectTaskLock(req.params.id, req.body?.locked),
+    });
   } catch (error) {
     next(error);
   }
@@ -11181,7 +11131,6 @@ app.use((error, req, res, _next) => {
   const timedOut = error?.code === "57014" || error?.cause?.code === "57014";
   const poolQueueTimedOut = error?.message === "timeout exceeded when trying to connect";
   let status = timedOut || poolQueueTimedOut ? 503 : error.status || 500;
-  if (status >= 500) console.error(error);
   let message = timedOut
     ? "查询执行超时，请稍后重试"
     : poolQueueTimedOut
@@ -11208,24 +11157,42 @@ app.use((error, req, res, _next) => {
   if (error.retryAfterSeconds != null) {
     res.setHeader("Retry-After", String(error.retryAfterSeconds));
   }
+  if (status >= 500) {
+    operationalLogger.error({
+      kind: "api-error",
+      message,
+      code,
+      status,
+      api: requestLogMetadata(req),
+      metadata: {
+        timedOut,
+        poolQueueTimedOut,
+      },
+    }, error);
+  }
   res.status(status).json({ message, code });
 });
 
-if (!isTaskGenerationWorker) {
-  const queuedSubjects = await db
-    .prepare("SELECT id FROM subjects WHERE deletionRequestedAt IS NOT NULL")
-    .all();
-  for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
+export async function runStartupMaintenance() {
+  if (isTaskGenerationWorker) return;
+  startupState.status = "maintaining";
+  startupState.error = null;
+  console.info("API startup maintenance started");
+  try {
+    const queuedSubjects = await db
+      .prepare("SELECT id FROM subjects WHERE deletionRequestedAt IS NOT NULL")
+      .all();
+    for (const subject of queuedSubjects) queueSubjectDeletion(subject.id);
 
-  const startupNow = nowIso();
-  await deleteExpiredSessionsStmt.run(startupNow);
-  await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
-  await deleteExpiredCaptchaChallengesStmt.run(startupNow);
-  await deleteExpiredImportJobsStmt.run(startupNow);
-  await deleteExpiredTaskGenerationJobsStmt.run(startupNow);
-  await sweepResumableUploadSessions();
-  await db.prepare(
-    `UPDATE import_jobs
+    const startupNow = nowIso();
+    await deleteExpiredSessionsStmt.run(startupNow);
+    await deleteExpiredAuthLoginAttemptsStmt.run(authCutoff(startupNow, 24 * 60 * 60 * 1000));
+    await deleteExpiredCaptchaChallengesStmt.run(startupNow);
+    await deleteExpiredImportJobsStmt.run(startupNow);
+    await deleteExpiredTaskGenerationJobsStmt.run(startupNow);
+    await sweepResumableUploadSessions();
+    await db.prepare(
+      `UPDATE import_jobs
      SET status = CASE
            WHEN metadata LIKE '%"pendingJson":true%' THEN 'awaiting_json'
            ELSE 'failed'
@@ -11240,13 +11207,25 @@ if (!isTaskGenerationWorker) {
          END,
          updatedAt = @updatedAt
      WHERE status IN ('queued', 'merging', 'importing')`,
-  ).run({ updatedAt: startupNow });
-  await failInterruptedTaskGenerationJobsStmt.run({ updatedAt: startupNow });
-  await sweepPendingJsonImports();
-  queueSubjectTaskTemplateStatsBackfill();
-  queueProjectTaskBaseStatsBackfill();
-  startTaskStatsWorkers();
+      ).run({ updatedAt: startupNow });
+    await failInterruptedTaskGenerationJobsStmt.run({ updatedAt: startupNow });
+    await sweepPendingJsonImports();
+    queueSubjectTaskTemplateStatsBackfill();
+    queueProjectTaskBaseStatsBackfill();
+    startTaskStatsWorkers();
+    const completedProjects = await db.prepare(
+      "SELECT id FROM projects WHERE taskStatus = 'task_completed' AND deletionRequestedAt IS NULL",
+    ).all();
+    completedProjects.forEach((project) => queueProjectTaskSummary(project.id));
+    startupState.status = "ready";
+    startupState.completedAt = new Date().toISOString();
+    console.info("API startup maintenance completed");
+  } catch (error) {
+    startupState.status = "degraded";
+    startupState.error = error?.message || String(error);
+    console.error("API startup maintenance failed; API remains available for diagnosis", error);
+  }
 }
 
-export { generateSubjectTasks, importZipArchive };
+export { generateSubjectTasks, importZipArchive, startupState };
 export default app;

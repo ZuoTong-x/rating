@@ -36,6 +36,7 @@ process.on("message", async (message) => {
     await sendParentMessage({
       type: "failed",
       message: error?.message || "任务生成失败",
+      needsReconciliation: Boolean(error?.needsReconciliation),
     });
     setImmediate(() => process.exit(1));
   }

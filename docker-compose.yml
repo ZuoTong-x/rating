@@ -24,6 +24,7 @@ services:
     restart: unless-stopped
     environment:
       PORT: ${PORT:-3000}
+      RUN_SCHEMA_INIT: "0"
       DATABASE_URL: ${DATABASE_URL:-postgresql://image_rating:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-image_rating}}
       UPLOAD_DIR: /app/uploads
       COOKIE_SECURE: ${COOKIE_SECURE:-false}
@@ -36,13 +37,18 @@ services:
       MAX_IMAGE_UNCOMPRESSED_BYTES: ${MAX_IMAGE_UNCOMPRESSED_BYTES:-}
       MAX_CHUNK_COUNT: ${MAX_CHUNK_COUNT:-}
       IMAGE_IMPORT_CONCURRENCY: ${IMAGE_IMPORT_CONCURRENCY:-}
+      IMPORT_DB_BATCH_SIZE: ${IMPORT_DB_BATCH_SIZE:-1000}
+      IMPORT_DB_ITEM_BATCH_SIZE: ${IMPORT_DB_ITEM_BATCH_SIZE:-5000}
       IMAGE_THUMBNAIL_SIZE: ${IMAGE_THUMBNAIL_SIZE:-}
       IMAGE_THUMBNAIL_QUALITY: ${IMAGE_THUMBNAIL_QUALITY:-}
       IMAGE_THUMBNAIL_EFFORT: ${IMAGE_THUMBNAIL_EFFORT:-}
+      THUMBNAIL_PROCESS_TIMEOUT_SECONDS: ${THUMBNAIL_PROCESS_TIMEOUT_SECONDS:-300}
       PG_POOL_MAX: ${PG_POOL_MAX:-24}
       PG_TASK_GENERATION_POOL_MAX: ${PG_TASK_GENERATION_POOL_MAX:-4}
       PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-60000}
       PG_LOCK_TIMEOUT_MS: ${PG_LOCK_TIMEOUT_MS:-2000}
+      TASK_WRITE_BATCH_SIZE: ${TASK_WRITE_BATCH_SIZE:-1000}
+      TASK_WRITE_TRANSACTION_SIZE: ${TASK_WRITE_TRANSACTION_SIZE:-1000}
       TASK_STATS_EVENT_FLUSH_INTERVAL_MS: ${TASK_STATS_EVENT_FLUSH_INTERVAL_MS:-2000}
       TASK_STATS_EVENT_SCAN_BATCH_SIZE: ${TASK_STATS_EVENT_SCAN_BATCH_SIZE:-20000}
       TASK_STATS_EVENT_INSERT_BATCH_SIZE: ${TASK_STATS_EVENT_INSERT_BATCH_SIZE:-500}
@@ -50,9 +56,33 @@ services:
       TASK_STATS_EVENT_CLEANUP_INTERVAL_MS: ${TASK_STATS_EVENT_CLEANUP_INTERVAL_MS:-3600000}
       COMPLETE_TASK_SLOW_LOG_MS: ${COMPLETE_TASK_SLOW_LOG_MS:-1000}
       TASK_CLAIM_LEASE_MS: ${TASK_CLAIM_LEASE_MS:-1800000}
+      LOG_DIR: /app/logs
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
     volumes:
       - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/uploads:/app/uploads
       - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/inbox:/app/inbox
+      - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/logs:/app/logs
+    depends_on:
+      schema-migrate:
+        condition: service_completed_successfully
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:3000/readyz"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  schema-migrate:
+    build:
+      context: .
+      dockerfile: server/Dockerfile
+    command: ["npm", "run", "migrate:schema"]
+    restart: "no"
+    environment:
+      DATABASE_URL: ${DATABASE_URL:-postgresql://image_rating:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-image_rating}}
+      RUN_SCHEMA_INIT: "0"
+      PG_STATEMENT_TIMEOUT_MS: ${PG_SCHEMA_STATEMENT_TIMEOUT_MS:-600000}
+      PG_LOCK_TIMEOUT_MS: ${PG_SCHEMA_LOCK_TIMEOUT_MS:-30000}
     depends_on:
       postgres:
         condition: service_healthy
@@ -71,19 +101,28 @@ services:
       IMAGE_THUMBNAIL_EFFORT: ${IMAGE_THUMBNAIL_EFFORT:-}
       THUMBNAIL_WORKER: "1"
       THUMBNAIL_WORKER_CONCURRENCY: ${THUMBNAIL_WORKER_CONCURRENCY:-2}
+      THUMBNAIL_WORKER_MAX_CONCURRENCY: ${THUMBNAIL_WORKER_MAX_CONCURRENCY:-16}
       THUMBNAIL_MAX_ATTEMPTS: ${THUMBNAIL_MAX_ATTEMPTS:-5}
       THUMBNAIL_JOB_LEASE_MS: ${THUMBNAIL_JOB_LEASE_MS:-1800000}
+      THUMBNAIL_PROCESS_TIMEOUT_SECONDS: ${THUMBNAIL_PROCESS_TIMEOUT_SECONDS:-300}
+      THUMBNAIL_PROCESS_TIMEOUT_MS: ${THUMBNAIL_PROCESS_TIMEOUT_MS:-360000}
       THUMBNAIL_RETRY_BASE_MS: ${THUMBNAIL_RETRY_BASE_MS:-5000}
       THUMBNAIL_POLL_MS: ${THUMBNAIL_POLL_MS:-2000}
       THUMBNAIL_QUEUE_REPAIR_INTERVAL_MS: ${THUMBNAIL_QUEUE_REPAIR_INTERVAL_MS:-30000}
+      THUMBNAIL_QUEUE_REPAIR_SCAN_BATCH_SIZE: ${THUMBNAIL_QUEUE_REPAIR_SCAN_BATCH_SIZE:-2000}
+      THUMBNAIL_PRIORITY_EMPTY_RETRY_MS: ${THUMBNAIL_PRIORITY_EMPTY_RETRY_MS:-60000}
+      THUMBNAIL_SETTINGS_REFRESH_INTERVAL_MS: ${THUMBNAIL_SETTINGS_REFRESH_INTERVAL_MS:-5000}
       THUMBNAIL_WORKER_PG_POOL_MAX: ${THUMBNAIL_WORKER_PG_POOL_MAX:-4}
       PG_STATEMENT_TIMEOUT_MS: ${PG_STATEMENT_TIMEOUT_MS:-60000}
       PG_LOCK_TIMEOUT_MS: ${PG_LOCK_TIMEOUT_MS:-2000}
+      LOG_DIR: /app/logs
+      LOG_RETENTION_DAYS: ${LOG_RETENTION_DAYS:-14}
     volumes:
       - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/uploads:/app/uploads
+      - ${RATING_DATA_DIR:-/data/sunwenxiu/rating}/logs:/app/logs
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
 
   image-files:
     build:
@@ -107,7 +146,7 @@ services:
       - "${WEB_PORT:-8080}:80"
     depends_on:
       api:
-        condition: service_started
+        condition: service_healthy
       image-files:
         condition: service_healthy
       postgres:

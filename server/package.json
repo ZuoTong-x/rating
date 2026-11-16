@@ -2,12 +2,14 @@
   "name": "image-rating-api",
   "type": "module",
   "scripts": {
-    "start": "node src/index.js",
-    "dev": "node --watch src/index.js",
-    "import:local": "node src/import-local.js",
-    "thumbnails:backfill": "node src/backfill-thumbnails.js",
-    "thumbnails:worker": "node src/thumbnail-worker.js",
-    "migrate:sqlite": "node src/migrate-sqlite-to-postgres.js"
+    "start": "DOTENV_CONFIG_PATH=../.env node src/index.js",
+    "dev": "DOTENV_CONFIG_PATH=../.env node --watch src/index.js",
+    "migrate:schema": "DOTENV_CONFIG_PATH=../.env RUN_SCHEMA_INIT=0 node src/migrate-schema.js",
+    "test": "node --test test/*.test.js",
+    "import:local": "DOTENV_CONFIG_PATH=../.env node src/import-local.js",
+    "thumbnails:backfill": "DOTENV_CONFIG_PATH=../.env node src/backfill-thumbnails.js",
+    "thumbnails:worker": "DOTENV_CONFIG_PATH=../.env node src/thumbnail-worker.js",
+    "migrate:sqlite": "DOTENV_CONFIG_PATH=../.env node src/migrate-sqlite-to-postgres.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",

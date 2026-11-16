@@ -13,3 +13,7 @@ release/
 .ssh/
 codexWork
 tools
+__pycache__/
+*.py[cod]
+.DS_Store
+outputs/

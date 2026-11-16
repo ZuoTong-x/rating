@@ -457,7 +457,7 @@ PATCH /api/import/uploads/:uploadId
 GET /api/import/uploads/:uploadId/status
         │
         ▼
-合并 ZIP、解压图片、生成缩略图、校验 JSON、写入数据库
+合并 ZIP、解压图片、校验 JSON、写入数据库并创建缩略图后台任务
 ```
 
 前端实现位于 `client/src/services/images.ts`，主要特性：
@@ -476,7 +476,7 @@ GET /api/import/uploads/:uploadId/status
 3. 读取 ZIP 根目录中的 `tasks.json` 或 `task.json`。
 4. 清理相对路径并处理中文文件名。
 5. 解压图片并保存到图包目录。
-6. 为图片生成 WebP 缩略图。
+6. 为图片创建异步缩略图任务；导入完成不等待缩略图生成。
 7. 通过路径优先、文件名兜底匹配 manifest。
 8. 校验任务 ID、评分维度、图片引用、图片角色和重复任务。
 9. 开启短数据库事务，批量写入图包、图片、任务模板和模板图片。
@@ -1018,6 +1018,12 @@ informationClarity
 designQuality
 typography
 highInfoAes
+ss_infographic_v2
+sparse_info
+illustration
+photography
+portrait
+poster
 ```
 
 支持的图片角色：
@@ -1337,6 +1343,10 @@ npm --prefix client run build
 | `IMPORT_DB_ITEM_BATCH_SIZE` | 模板图片写入批量大小 | `5000` |
 | `IMAGE_THUMBNAIL_SIZE` | 缩略图最大边 | `640` |
 | `IMAGE_THUMBNAIL_QUALITY` | WebP 质量 | `76` |
+| `THUMBNAIL_WORKER_MAX_CONCURRENCY` | 单个缩略图 Worker 最大并发 | `16` |
+| `THUMBNAIL_QUEUE_REPAIR_SCAN_BATCH_SIZE` | 每次缩略图队列增量巡检的图片数量 | `2000` |
+| `THUMBNAIL_PRIORITY_EMPTY_RETRY_MS` | 高优先级图包无待处理任务时的复查间隔 | `60000` |
+| `THUMBNAIL_SETTINGS_REFRESH_INTERVAL_MS` | Worker 刷新管理端调度策略的间隔 | `5000` |
 | `AUTH_CAPTCHA_SECRET` | 验证码 HMAC 密钥 | 至少 32 位随机字符串 |
 | `TRUST_PROXY` | 反向代理层数 | 例如 `1` |
 | `COOKIE_SECURE` | 是否只通过 HTTPS 发送 Cookie | `false` |

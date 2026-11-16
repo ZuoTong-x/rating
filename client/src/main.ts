@@ -30,10 +30,12 @@ const router = createRouter({
         { path: 'packages', component: () => import('./views/AdminProjectView.vue') },
         { path: 'projects', component: () => import('./views/AdminProjectsView.vue') },
         { path: 'tasks', component: () => import('./views/AdminTaskManagerView.vue') },
+        { path: 'thumbnails', component: () => import('./views/AdminThumbnailQueueView.vue') },
         { path: 'scoring', component: () => import('./views/AdminScoringView.vue') },
         { path: 'accounts', component: () => import('./views/AdminAccountView.vue') },
         { path: 'teams', component: () => import('./views/AdminTeamsView.vue') },
         { path: 'feedbacks', component: () => import('./views/AdminFeedbackView.vue') },
+        { path: 'logs', component: () => import('./views/AdminOperationalLogsView.vue') },
         { path: 'projects/:subjectId/tasks', component: () => import('./views/AdminTaskView.vue'), alias: 'subjects/:subjectId/tasks' },
         { path: 'packages/:subjectId', component: () => import('./views/AdminSubjectView.vue'), alias: ['subjects/:subjectId', 'projects/:subjectId/images'] }
       ]

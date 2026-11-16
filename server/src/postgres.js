@@ -23,7 +23,7 @@ export const subjectSelectColumns =
      (SELECT COUNT(*) FROM subject_task_templates WHERE subject_task_templates.subjectId = subjects.id)
    ) AS taskTemplateCount`;
 export const projectSelectColumns = `
-  projects.id AS _id, projects.name, projects.icon, projects.packageId, projects.taskStatus,
+  projects.id AS _id, projects.name, projects.icon, projects.packageId, projects.taskStatus, projects.tasksLocked,
   projects.deletionRequestedAt, projects.createdAt, projects.updatedAt, subjects.name AS packageName,
   subjects.originalFilename AS packageFilename, subjects.imageCount, subjects.categoryCount, subjects.status AS packageStatus`;
 export const imageSelectColumns = `id AS _id, subjectId, filename, originalPath, storagePath, thumbnailPath, mimeType, category, directory, isInfographic, prompt, catalogData, importBatch, scorer, ${scoreNumericFields.join(", ")}, ${scoreStateFields.join(", ")}, discomfort, comment, ratedAt, createdAt, updatedAt`;
@@ -42,6 +42,11 @@ const configuredThumbnailWorkerPoolMax = Number.parseInt(
   process.env.THUMBNAIL_WORKER_PG_POOL_MAX || "",
   10,
 );
+const databaseUrl = process.env.DATABASE_URL || (
+  process.env.POSTGRES_DB && process.env.POSTGRES_USER && process.env.POSTGRES_PASSWORD
+    ? `postgresql://${encodeURIComponent(process.env.POSTGRES_USER)}:${encodeURIComponent(process.env.POSTGRES_PASSWORD)}@${process.env.POSTGRES_HOST || "127.0.0.1"}:${process.env.POSTGRES_PORT || "5432"}/${encodeURIComponent(process.env.POSTGRES_DB)}`
+    : undefined
+);
 const defaultStatementTimeout = 60000;
 const configuredStatementTimeout = Number.parseInt(process.env.PG_STATEMENT_TIMEOUT_MS || "", 10);
 const statementTimeout = Number.isInteger(configuredStatementTimeout) && configuredStatementTimeout > 0
@@ -49,7 +54,7 @@ const statementTimeout = Number.isInteger(configuredStatementTimeout) && configu
   : defaultStatementTimeout;
 const lockTimeout = Number.parseInt(process.env.PG_LOCK_TIMEOUT_MS || "2000", 10);
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: databaseUrl,
   max: isTaskGenerationWorker
     ? (
       Number.isInteger(configuredWorkerPoolMax) && configuredWorkerPoolMax > 0
@@ -78,7 +83,7 @@ export function runWithDatabaseContext(callback) {
   return transactionStorage.run({ client: null }, callback);
 }
 
-for (const file of ["app.js", "services/admin-dashboard.js", "services/admin-scoring.js"]) {
+for (const file of ["app.js", "services/admin-dashboard.js", "services/admin-scoring.js", "services/admin-thumbnails.js", "services/admin-system.js", "thumbnail-worker.js"]) {
   try {
     const source = await fs.readFile(new URL(`./${file}`, import.meta.url), "utf8");
     for (const match of source.matchAll(/\b[a-z][A-Za-z0-9]*[A-Z][A-Za-z0-9]*\b/g)) {
@@ -180,9 +185,15 @@ export const db = {
   exec,
 };
 
-if (!isBackgroundWorker) {
+export async function initializeSchema() {
   const schema = await fs.readFile(new URL("./postgres-schema.sql", import.meta.url), "utf8");
   await pool.query(schema);
+}
+
+if (!isBackgroundWorker && process.env.RUN_SCHEMA_INIT !== "0") {
+  console.info("Database schema initialization started");
+  await initializeSchema();
+  console.info("Database schema initialization completed");
 }
 
 export { pool };

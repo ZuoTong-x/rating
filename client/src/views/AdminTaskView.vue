@@ -402,10 +402,15 @@ watch(() => reassignmentForm.source, source => {
 });
 
 function renderTaskImages(task: AdminTaskListItem) {
-  return h('div', { class: 'task-image-strip' }, task.items.map(item => h('div', {
-    class: 'task-image-cell',
+  const items = [...task.items].sort((left, right) => {
+    if (left.role === 'filler' && right.role !== 'filler') return -1;
+    if (left.role !== 'filler' && right.role === 'filler') return 1;
+    return left.position - right.position;
+  });
+  return h('div', { class: 'task-image-strip' }, items.map(item => h('div', {
+    class: ['task-image-cell', { 'is-reference': item.role === 'filler' }],
     key: `${task.id}-${item.position}`,
-    title: item.image.filename
+    title: item.role === 'filler' ? `参考图：${item.image.filename}` : item.image.filename
   }, [
     h('img', {
       class: 'task-thumbnail',
@@ -414,7 +419,9 @@ function renderTaskImages(task: AdminTaskListItem) {
       loading: 'lazy',
       decoding: 'async'
     }),
-    h('span', { class: 'task-thumbnail-position' }, String(item.position + 1))
+    h('span', {
+      class: ['task-thumbnail-position', { 'is-reference': item.role === 'filler' }]
+    }, item.role === 'filler' ? '参考' : String(item.position + 1))
   ])));
 }
 
@@ -583,8 +590,9 @@ onMounted(() => {
         <template v-if="isDetailCorrectnessCriterion">
           <div class="admin-task-detail-correctness-grid">
             <article v-for="{ item, state } in detailCorrectnessItems" :key="item.imageId" class="admin-task-detail-image"
-              :class="`is-${state}`">
+              :class="[`is-${state}`, { 'is-reference': item.role === 'filler' }]">
               <span class="admin-task-detail-state" :class="`is-${state}`">{{ detailCorrectnessStateLabel(state) }}</span>
+              <span v-if="item.role === 'filler'" class="admin-task-detail-reference">参考图</span>
               <n-image :src="item.image.thumbnailUrl || item.image.imageUrl" :preview-src="item.image.imageUrl"
                 :alt="item.image.filename" object-fit="cover" show-toolbar-tooltip />
             </article>
@@ -593,8 +601,9 @@ onMounted(() => {
         <template v-else>
           <div class="admin-task-detail-ranking-flow">
             <template v-for="(item, index) in detailRankedItems" :key="item.imageId">
-              <article class="admin-task-detail-image">
+              <article class="admin-task-detail-image" :class="{ 'is-reference': item.role === 'filler' }">
                 <span class="admin-task-detail-rank">{{ detailRank(detailTask, index) }}</span>
+                <span v-if="item.role === 'filler'" class="admin-task-detail-reference">参考图</span>
                 <n-image :src="item.image.thumbnailUrl || item.image.imageUrl" :preview-src="item.image.imageUrl"
                   :alt="item.image.filename" object-fit="cover" show-toolbar-tooltip />
                 <span :title="item.image.filename">{{ item.image.filename }}</span>

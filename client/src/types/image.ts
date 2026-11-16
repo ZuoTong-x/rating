@@ -87,10 +87,14 @@ export interface ProjectItem {
   categoryCount: number;
   taskTemplateCount: number;
   generatedTaskCount: number;
+  totalTaskCount: number;
+  completedTaskCount: number;
+  assignedTaskCount: number;
   pendingTaskCount: number;
   remainingTemplateCount: number;
   availableTaskCount: number;
   taskStatus: SubjectItem['taskStatus'];
+  tasksLocked: boolean;
   teams: Array<{ id: string; name: string; status?: AvailabilityStatus }>;
   deletionRequestedAt?: string | null;
   createdAt: string;
@@ -136,6 +140,200 @@ export interface ImageQuery {
   includeDetails?: boolean;
 }
 export interface ImagePage { total: number | null; page: number; pageSize: number; items: ImageItem[]; }
+
+export interface ThumbnailQueueSettings {
+  globallyPaused: boolean;
+  daytimeConcurrency: number;
+  nighttimeConcurrency: number;
+  nightStartHour: number;
+  nightEndHour: number;
+  timeZone: string;
+  updatedAt: string | null;
+  updatedBy: string | null;
+  activeSchedule: {
+    globallyPaused: boolean;
+    timeZone: string;
+    localHour: number;
+    isNight: boolean;
+    period: 'day' | 'night';
+    concurrency: number;
+  };
+}
+
+export interface ThumbnailQueueCounts {
+  pending: number;
+  eligiblePending: number;
+  excludedPending: number;
+  processing: number;
+  ready: number;
+  failed: number;
+  total: number;
+  oldestPendingAt: string | null;
+  completedLastFiveMinutes: number;
+  ratePerMinute: number;
+}
+
+export interface ThumbnailPackageCounts {
+  pending: number;
+  processing: number;
+  ready: number;
+  failed: number;
+  total: number;
+}
+
+export interface ThumbnailPackageQueue {
+  subjectId: string;
+  name: string;
+  imageCount: number;
+  generationEnabled: boolean;
+  paused: boolean;
+  priority: number;
+  state: 'disabled' | 'paused' | 'processing' | 'queued' | 'failed' | 'completed';
+  counts: ThumbnailPackageCounts;
+  oldestPendingAt: string | null;
+  completedLastFiveMinutes: number;
+  ratePerMinute: number;
+  estimatedMinutes: number | null;
+  controlUpdatedAt: string | null;
+  controlUpdatedBy: string | null;
+}
+
+export interface ThumbnailQueueOverview {
+  settings: ThumbnailQueueSettings;
+  counts: ThumbnailQueueCounts;
+  packages: ThumbnailPackageQueue[];
+  generatedAt: string;
+}
+
+export interface AdminSystemStatus {
+  status: 'healthy' | 'degraded';
+  hostname: string;
+  platform: string;
+  cpu: {
+    logicalCount: number;
+    effectiveCount: number;
+    systemUsagePercent: number | null;
+    processUsagePercent: number | null;
+    loadAverage1m: number;
+    loadAverage5m: number;
+    loadAverage15m: number;
+    normalizedLoadPercent: number | null;
+  };
+  memory: {
+    source: 'cgroup' | 'host';
+    totalBytes: number;
+    usedBytes: number;
+    availableBytes: number;
+    usagePercent: number | null;
+  };
+  process: {
+    pid: number;
+    uptimeSeconds: number;
+    rssBytes: number;
+    heapUsedBytes: number;
+    heapTotalBytes: number;
+  };
+  systemUptimeSeconds: number;
+  disk: {
+    path: string;
+    totalBytes: number | null;
+    usedBytes: number | null;
+    availableBytes: number | null;
+    usagePercent: number | null;
+    error?: string;
+  };
+  database: {
+    status: 'healthy' | 'unavailable';
+    latencyMs: number | null;
+    error?: string;
+  };
+  congestion: {
+    percent: number | null;
+    level: 'relaxed' | 'moderate' | 'busy' | 'critical' | 'unknown';
+    factors: {
+      cpuPercent: number | null;
+      loadPercent: number | null;
+      memoryPercent: number | null;
+      databasePercent: number | null;
+    };
+  };
+  activity: {
+    windowSeconds: number;
+    activeRequestCount: number;
+    requestCount: number;
+    hotApis: Array<{
+      method: string;
+      path: string;
+      requestCount: number;
+      totalDurationMs: number;
+      averageDurationMs: number;
+      maxDurationMs: number;
+      errorCount: number;
+    }>;
+    activeRequests: Array<{
+      method: string;
+      path: string;
+      durationMs: number;
+    }>;
+    backgroundTasks: Array<{
+      type: string;
+      label: string;
+      detail: string;
+      progress: number;
+    }>;
+  };
+  sampledAt: string;
+}
+
+export interface AdminOperationalLogEntry {
+  id: string;
+  timestamp: string;
+  level: 'warning' | 'error' | 'critical' | string;
+  source: string;
+  kind: string;
+  message: string;
+  code: string | null;
+  status: number | null;
+  api: {
+    requestId?: string | null;
+    method?: string;
+    path?: string;
+    description?: string;
+    actor?: { username?: string; role?: string } | null;
+    params?: Record<string, string>;
+  } | null;
+  metadata: Record<string, unknown> | null;
+  error: {
+    name?: string;
+    message?: string;
+    stack?: string | null;
+    code?: string | null;
+    severity?: string | null;
+    detail?: string | null;
+    hint?: string | null;
+    schema?: string | null;
+    table?: string | null;
+    column?: string | null;
+    constraint?: string | null;
+    file?: string | null;
+    line?: string | null;
+    routine?: string | null;
+  } | null;
+}
+
+export interface AdminOperationalLogPage {
+  entries: AdminOperationalLogEntry[];
+  total: number;
+  page: number;
+  pageSize: number;
+  availableSources: string[];
+  summary: {
+    byLevel: Record<string, number>;
+    bySource: Record<string, number>;
+    byCode: Record<string, number>;
+  };
+  truncated: boolean;
+}
 
 export interface RatingTaskItem {
   imageId: string;
@@ -377,6 +575,7 @@ export interface TaskListImage {
 
 export interface TaskListItemImage {
   position: number;
+  role: RatingTaskItem['role'];
   image: TaskListImage;
 }
 
@@ -516,6 +715,7 @@ export interface AdminDashboard {
     imageCount: number;
     categoryCount: number;
     taskTemplateCount: number;
+    availableTaskCount: number;
     totalTasks: number;
     pendingTaskCount: number;
     unassignedTaskCount: number;

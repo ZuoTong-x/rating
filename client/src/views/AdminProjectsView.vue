@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, h, onMounted, reactive, ref } from 'vue';
-import { NButton, NInput, NProgress, NTag, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
+import { NButton, NInput, NPopover, NProgress, NTag, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { authApi } from '../services/auth';
 import { HttpError } from '../services/http';
@@ -162,7 +162,10 @@ function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : '请求失败';
 }
 
-function taskStatusLabel(status: ProjectItem['taskStatus']) {
+function taskStatusLabel(status: ProjectItem['taskStatus'], row?: ProjectItem) {
+  if (row && row.totalTaskCount > 0 && row.completedTaskCount === row.totalTaskCount && row.availableTaskCount > 0) {
+    return '已下发任务完成';
+  }
   return {
     task_pending: '任务未开始',
     scoring: '打分中',
@@ -170,7 +173,8 @@ function taskStatusLabel(status: ProjectItem['taskStatus']) {
   }[status] || '任务未开始';
 }
 
-function taskStatusType(status: ProjectItem['taskStatus']) {
+function taskStatusType(status: ProjectItem['taskStatus'], row?: ProjectItem) {
+  if (row && row.totalTaskCount > 0 && row.completedTaskCount === row.totalTaskCount) return 'success';
   if (status === 'task_completed') return 'success';
   if (status === 'scoring') return 'warning';
   return 'default';
@@ -745,9 +749,26 @@ function renderStatus(row: ProjectItem) {
       h('div', { class: 'subject-status-text' }, `${taskStage.value[row._id] || '生成任务'} ${percentage}%`)
     ]);
   }
-  return h(NTag, { size: 'small', type: taskStatusType(row.taskStatus) }, {
-    default: () => taskStatusLabel(row.taskStatus)
+  return h(NTag, { size: 'small', type: taskStatusType(row.taskStatus, row) }, {
+    default: () => taskStatusLabel(row.taskStatus, row)
   });
+}
+
+function renderPackages(row: ProjectItem) {
+  const packageNames = row.packages?.map(pkg => pkg.name) || [];
+  if (!packageNames.length) return h('span', { class: 'table-muted' }, row.packageName || '未配置');
+  const visibleTags = packageNames.slice(0, 2).map((name, index) =>
+    h(NTag, { key: index, size: 'small', type: 'info', bordered: false, class: 'project-package-tag' }, {
+      default: () => h('span', { title: name }, name)
+    })
+  );
+  if (packageNames.length > 2) {
+    visibleTags.push(h(NPopover, { trigger: 'hover', placement: 'bottom' }, {
+      trigger: () => h(NTag, { size: 'small', bordered: false }, { default: () => `+${packageNames.length - 2}` }),
+      default: () => h('div', { class: 'project-package-popover' }, packageNames.map(name => h('div', name)))
+    }));
+  }
+  return h('div', { class: 'project-package-tags' }, visibleTags);
 }
 
 function taskActionLabel(row: ProjectItem) {
@@ -762,11 +783,10 @@ const columns: DataTableColumns<ProjectItem> = [
     title: '关联图包',
     key: 'packages',
     minWidth: 220,
-    render: row => h('div', { class: 'account-team-tags' }, row.packages?.length
-      ? row.packages.map(pkg => h(NTag, { size: 'small', type: 'info', bordered: false }, { default: () => pkg.name }))
-      : [h('span', { class: 'table-muted' }, row.packageName || '未配置')])
+    render: renderPackages
   },
   { title: '图片数', key: 'imageCount', width: 90 },
+  { title: '任务数', key: 'totalTaskCount', width: 90 },
   {
     title: '标注团队', key: 'teams', minWidth: 180,
     render: row => h('div', { class: 'account-team-tags' }, row.teams.length
@@ -805,7 +825,7 @@ onMounted(() => void loadData());
         <n-button type="primary" @click="openCreateProject">新建项目</n-button>
       </div>
       <n-data-table v-if="projects.length" :columns="columns" :data="projects" :loading="loading" :bordered="false" remote
-        :scroll-x="1100" />
+        :scroll-x="1250" />
       <div v-else class="empty">{{ loading ? '正在加载...' : '暂无项目，请先在图包管理中上传 ZIP' }}</div>
       <div class="table-shell-footer">
         <n-pagination v-if="projectTotal" :page="projectPage" :page-size="projectPageSize" :item-count="projectTotal"
@@ -821,7 +841,7 @@ onMounted(() => void loadData());
           <n-input v-model:value="projectForm.name" maxlength="120" placeholder="输入项目名称" autofocus />
         </n-form-item>
         <n-form-item label="选择图包">
-          <n-select v-model:value="projectForm.packageIds" multiple filterable :options="packageOptions"
+          <n-select v-model:value="projectForm.packageIds" multiple filterable :max-tag-count="2" :options="packageOptions"
             placeholder="选择一个或多个已处理完成的图包" />
         </n-form-item>
       </n-form>

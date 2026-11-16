@@ -316,15 +316,18 @@ export function createAdminDashboardService({
   async function projectTaskStatusCounts(projectId) {
     const row = await db
       .prepare(
-        `SELECT pending, assigned, completed
+        `SELECT total, pending, assigned, completed, baseTotal, basePending
          FROM project_task_stats
          WHERE projectId = ? AND taskVersion = ?`,
       )
       .get(projectId, taskVersion);
     return {
+      total: Number(row?.total || 0),
       pending: Number(row?.pending || 0),
       assigned: Number(row?.assigned || 0),
       completed: Number(row?.completed || 0),
+      baseTotal: row?.baseTotal == null ? Number(row?.total || 0) : Number(row.baseTotal),
+      basePending: row?.basePending == null ? Number(row?.pending || 0) : Number(row.basePending),
     };
   }
 
@@ -453,15 +456,23 @@ export function createAdminDashboardService({
     ]);
     const totalTasks = statusCounts.pending + statusCounts.assigned + statusCounts.completed;
     const taskSummary = await getDashboardProjectTaskSummary(projectId, packageRows);
+    const taskTemplateCount = packageRows.reduce((total, item) => total + Number(item.taskTemplateCount || 0), 0);
+    const availableTaskCount = statusCounts.basePending + Math.max(taskTemplateCount - statusCounts.baseTotal, 0);
+    const taskStatus = totalTasks === 0
+      ? "task_pending"
+      : statusCounts.pending + statusCounts.assigned > 0 || availableTaskCount > 0
+        ? "scoring"
+        : "task_completed";
 
     return {
       projectId: project.id,
       projectName: project.name,
-      taskStatus: project.taskStatus || "task_pending",
+      taskStatus,
       packageCount: packageRows.length || (project.packageId ? 1 : 0),
       imageCount: packageRows.reduce((total, item) => total + Number(item.imageCount || 0), 0),
       categoryCount: packageRows.reduce((total, item) => total + Number(item.categoryCount || 0), 0),
-      taskTemplateCount: packageRows.reduce((total, item) => total + Number(item.taskTemplateCount || 0), 0),
+      taskTemplateCount,
+      availableTaskCount,
       totalTasks,
       pendingTaskCount: statusCounts.pending + statusCounts.assigned,
       unassignedTaskCount: statusCounts.pending,

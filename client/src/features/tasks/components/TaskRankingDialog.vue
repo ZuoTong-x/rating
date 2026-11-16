@@ -94,6 +94,13 @@ watch(loadingNextTask, active => {
 
 const criterion = computed(() => props.task?.criterion as TaskCriterionKey | undefined);
 const criterionLabel = computed(() => taskCriteria.find(item => item.key === criterion.value)?.label || '综合排序');
+const criterionRuleSuffix: Record<string, string> = {
+  sparse_info: '综合美感，包括整图美感，创意感，艺术字美感，文字/艺术字正确性等。'
+};
+const criterionRuleTitle = computed(() => {
+  const suffix = criterion.value ? criterionRuleSuffix[criterion.value] : '';
+  return suffix ? `${criterionLabel.value}，${suffix}` : criterionLabel.value;
+});
 const isEditing = computed(() => props.task?.status === 'completed');
 const isPromptAlignment = computed(() => criterion.value === 'promptAlignment');
 const isCorrectnessCriterion = computed(() => criterion.value === 'textCorrectness' || criterion.value === 'anatomyNormality');
@@ -101,6 +108,10 @@ const supportsExclusion = computed(() => criterion.value === 'realism' || criter
 const correctButtonLabel = computed(() => criterion.value === 'anatomyNormality' ? '确认肢体正确' : '确认文字正确');
 const excludedIdSet = computed(() => new Set(excludedImageIds.value));
 const correctIdSet = computed(() => new Set(correctImageIds.value));
+const referenceIdSet = computed(() => new Set((props.task?.items || [])
+  .filter(item => item.role === 'filler')
+  .map(item => item.imageId)));
+const hasReferenceImages = computed(() => referenceIdSet.value.size > 0);
 const displayedItems = computed(() => orderedItems.value);
 const excludedItems = computed(() => {
   const task = props.task;
@@ -131,6 +142,7 @@ const detailPrompt = computed(() => {
 
 const commonRulePoint = '所有黄色、暴力、暗黑、阴暗的画风表达，都应该在排序中垫底。';
 const largeImageRulePoint = '请点击查看大图。';
+const referenceRulePoint = '参考图用于说明什么是好看的图。请优先判断待标注图在当前评分维度的美感和质量上是否更接近参考图；如果待标注图明显超过参考图，则谁更好看谁排前面。';
 const rulePoints: Record<string, string[]> = {
   overall: [largeImageRulePoint, '一眼评，不参考其他分数。', commonRulePoint],
   creativity: [largeImageRulePoint, '视觉记忆性、趣味性、视觉冲击力、天马行空的想象力。', commonRulePoint],
@@ -153,10 +165,23 @@ const rulePoints: Record<string, string[]> = {
   informationClarity: [largeImageRulePoint, '信息传达是否突出、明确。', commonRulePoint],
   designQuality: [largeImageRulePoint, '整体布局、视觉系统与设计完成度。', commonRulePoint],
   typography: [largeImageRulePoint, '文字排版、字形选择和信息层级是否协调。', commonRulePoint],
-  highInfoAes: [largeImageRulePoint, '信息密度高但不拥挤，信息层级清晰，图文关系和整体视觉呈现协调。', commonRulePoint]
+  highInfoAes: [largeImageRulePoint, '信息密度高但不拥挤，信息层级清晰，图文关系和整体视觉呈现协调。', commonRulePoint],
+  ss_infographic_v2: [largeImageRulePoint, '综合比较信息图的排版结构、信息层级、文字正确性和整体色调，优先选择信息清晰、层次分明、文字准确且配色协调的图片。'],
+  sparse_info: [largeImageRulePoint, commonRulePoint],
+  illustration: [largeImageRulePoint, '总体看哪张插画更好看，重点看色彩是否协调、创意是否有想象力和视觉冲击力。', commonRulePoint],
+  photography: [largeImageRulePoint, '总体看哪张照片更好看，重点看光影、色彩、真实感和构图。', commonRulePoint],
+  portrait: [largeImageRulePoint, '总体看哪张更好看，重点看人像是否真实自然、光影是否和谐、色彩是否协调。', commonRulePoint],
+  poster: [largeImageRulePoint, '总体看哪张海报更好看，重点看文字是否正确清晰、色彩是否协调、创意是否有记忆点。', commonRulePoint]
 };
 
 const currentRulePoints = computed(() => criterion.value ? rulePoints[criterion.value] : rulePoints.overall);
+const displayedRulePoints = computed(() => {
+  const points = [...currentRulePoints.value];
+  if (!hasReferenceImages.value) return points;
+  const largeImageRuleIndex = points.indexOf(largeImageRulePoint);
+  points.splice(largeImageRuleIndex >= 0 ? largeImageRuleIndex + 1 : 0, 0, referenceRulePoint);
+  return points;
+});
 
 function mergeSavedTask(savedTask: RatingTask, currentTask: RatingTask | null): RatingTask {
   if (!currentTask || currentTask.id !== savedTask.id) return savedTask;
@@ -220,7 +245,11 @@ function resetOrder() {
 
   task.items
     .slice()
-    .sort((left, right) => left.position - right.position)
+    .sort((left, right) => {
+      if (left.role === 'filler' && right.role !== 'filler') return -1;
+      if (left.role !== 'filler' && right.role === 'filler') return 1;
+      return left.position - right.position;
+    })
     .forEach(item => {
       if (!storedExclusions.has(item.imageId) && !used.has(item.imageId)) {
         ordered.push(item);
@@ -572,11 +601,12 @@ async function retryNextTask() {
           :data-image-count="rankingImageCount">
           <template v-for="(item, index) in displayedItems" :key="item.imageId">
             <article class="task-ranking-item"
-              :class="{ 'is-dragging': draggingIndex === index, 'is-correctness': isCorrectnessCriterion, 'is-correct': correctIdSet.has(item.imageId) }"
+              :class="{ 'is-dragging': draggingIndex === index, 'is-correctness': isCorrectnessCriterion, 'is-correct': correctIdSet.has(item.imageId), 'is-reference': item.role === 'filler' }"
               :draggable="true" @dragstart="startDrag(index, $event)"
               @dragenter.prevent="moveItem(index)" @dragover.prevent @drop.prevent="endDrag" @dragend="endDrag"
               @click.stop="openImagePreview(item)">
               <div class="task-ranking-position">{{ isCorrectnessCriterion ? index + 1 : rankAt(index) }}</div>
+              <div v-if="item.role === 'filler'" class="task-ranking-reference-tag">参考图</div>
               <div v-if="isCorrectnessCriterion" class="task-ranking-correctness-actions">
                 <n-button class="task-ranking-confirm-button" type="primary" size="small" block
                   :secondary="!correctIdSet.has(item.imageId)"
@@ -639,10 +669,10 @@ async function retryNextTask() {
         <div class="task-rule-heading-wrap">
           <div class="task-rule-panel-header">
             <strong>评分规则</strong>
-            <n-text depth="3">{{ criterionLabel }}</n-text>
+            <n-text depth="3">{{ criterionRuleTitle }}</n-text>
           </div>
           <div class="task-rule-list">
-            <n-text v-for="point in currentRulePoints" :key="point">
+            <n-text v-for="point in displayedRulePoints" :key="point">
               {{ point }}
             </n-text>
           </div>

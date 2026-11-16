@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "watchId": "v4-20261103-creativity-colors",
+  "automationId": "v4",
+  "planId": "v4-1.6-remaining",
+  "requestedAt": "2026-11-03",
+  "policy": "finish_previous_quotas_first",
+  "backtestRatio": 5,
+  "groups": [
+    {
+      "projectName": "V4_CREATIVITY_1.6",
+      "packages": [
+        "creativity_part_01",
+        "creativity_part_02",
+        "creativity_part_03",
+        "creativity_part_04",
+        "creativity_part_05",
+        "creativity_part_06",
+        "creativity_part_07",
+        "creativity_part_08",
+        "creativity_part_09",
+        "creativity_part_10"
+      ],
+      "queueLog": "/app/inbox/import-logs/queue-20261102_07/queue.log",
+      "hostQueueLog": "/data/sunwenxiu/rating/inbox/import-logs/queue-20261102_07/queue.log",
+      "completionMarker": "QUEUE07_ALL_10_OK",
+      "status": "waiting_for_imports"
+    },
+    {
+      "projectName": "V4_COLORS_1.6",
+      "packages": [
+        "colors_part_01",
+        "colors_part_02",
+        "colors_part_03",
+        "colors_part_04",
+        "colors_part_05",
+        "colors_part_06",
+        "colors_part_07",
+        "colors_part_08",
+        "colors_part_09",
+        "colors_part_10"
+      ],
+      "queueLog": "/app/inbox/import-logs/queue-20261102_08/queue.log",
+      "hostQueueLog": "/data/sunwenxiu/rating/inbox/import-logs/queue-20261102_08/queue.log",
+      "completionMarker": "QUEUE08_ALL_10_OK",
+      "status": "waiting_for_imports"
+    }
+  ]
+}

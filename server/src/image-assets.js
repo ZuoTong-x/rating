@@ -17,6 +17,10 @@ const thumbnailEffort = Math.min(
   6,
   Math.max(0, Number.parseInt(process.env.IMAGE_THUMBNAIL_EFFORT || "0", 10) || 0),
 );
+const thumbnailTimeoutSeconds = Math.min(
+  3600,
+  Math.max(10, Number.parseInt(process.env.THUMBNAIL_PROCESS_TIMEOUT_SECONDS || "300", 10) || 300),
+);
 
 function normalizedStoragePath(storagePath) {
   return String(storagePath || "").replace(/\\/g, "/").replace(/^\/+/, "");
@@ -41,6 +45,7 @@ export async function createThumbnail(sourcePath, targetPath) {
 
   try {
     await sharp(sourcePath, { animated: false })
+      .timeout({ seconds: thumbnailTimeoutSeconds })
       .rotate()
       .resize({
         width: thumbnailMaxSize,

@@ -19,6 +19,12 @@ export const scoreCriteria = [
   { key: "designQuality", label: "整体设计感", group: "信息图类评分追加" },
   { key: "typography", label: "文字设计感", group: "信息图类评分追加" },
   { key: "highInfoAes", label: "高密度信息图美感", group: "信息图类评分追加" },
+  { key: "ss_infographic_v2", label: "高密度信息图", group: "信息图类评分追加" },
+  { key: "sparse_info", label: "中低密度信息图美感", group: "信息图类评分追加" },
+  { key: "illustration", label: "插画", group: "图像类别" },
+  { key: "photography", label: "摄影", group: "图像类别" },
+  { key: "portrait", label: "人像", group: "图像类别" },
+  { key: "poster", label: "海报", group: "图像类别" },
 ] as const;
 
 export const taskCriteria = [
@@ -42,6 +48,12 @@ export const taskCriteria = [
   { key: "designQuality", label: "整体设计感", group: "信息图类评分追加" },
   { key: "typography", label: "文字设计感", group: "信息图类评分追加" },
   { key: "highInfoAes", label: "高密度信息图美感", group: "信息图类评分追加" },
+  { key: "ss_infographic_v2", label: "高密度信息图", group: "信息图类评分追加" },
+  { key: "sparse_info", label: "中低密度信息图美感", group: "信息图类评分追加" },
+  { key: "illustration", label: "插画", group: "图像类别" },
+  { key: "photography", label: "摄影", group: "图像类别" },
+  { key: "portrait", label: "人像", group: "图像类别" },
+  { key: "poster", label: "海报", group: "图像类别" },
 ] as const;
 
 export type TaskCriterionKey = (typeof taskCriteria)[number]["key"];
