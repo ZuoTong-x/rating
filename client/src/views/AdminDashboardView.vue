@@ -710,14 +710,6 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="admin-page admin-dashboard-content">
-    <div class="admin-page-header admin-dashboard-page-header">
-      <div>
-        <n-h2 class="page-title">仪表盘</n-h2>
-        <n-text depth="3">项目、团队与打分进度总览</n-text>
-      </div>
-
-    </div>
-
     <section class="admin-dashboard-stat-grid" aria-label="核心指标">
       <article v-for="card in statCards" :key="card.key" class="admin-dashboard-stat-card"
         :class="`is-${card.key}`">
@@ -989,16 +981,16 @@ onBeforeUnmount(() => {
     <section class="dashboard-insight-grid">
       <div class="table-shell dashboard-project-summary">
         <div class="table-shell-header dashboard-card-header">
-          <div class="table-shell-header-flex">
+          <div class="table-shell-header-flex dashboard-project-header-title">
             <strong>按项目汇总</strong>
-            <n-text depth="3">{{ selectedProjectName }}</n-text>
+            <n-text depth="3" class="dashboard-project-header-name" :title="selectedProjectName">{{ selectedProjectName }}</n-text>
           </div>
           <n-select v-model:value="selectedProjectId" filterable :options="projectOptions" placeholder="选择项目" />
         </div>
         <div v-if="dashboard.projectSummary" class="dashboard-project-body">
           <div class="dashboard-project-title-row">
-            <div>
-              <strong>{{ dashboard.projectSummary.projectName }}</strong>
+            <div class="dashboard-project-title-copy">
+              <strong :title="dashboard.projectSummary.projectName">{{ dashboard.projectSummary.projectName }}</strong>
               <n-text depth="3">
                 {{ dashboard.projectSummary.packageCount }} 个图包 / {{ dashboard.projectSummary.taskTemplateCount }} 个模板任务
               </n-text>

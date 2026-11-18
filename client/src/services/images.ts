@@ -433,8 +433,12 @@ export const imageApi = {
     if (query.mode) params.set('mode', query.mode);
     return requestJson<AdminDashboardWorkloadSection>(`/api/admin/dashboard/workload${params.toString() ? `?${params}` : ''}`);
   },
-  thumbnailQueueOverview() {
-    return requestJson<ThumbnailQueueOverview>('/api/admin/thumbnails');
+  thumbnailQueueOverview(query: { page?: number; pageSize?: number; search?: string } = {}) {
+    const params = new URLSearchParams();
+    if (query.page) params.set('page', String(query.page));
+    if (query.pageSize) params.set('pageSize', String(query.pageSize));
+    if (query.search) params.set('search', query.search);
+    return requestJson<ThumbnailQueueOverview>(`/api/admin/thumbnails${params.toString() ? `?${params}` : ''}`);
   },
   adminSystemStatus() {
     return requestJson<AdminSystemStatus>('/api/admin/system/status');
@@ -446,6 +450,8 @@ export const imageApi = {
     source?: string | null;
     code?: string | null;
     search?: string | null;
+    startTime?: string | null;
+    endTime?: string | null;
   } = {}) {
     const params = new URLSearchParams();
     if (query.page) params.set('page', String(query.page));
@@ -454,6 +460,8 @@ export const imageApi = {
     if (query.source) params.set('source', query.source);
     if (query.code) params.set('code', query.code);
     if (query.search) params.set('search', query.search);
+    if (query.startTime) params.set('startTime', query.startTime);
+    if (query.endTime) params.set('endTime', query.endTime);
     return requestJson<AdminOperationalLogPage>(`/api/admin/logs${params.toString() ? `?${params}` : ''}`);
   },
   updateThumbnailQueueSettings(payload: Partial<Pick<ThumbnailQueueSettings,
@@ -462,6 +470,18 @@ export const imageApi = {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload)
+    });
+  },
+  completedThumbnailCandidates() {
+    return requestJson<{ packages: Array<{ subjectId: string; name: string; pendingCount: number; importedAt: string | null }> }>(
+      '/api/admin/thumbnails/completed-candidates'
+    );
+  },
+  disableCompletedThumbnailPackages(subjectIds: string[]) {
+    return requestJson<{ disabled: number; subjectIds: string[] }>('/api/admin/thumbnails/disable-completed', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ subjectIds })
     });
   },
   updateThumbnailPackageControl(subjectId: string, payload: {

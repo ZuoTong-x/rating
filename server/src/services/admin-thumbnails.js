@@ -25,14 +25,16 @@ function validateTimeZone(value, httpError) {
 }
 
 export function createAdminThumbnailService({ db, httpError, nowIso }) {
-  let overviewCache = null;
-  let overviewCacheAt = 0;
-  let overviewPromise = null;
+  const overviewCache = new Map();
+  const overviewPromises = new Map();
+  let globalCountsCache = null;
+  let globalCountsPromise = null;
   let overviewEpoch = 0;
   function invalidateOverview() {
     overviewEpoch += 1;
-    overviewCache = null;
-    overviewCacheAt = 0;
+    overviewCache.clear();
+    globalCountsCache = null;
+    globalCountsPromise = null;
   }
   const selectSettingsStmt = db.prepare(`
     SELECT globallyPaused, daytimeConcurrency, nighttimeConcurrency,
@@ -95,54 +97,146 @@ export function createAdminThumbnailService({ db, httpError, nowIso }) {
   `);
   const selectGlobalCountsStmt = db.prepare(`
     SELECT
-      COUNT(*) FILTER (WHERE status = 'pending') AS pending,
-      COUNT(*) FILTER (WHERE status = 'processing') AS processing,
-      COUNT(*) FILTER (WHERE status = 'ready') AS ready,
-      COUNT(*) FILTER (WHERE status = 'failed') AS failed,
-      COUNT(*) AS total,
-      MIN(createdAt) FILTER (WHERE status = 'pending') AS oldestPendingAt,
-      COUNT(*) FILTER (WHERE completedAt >= NOW() - INTERVAL '5 minutes') AS completedLastFiveMinutes
-    FROM thumbnail_jobs
+      COALESCE(SUM(stats.pending), 0) AS pending,
+      COALESCE(SUM(stats.processing), 0) AS processing,
+      COALESCE(SUM(stats.ready), 0) AS ready,
+      COALESCE(SUM(stats.failed), 0) AS failed,
+      COALESCE(SUM(stats.total), 0) AS total,
+      COUNT(*) FILTER (WHERE COALESCE(stats.initialized, false) = false) AS uninitialized,
+      COALESCE(SUM(stats.pending) FILTER (WHERE COALESCE(controls.generationEnabled, true)), 0) AS eligiblePending,
+      COALESCE(SUM(stats.pending) FILTER (WHERE NOT COALESCE(controls.generationEnabled, true)), 0) AS excludedPending
+    FROM subjects
+    LEFT JOIN thumbnail_subject_stats stats ON stats.subjectId = subjects.id
+    LEFT JOIN thumbnail_subject_controls controls ON controls.subjectId = subjects.id
+    WHERE subjects.deletionRequestedAt IS NULL AND subjects.imageCount > 0
   `);
+  const selectRecentCompletedStmt = db.prepare(`
+    SELECT COUNT(*) AS completedLastFiveMinutes
+    FROM thumbnail_jobs
+    WHERE status = 'ready' AND completedAt >= NOW() - INTERVAL '5 minutes'
+  `);
+  async function getGlobalCounts() {
+    if (globalCountsCache && Date.now() - globalCountsCache.at < 45_000) return globalCountsCache.value;
+    if (globalCountsPromise) return globalCountsPromise;
+    const epoch = overviewEpoch;
+    let pending;
+    pending = selectGlobalCountsStmt.get()
+      .then((value) => {
+        if (epoch === overviewEpoch) globalCountsCache = { value, at: Date.now() };
+        return value;
+      })
+      .finally(() => { if (globalCountsPromise === pending) globalCountsPromise = null; });
+    globalCountsPromise = pending;
+    return pending;
+  }
   const selectPackageRowsStmt = db.prepare(`
     SELECT
       subjects.id AS subjectId,
       subjects.name,
       subjects.imageCount,
+      subjects.createdAt AS importedAt,
       COALESCE(controls.generationEnabled, true) AS generationEnabled,
       COALESCE(controls.paused, false) AS paused,
       COALESCE(controls.priority, 0) AS priority,
-      COALESCE(job_counts.pending, 0) AS pending,
-      COALESCE(job_counts.processing, 0) AS processing,
-      COALESCE(job_counts.ready, 0) AS ready,
-      COALESCE(job_counts.failed, 0) AS failed,
-      COALESCE(job_counts.total, 0) AS total,
-      job_counts.oldestPendingAt,
-      COALESCE(job_counts.completedLastFiveMinutes, 0) AS completedLastFiveMinutes,
       controls.updatedAt AS controlUpdatedAt,
       controls.updatedBy AS controlUpdatedBy
     FROM subjects
     LEFT JOIN thumbnail_subject_controls controls ON controls.subjectId = subjects.id
-    LEFT JOIN (
-      SELECT images.subjectId,
-        COUNT(*) FILTER (WHERE jobs.status = 'pending') AS pending,
-        COUNT(*) FILTER (WHERE jobs.status = 'processing') AS processing,
-        COUNT(*) FILTER (WHERE jobs.status = 'ready') AS ready,
-        COUNT(*) FILTER (WHERE jobs.status = 'failed') AS failed,
-        COUNT(*) AS total,
-        MIN(jobs.createdAt) FILTER (WHERE jobs.status = 'pending') AS oldestPendingAt,
-        COUNT(*) FILTER (WHERE jobs.completedAt >= NOW() - INTERVAL '5 minutes') AS completedLastFiveMinutes
-      FROM thumbnail_jobs jobs
-      JOIN images ON images.id = jobs.imageId
-      GROUP BY images.subjectId
-    ) job_counts ON job_counts.subjectId = subjects.id
+    LEFT JOIN thumbnail_subject_stats stats ON stats.subjectId = subjects.id
     WHERE subjects.deletionRequestedAt IS NULL
       AND subjects.imageCount > 0
     ORDER BY COALESCE(controls.priority, 0) DESC,
-             COALESCE(job_counts.processing, 0) DESC,
-             COALESCE(job_counts.pending, 0) DESC,
+             COALESCE(stats.processing, 0) DESC,
+             COALESCE(stats.pending, 0) DESC,
              subjects.createdAt DESC
   `);
+  const selectPackageTotalStmt = db.prepare(`
+    SELECT COUNT(*) AS total
+    FROM subjects
+    WHERE deletionRequestedAt IS NULL AND imageCount > 0
+      AND (? = '' OR LOWER(name) LIKE ? OR id LIKE ?)
+  `);
+  const selectMaxPriorityStmt = db.prepare(`
+    SELECT COALESCE(MAX(priority), 0) AS maxPriority FROM thumbnail_subject_controls
+  `);
+  const completedPackageCondition = `
+    EXISTS (
+      SELECT 1 FROM projects project
+      WHERE project.deletionRequestedAt IS NULL
+        AND project.taskStatus = 'task_completed'
+        AND (project.packageId = subjects.id OR EXISTS (
+          SELECT 1 FROM project_packages link
+          WHERE link.projectId = project.id AND link.packageId = subjects.id
+        ))
+    )
+    AND NOT EXISTS (
+      SELECT 1 FROM projects project
+      WHERE project.deletionRequestedAt IS NULL
+        AND project.taskStatus <> 'task_completed'
+        AND (project.packageId = subjects.id OR EXISTS (
+          SELECT 1 FROM project_packages link
+          WHERE link.projectId = project.id AND link.packageId = subjects.id
+        ))
+    )
+  `;
+  const selectCompletedCandidatesStmt = db.prepare(`
+    SELECT subjects.id AS subjectId, subjects.name, subjects.createdAt AS importedAt,
+           pending.pending AS pendingCount
+    FROM subjects
+    LEFT JOIN thumbnail_subject_controls controls ON controls.subjectId = subjects.id
+    JOIN thumbnail_subject_stats pending ON pending.subjectId = subjects.id
+    WHERE subjects.deletionRequestedAt IS NULL
+      AND COALESCE(controls.generationEnabled, true) = true
+      AND pending.initialized = true AND pending.pending > 0
+      AND ${completedPackageCondition}
+    ORDER BY subjects.createdAt DESC, subjects.id ASC
+    LIMIT 100
+  `);
+  const selectPackagePageStmt = db.prepare(`
+    SELECT subjects.id AS subjectId, subjects.name, subjects.imageCount,
+           subjects.createdAt AS importedAt,
+           COALESCE(controls.generationEnabled, true) AS generationEnabled,
+           COALESCE(controls.paused, false) AS paused,
+           COALESCE(controls.priority, 0) AS priority,
+           controls.updatedAt AS controlUpdatedAt,
+           controls.updatedBy AS controlUpdatedBy
+    FROM subjects
+    LEFT JOIN thumbnail_subject_controls controls ON controls.subjectId = subjects.id
+    WHERE subjects.deletionRequestedAt IS NULL AND subjects.imageCount > 0
+      AND (? = '' OR LOWER(subjects.name) LIKE ? OR subjects.id LIKE ?)
+    ORDER BY COALESCE(controls.priority, 0) DESC, subjects.createdAt DESC, subjects.id ASC
+    LIMIT ? OFFSET ?
+  `);
+
+  async function getPageJobCounts(subjectIds) {
+    if (!subjectIds.length) return new Map();
+    const values = subjectIds.map(() => "(?)").join(", ");
+    const statsRows = await db.prepare(`
+      WITH selected(subjectId) AS (VALUES ${values})
+      SELECT selected.subjectId, COALESCE(stats.initialized, false) AS statsReady,
+             COALESCE(stats.pending, 0) AS pending,
+             COALESCE(stats.processing, 0) AS processing,
+             COALESCE(stats.ready, 0) AS ready,
+             COALESCE(stats.failed, 0) AS failed,
+             COALESCE(stats.total, 0) AS total
+      FROM selected
+      LEFT JOIN thumbnail_subject_stats stats ON stats.subjectId = selected.subjectId
+    `).all(...subjectIds);
+    const recentRows = await db.prepare(`
+      SELECT images.subjectId, COUNT(*) AS completedLastFiveMinutes
+      FROM thumbnail_jobs jobs
+      JOIN images ON images.id = jobs.imageId
+      WHERE jobs.status = 'ready'
+        AND jobs.completedAt >= NOW() - INTERVAL '5 minutes'
+        AND images.subjectId IN (${subjectIds.map(() => "?").join(", ")})
+      GROUP BY images.subjectId
+    `).all(...subjectIds);
+    const recent = new Map(recentRows.map((row) => [row.subjectId, Number(row.completedLastFiveMinutes || 0)]));
+    return new Map(statsRows.map((row) => [row.subjectId, {
+      ...row,
+      completedLastFiveMinutes: recent.get(row.subjectId) || 0,
+    }]));
+  }
 
   function settingsDto(row) {
     const settings = {
@@ -166,6 +260,7 @@ export function createAdminThumbnailService({ db, httpError, nowIso }) {
     const completedLastFiveMinutes = Number(row.completedLastFiveMinutes || 0);
     const ratePerMinute = completedLastFiveMinutes / 5;
     let state = "completed";
+    if (!row.statsReady) state = "calculating";
     if (!row.generationEnabled) state = "disabled";
     else if (row.paused) state = "paused";
     else if (processing > 0) state = "processing";
@@ -175,9 +270,11 @@ export function createAdminThumbnailService({ db, httpError, nowIso }) {
       subjectId: row.subjectId,
       name: row.name,
       imageCount: Number(row.imageCount || 0),
+      importedAt: row.importedAt || null,
       generationEnabled: Boolean(row.generationEnabled),
       paused: Boolean(row.paused),
       priority: Number(row.priority || 0),
+      statsReady: Boolean(row.statsReady),
       state,
       counts: { pending, processing, ready, failed, total: Number(row.total || 0) },
       oldestPendingAt: row.oldestPendingAt || null,
@@ -188,45 +285,79 @@ export function createAdminThumbnailService({ db, httpError, nowIso }) {
         : null,
       controlUpdatedAt: row.controlUpdatedAt || null,
       controlUpdatedBy: row.controlUpdatedBy || null,
+      skipReason: !row.generationEnabled && String(row.controlUpdatedBy || "").startsWith("completed-project:")
+        ? "关联项目已完成"
+        : null,
     };
   }
 
-  async function getOverview() {
-    if (overviewCache && Date.now() - overviewCacheAt < 30_000) return overviewCache;
-    if (overviewPromise) return overviewPromise;
+  async function getOverview(query = {}) {
+    const requestedPage = Number.parseInt(String(query.page ?? ""), 10);
+    const paged = Number.isInteger(requestedPage) && requestedPage > 0;
+    const page = paged ? Math.min(requestedPage, 100000) : 1;
+    const requestedPageSize = Number.parseInt(String(query.pageSize ?? ""), 10);
+    const pageSize = paged && Number.isInteger(requestedPageSize)
+      ? Math.max(10, Math.min(requestedPageSize, 50))
+      : 25;
+    const search = paged ? String(query.search || "").trim().toLowerCase().slice(0, 80) : "";
+    const searchPattern = `%${search.replace(/[\\%_]/g, "\\$&")}%`;
+    const cacheKey = paged ? JSON.stringify([page, pageSize, search]) : "all";
+    const promiseKey = `${overviewEpoch}:${cacheKey}`;
+    const cached = overviewCache.get(cacheKey);
+    if (cached && Date.now() - cached.at < (paged ? 45_000 : 5 * 60_000)) {
+      return cached.value;
+    }
+    if (overviewPromises.has(promiseKey)) return overviewPromises.get(promiseKey);
     const epoch = overviewEpoch;
-    overviewPromise = (async () => {
-      const [settings, counts, rows] = await Promise.all([
+    const promise = (async () => {
+      const rowsPromise = paged
+        ? selectPackagePageStmt.all(search, searchPattern, searchPattern, pageSize, (page - 1) * pageSize)
+        : selectPackageRowsStmt.all();
+      const pageCountsPromise = rowsPromise.then((rows) => getPageJobCounts(rows.map((row) => row.subjectId)));
+      const [settings, counts, recentCompleted, rows, totalRow, maxPriorityRow, pageCounts] = await Promise.all([
         selectSettingsStmt.get(),
-        selectGlobalCountsStmt.get(),
-        selectPackageRowsStmt.all(),
+        getGlobalCounts(),
+        selectRecentCompletedStmt.get(),
+        rowsPromise,
+        selectPackageTotalStmt.get(search, searchPattern, searchPattern),
+        selectMaxPriorityStmt.get(),
+        pageCountsPromise,
       ]);
-      const packages = rows.map(packageDto);
-      const completedLastFiveMinutes = Number(counts?.completedLastFiveMinutes || 0);
+      const packages = rows.map((row) => packageDto({ ...row, ...(pageCounts?.get(row.subjectId) || {}) }));
+      const completedLastFiveMinutes = Number(recentCompleted?.completedLastFiveMinutes || 0);
       const overview = {
         settings: settingsDto(settings),
         counts: {
+          statsReady: Number(counts?.uninitialized || 0) === 0,
           pending: Number(counts?.pending || 0),
-          eligiblePending: packages.reduce((total, item) => total + (item.generationEnabled ? item.counts.pending : 0), 0),
-          excludedPending: packages.reduce((total, item) => total + (item.generationEnabled ? 0 : item.counts.pending), 0),
+          eligiblePending: Number(counts?.eligiblePending || 0),
+          excludedPending: Number(counts?.excludedPending || 0),
           processing: Number(counts?.processing || 0),
           ready: Number(counts?.ready || 0),
           failed: Number(counts?.failed || 0),
           total: Number(counts?.total || 0),
-          oldestPendingAt: counts?.oldestPendingAt || null,
+          oldestPendingAt: null,
           completedLastFiveMinutes,
           ratePerMinute: completedLastFiveMinutes / 5,
         },
         packages,
+        totalPackages: Number(totalRow?.total || 0),
+        page,
+        pageSize,
+        maxPriority: Number(maxPriorityRow?.maxPriority || 0),
         generatedAt: nowIso(),
       };
       if (epoch === overviewEpoch) {
-        overviewCache = overview;
-        overviewCacheAt = Date.now();
+        overviewCache.set(cacheKey, { value: overview, at: Date.now() });
+        if (overviewCache.size > 64) {
+          const oldestPageKey = [...overviewCache.keys()].find((key) => key !== "all");
+          if (oldestPageKey) overviewCache.delete(oldestPageKey);
+        }
       }
       return overview;
-    })().finally(() => { overviewPromise = null; });
-    return overviewPromise;
+    })().finally(() => { overviewPromises.delete(promiseKey); });
+    overviewPromises.set(promiseKey, promise);
+    return promise;
   }
 
   async function updateSettings(payload, actor) {
@@ -298,5 +429,50 @@ export function createAdminThumbnailService({ db, httpError, nowIso }) {
     return { retried: result.changes };
   }
 
-  return { getOverview, updateSettings, updatePackageControl, retryPackageFailed, retryAllFailed };
+  async function getCompletedCandidates() {
+    const rows = await selectCompletedCandidatesStmt.all();
+    return rows.map((row) => ({
+      subjectId: row.subjectId,
+      name: row.name,
+      importedAt: row.importedAt,
+      pendingCount: Number(row.pendingCount || 0),
+    }));
+  }
+
+  async function disableCompletedPackages(subjectIds, actor) {
+    if (!Array.isArray(subjectIds) || subjectIds.length < 1 || subjectIds.length > 100
+      || subjectIds.some((id) => typeof id !== "string" || !id.trim() || id.length > 200)) {
+      throw httpError(400, "请选择 1–100 个已完成图包");
+    }
+    const ids = [...new Set(subjectIds)];
+    const placeholders = ids.map(() => "?").join(", ");
+    const stmt = db.prepare(`
+      INSERT INTO thumbnail_subject_controls (
+        subjectId, generationEnabled, paused, priority, updatedAt, updatedBy
+      )
+      SELECT subjects.id, false, false, COALESCE(controls.priority, 0), ?, ?
+      FROM subjects
+      LEFT JOIN thumbnail_subject_controls controls ON controls.subjectId = subjects.id
+      WHERE subjects.id IN (${placeholders})
+        AND subjects.deletionRequestedAt IS NULL
+        AND COALESCE(controls.generationEnabled, true) = true
+        AND ${completedPackageCondition}
+        AND EXISTS (
+          SELECT 1 FROM thumbnail_subject_stats stats
+          WHERE stats.subjectId = subjects.id AND stats.initialized = true AND stats.pending > 0
+        )
+      ON CONFLICT (subjectId) DO UPDATE SET
+        generationEnabled = false, paused = false,
+        updatedAt = EXCLUDED.updatedAt, updatedBy = EXCLUDED.updatedBy
+      RETURNING subjectId
+    `);
+    const rows = await stmt.all(nowIso(), `completed-project:${actor || "admin"}`, ...ids);
+    invalidateOverview();
+    return { disabled: rows.length, subjectIds: rows.map((row) => row.subjectId) };
+  }
+
+  return {
+    getOverview, updateSettings, updatePackageControl, retryPackageFailed, retryAllFailed,
+    getCompletedCandidates, disableCompletedPackages,
+  };
 }

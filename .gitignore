@@ -17,3 +17,7 @@ __pycache__/
 *.py[cod]
 .DS_Store
 outputs/
+
+# Local private credentials and records
+/ssh.md
+/upload.md

@@ -778,7 +778,7 @@ function taskActionLabel(row: ProjectItem) {
 }
 
 const columns: DataTableColumns<ProjectItem> = [
-  { title: '项目名称', key: 'name', minWidth: 180 },
+  { title: '项目名称', key: 'name', width: 200, ellipsis: { tooltip: true } },
   {
     title: '关联图包',
     key: 'packages',
@@ -816,7 +816,7 @@ onMounted(() => void loadData());
 
 <template>
   <div class="admin-page">
-    <div class="table-shell">
+    <div class="table-shell project-list-shell">
       <div class="table-shell-header">
         <div class="table-shell-header-flex">
           <strong>项目列表</strong>
@@ -825,7 +825,7 @@ onMounted(() => void loadData());
         <n-button type="primary" @click="openCreateProject">新建项目</n-button>
       </div>
       <n-data-table v-if="projects.length" :columns="columns" :data="projects" :loading="loading" :bordered="false" remote
-        :scroll-x="1250" />
+        :scroll-x="1440" />
       <div v-else class="empty">{{ loading ? '正在加载...' : '暂无项目，请先在图包管理中上传 ZIP' }}</div>
       <div class="table-shell-footer">
         <n-pagination v-if="projectTotal" :page="projectPage" :page-size="projectPageSize" :item-count="projectTotal"

@@ -161,9 +161,10 @@ export interface ThumbnailQueueSettings {
 }
 
 export interface ThumbnailQueueCounts {
+  statsReady: boolean;
   pending: number;
-  eligiblePending: number;
-  excludedPending: number;
+  eligiblePending: number | null;
+  excludedPending: number | null;
   processing: number;
   ready: number;
   failed: number;
@@ -185,10 +186,12 @@ export interface ThumbnailPackageQueue {
   subjectId: string;
   name: string;
   imageCount: number;
+  importedAt: string | null;
   generationEnabled: boolean;
   paused: boolean;
   priority: number;
-  state: 'disabled' | 'paused' | 'processing' | 'queued' | 'failed' | 'completed';
+  statsReady: boolean;
+  state: 'calculating' | 'disabled' | 'paused' | 'processing' | 'queued' | 'failed' | 'completed';
   counts: ThumbnailPackageCounts;
   oldestPendingAt: string | null;
   completedLastFiveMinutes: number;
@@ -196,12 +199,17 @@ export interface ThumbnailPackageQueue {
   estimatedMinutes: number | null;
   controlUpdatedAt: string | null;
   controlUpdatedBy: string | null;
+  skipReason?: string | null;
 }
 
 export interface ThumbnailQueueOverview {
   settings: ThumbnailQueueSettings;
   counts: ThumbnailQueueCounts;
   packages: ThumbnailPackageQueue[];
+  totalPackages: number;
+  page: number;
+  pageSize: number;
+  maxPriority: number;
   generatedAt: string;
 }
 

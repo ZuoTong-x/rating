@@ -10,6 +10,8 @@ export function createAdminLogService({ logDir }) {
       source: String(query.source || "").trim(),
       code: String(query.code || "").trim(),
       search: String(query.search || "").trim(),
+      startTime: String(query.startTime || "").trim(),
+      endTime: String(query.endTime || "").trim(),
     });
   }
 

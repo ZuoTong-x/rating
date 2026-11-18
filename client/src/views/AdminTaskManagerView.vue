@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { h, onMounted, ref } from 'vue';
-import { NButton, NSwitch, NTag, useMessage, type DataTableColumns } from 'naive-ui';
+import { NButton, NSwitch, NTag, NTooltip, useMessage, type DataTableColumns } from 'naive-ui';
 import { useRouter } from 'vue-router';
 import { imageApi } from '../services/images';
 import type { ProjectItem } from '../types/image';
@@ -82,7 +82,18 @@ const columns: DataTableColumns<ProjectItem> = [
     })
   },
   {
-    title: '任务锁定',
+    title: () => h('span', { class: 'admin-task-lock-heading' }, [
+      '任务锁定',
+      h(NTooltip, { placement: 'top-start' }, {
+        trigger: () => h('span', {
+          class: 'admin-task-lock-help',
+          tabindex: 0,
+          'aria-label': '查看任务锁定说明'
+        }, 'i'),
+        default: () => h('span', { class: 'admin-task-lock-tooltip' },
+          '新建项目默认锁定。锁定期间可以继续生成和分配任务，但打分人的项目列表、任务列表和任务数量均不会显示；完成下发后请在此手动解锁。')
+      })
+    ]),
     key: 'tasksLocked',
     width: 150,
     render: row => h('div', { class: 'admin-task-lock-control' }, [
@@ -114,9 +125,6 @@ onMounted(() => void loadSubjects());
 
 <template>
   <div class="admin-page">
-    <n-alert type="info" :bordered="false">
-      新建项目默认锁定。锁定期间可以继续生成和分配任务，但打分人的项目列表、任务列表和任务数量均不会显示；完成下发后请在此手动解锁。
-    </n-alert>
     <div class="table-shell">
       <div class="table-shell-header">
         <div class="table-shell-header-flex">

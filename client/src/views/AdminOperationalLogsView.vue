@@ -3,7 +3,31 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useMessage } from 'naive-ui';
 import { imageApi } from '../services/images';
 import type { AdminOperationalLogEntry, AdminOperationalLogPage } from '../types/image';
-import { formatDateTime } from '../utils/time';
+import { BUSINESS_TIME_ZONE, formatDateTime, shanghaiDateToUtc } from '../utils/time';
+
+function shanghaiToday() {
+  const parts = new Intl.DateTimeFormat('en-US', {
+    timeZone: BUSINESS_TIME_ZONE, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(new Date());
+  const value = (type: string) => parts.find(part => part.type === type)?.value || '';
+  return `${value('year')}-${value('month')}-${value('day')}`;
+}
+
+function localDateTimestamp(date: string) {
+  const [year, month, day] = date.split('-').map(Number);
+  return new Date(year, month - 1, day).getTime();
+}
+
+function lastSevenDays(): [number, number] {
+  const today = shanghaiToday();
+  const start = new Date(Date.parse(`${today}T00:00:00.000Z`) - 6 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  return [localDateTimestamp(start), localDateTimestamp(today)];
+}
+
+function selectedDate(timestamp: number) {
+  const date = new Date(timestamp);
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
 
 const message = useMessage();
 const loading = ref(false);
@@ -14,6 +38,7 @@ const level = ref<string | null>(null);
 const source = ref<string | null>(null);
 const code = ref<string | null>(null);
 const search = ref('');
+const dateRange = ref<[number, number] | null>(lastSevenDays());
 const activeEntry = ref<AdminOperationalLogEntry | null>(null);
 const detailVisible = ref(false);
 const autoRefresh = ref(true);
@@ -58,7 +83,9 @@ async function loadLogs(nextPage = page.value, silent = false) {
       level: level.value,
       source: source.value,
       code: code.value,
-      search: search.value.trim() || null
+      search: search.value.trim() || null,
+      startTime: dateRange.value ? shanghaiDateToUtc(selectedDate(dateRange.value[0])) : null,
+      endTime: dateRange.value ? shanghaiDateToUtc(selectedDate(dateRange.value[1]), 1) : null
     });
     page.value = result.value.page;
   } catch (error) {
@@ -77,6 +104,7 @@ function clearFilters() {
   source.value = null;
   code.value = null;
   search.value = '';
+  dateRange.value = lastSevenDays();
   void loadLogs(1);
 }
 
@@ -128,6 +156,7 @@ onBeforeUnmount(() => {
 
     <div class="table-shell operational-log-shell">
       <div class="operational-log-filters">
+        <n-date-picker v-model:value="dateRange" type="daterange" clearable :shortcuts="{ '最近 7 天': lastSevenDays }" />
         <n-select v-model:value="level" clearable :options="levelOptions" placeholder="错误级别" />
         <n-select v-model:value="source" clearable :options="sourceOptions" placeholder="日志来源" />
         <n-input v-model:value="code" clearable placeholder="错误码，如 XX002" @keyup.enter="applyFilters" />

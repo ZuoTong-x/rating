@@ -229,12 +229,22 @@ export async function readOperationalLogs({
   source = "",
   code = "",
   search = "",
+  startTime = "",
+  endTime = "",
   maximumBytes = DEFAULT_READ_BYTES,
 } = {}) {
   const directory = path.resolve(logDir);
+  const startTimestamp = startTime ? Date.parse(startTime) : NaN;
+  const endTimestamp = endTime ? Date.parse(endTime) : NaN;
   const files = (await fs.readdir(directory, { withFileTypes: true }).catch(() => []))
     .filter((entry) => entry.isFile() && /^operational-[a-z0-9_-]+-\d{4}-\d{2}-\d{2}\.jsonl$/.test(entry.name))
     .map((entry) => entry.name)
+    .filter((filename) => {
+      const day = filename.match(/(\d{4}-\d{2}-\d{2})\.jsonl$/)?.[1];
+      const dayStart = Date.parse(`${day}T00:00:00.000Z`);
+      return (!Number.isFinite(startTimestamp) || dayStart + 24 * 60 * 60 * 1000 > startTimestamp)
+        && (!Number.isFinite(endTimestamp) || dayStart < endTimestamp);
+    })
     .sort()
     .reverse();
   const entries = [];
@@ -256,6 +266,13 @@ export async function readOperationalLogs({
   }
   const normalizedSearch = String(search || "").trim().toLowerCase();
   const filtered = entries
+    .filter((entry) => {
+      if (!Number.isFinite(startTimestamp) && !Number.isFinite(endTimestamp)) return true;
+      const timestamp = Date.parse(entry.timestamp);
+      return Number.isFinite(timestamp)
+        && (!Number.isFinite(startTimestamp) || timestamp >= startTimestamp)
+        && (!Number.isFinite(endTimestamp) || timestamp < endTimestamp);
+    })
     .filter((entry) => !level || entry.level === level)
     .filter((entry) => !source || entry.source === source)
     .filter((entry) => !code || String(entry.code || "").toLowerCase() === String(code).toLowerCase())
