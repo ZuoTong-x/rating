@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NLayout, NLayoutSider, NMenu, NLayoutContent, NLayoutHeader, NButton, NIcon, NPopover, NAvatar, NText, NDivider } from 'naive-ui';
 import { computed, ref, watch } from 'vue';
 import { RouterView, useRoute, useRouter } from 'vue-router';
 import TaskStackFloat from '../components/TaskStackFloat.vue';
@@ -25,7 +26,6 @@ const layoutNavItems = computed(() => isAdminLayoutMode.value ? adminNavItems : 
 const activeKey = computed(() => isAdminLayoutMode.value ? resolveAdminActiveKey(route.path) : resolveScorerActiveKey(route.path));
 const activeNavLabel = computed(() => layoutNavItems.value.find(item => item.key === activeKey.value)?.label || '仪表盘');
 const sidebarSubtitle = computed(() => isAdminLayoutMode.value ? '管理后台' : '打分端');
-const searchPlaceholder = computed(() => isAdminLayoutMode.value ? '搜索导航' : '搜索菜单');
 const visibleNavItems = computed(() => (collapsed.value ? layoutNavItems.value : filterNavItems(layoutNavItems.value, keyword.value)));
 const menuOptions = computed(() => visibleNavItems.value.map(item => ({
   key: item.key,

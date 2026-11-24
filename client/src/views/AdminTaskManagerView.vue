@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NText, NDataTable } from 'naive-ui';
 import { h, onMounted, ref } from 'vue';
 import { NButton, NSwitch, NTag, NTooltip, useMessage, type DataTableColumns } from 'naive-ui';
 import { useRouter } from 'vue-router';

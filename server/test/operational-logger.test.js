@@ -8,7 +8,7 @@ import {
   describeApi,
   readOperationalLogs,
   requestLogMetadata,
-} from "../src/operational-logger.js";
+} from "../src/operational-logger.ts";
 
 test("API 日志会补充接口说明并归一化资源 ID", () => {
   const metadata = requestLogMetadata({

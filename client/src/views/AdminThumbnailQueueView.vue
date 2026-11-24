@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { NCard, NTooltip, NSpace, NTag, NButton, NFormItem, NInputNumber, NSelect, NText, NInput, NSpin, NTable, NProgress, NSwitch, NPagination } from 'naive-ui';
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { useDialog, useMessage, type GlobalThemeOverrides } from 'naive-ui';
-import { imageApi } from '../services/images';
+import { adminThumbnailApi } from '../services/admin-thumbnails';
 import { useAppTheme } from '../composables/theme';
 import type { ThumbnailPackageQueue, ThumbnailQueueOverview } from '../types/image';
 import { formatDateTime } from '../utils/time';
@@ -83,7 +84,7 @@ async function loadOverview(silent = false, force = false) {
   if (!silent) loading.value = true;
   else backgroundLoading = true;
   try {
-    const data = await imageApi.thumbnailQueueOverview({
+    const data = await adminThumbnailApi.thumbnailQueueOverview({
       page: page.value,
       pageSize: pageSize.value,
       search: search.value
@@ -129,7 +130,7 @@ async function saveSettings() {
   }
   savingSettings.value = true;
   try {
-    await imageApi.updateThumbnailQueueSettings({ ...settingsDraft });
+    await adminThumbnailApi.updateThumbnailQueueSettings({ ...settingsDraft });
     message.success('闲时策略已保存，Worker 最迟数秒内生效');
     await loadOverview(true, true);
   } catch (error) {
@@ -143,7 +144,7 @@ async function toggleGlobalPause() {
   if (!settings.value) return;
   savingSettings.value = true;
   try {
-    await imageApi.updateThumbnailQueueSettings({ globallyPaused: !settings.value.globallyPaused });
+    await adminThumbnailApi.updateThumbnailQueueSettings({ globallyPaused: !settings.value.globallyPaused });
     message.success(settings.value.globallyPaused ? '缩略图队列已启动' : '缩略图队列已暂停');
     await loadOverview(true, true);
   } catch (error) {
@@ -167,7 +168,7 @@ async function updatePackage(item: ThumbnailPackageQueue, payload: {
 }, successText: string) {
   setPackageBusy(item.subjectId, true);
   try {
-    await imageApi.updateThumbnailPackageControl(item.subjectId, payload);
+    await adminThumbnailApi.updateThumbnailPackageControl(item.subjectId, payload);
     message.success(successText);
     await loadOverview(true, true);
   } catch (error) {
@@ -214,8 +215,8 @@ function savePriority(item: ThumbnailPackageQueue) {
 async function retryFailed(item?: ThumbnailPackageQueue) {
   try {
     const result = item
-      ? await imageApi.retryThumbnailPackageFailed(item.subjectId)
-      : await imageApi.retryAllThumbnailFailed();
+      ? await adminThumbnailApi.retryThumbnailPackageFailed(item.subjectId)
+      : await adminThumbnailApi.retryAllThumbnailFailed();
     message.success(result.retried ? `已重新加入 ${result.retried} 个失败任务` : '没有可重试的失败任务');
     await loadOverview(true, true);
   } catch (error) {
@@ -230,7 +231,7 @@ async function reviewCompletedPackages() {
   }
   skippingCompleted.value = true;
   try {
-    const { packages: candidates } = await imageApi.completedThumbnailCandidates();
+    const { packages: candidates } = await adminThumbnailApi.completedThumbnailCandidates();
     if (!candidates.length) {
       message.info('没有关联项目全部完成且仍待生成的图包');
       return;
@@ -245,7 +246,7 @@ async function reviewCompletedPackages() {
       negativeText: '取消',
       onPositiveClick: async () => {
         try {
-          const result = await imageApi.disableCompletedThumbnailPackages(candidates.map(item => item.subjectId));
+          const result = await adminThumbnailApi.disableCompletedThumbnailPackages(candidates.map(item => item.subjectId));
           message.success(`已停用 ${result.disabled} 个图包；状态变化的图包会被自动跳过`);
           await loadOverview(true, true);
         } catch (error) {

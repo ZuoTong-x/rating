@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NConfigProvider, NLoadingBarProvider, NMessageProvider, NDialogProvider, NLayout } from 'naive-ui';
 import { computed } from 'vue';
 import { darkTheme, type GlobalThemeOverrides } from 'naive-ui';
 import { useAppTheme } from '../composables/theme';

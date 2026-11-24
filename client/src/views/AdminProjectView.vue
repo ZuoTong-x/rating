@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NText, NUpload, NDataTable, NPagination } from 'naive-ui';
 import { computed, h, onMounted, ref, watch } from 'vue';
 import { NButton, NProgress, useDialog, useMessage, type DataTableColumns, type UploadCustomRequestOptions } from 'naive-ui';
 import { useRouter } from 'vue-router';

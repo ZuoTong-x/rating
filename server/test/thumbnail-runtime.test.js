@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { withTimeout, isDatabaseIntegrityError } from "../src/thumbnail-runtime.js";
+import { withTimeout, isDatabaseIntegrityError } from "../src/thumbnail-runtime.ts";
 
 test("缩略图任务在超时前完成时返回原结果", async () => {
   assert.equal(await withTimeout(Promise.resolve("ready"), 50, "timeout"), "ready");

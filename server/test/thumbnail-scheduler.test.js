@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { hourInWindow, localHourAt, resolveThumbnailSchedule } from "../src/thumbnail-scheduler.js";
+import { hourInWindow, localHourAt, resolveThumbnailSchedule } from "../src/thumbnail-scheduler.ts";
 
 test("跨午夜的夜间时段包含起点、不包含终点", () => {
   assert.equal(hourInWindow(22, 22, 8), true);

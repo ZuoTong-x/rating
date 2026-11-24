@@ -36,7 +36,7 @@ example.zip
 在项目根目录执行：
 
 ```bash
-docker compose exec -T api node src/import-local.js /app/inbox/example.zip
+docker compose exec -T api node dist/import-local.js /app/inbox/example.zip
 ```
 
 导入成功后，命令会输出 JSON 结果，并将源文件移动到：
@@ -50,7 +50,7 @@ docker compose exec -T api node src/import-local.js /app/inbox/example.zip
 如果需要保留源文件，不移动到 `processed`：
 
 ```bash
-docker compose exec -T api node src/import-local.js /app/inbox/example.zip --keep
+docker compose exec -T api node dist/import-local.js /app/inbox/example.zip --keep
 ```
 
 ## 4. 输出结果

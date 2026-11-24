@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NSpace, NForm, NFormItem, NSelect } from 'naive-ui';
 import { reactive, watch } from 'vue';
 import type { ImageQuery } from '../../../types/image';
 

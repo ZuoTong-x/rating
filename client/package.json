@@ -10,7 +10,6 @@
   "dependencies": {
     "chart.js": "^4.5.1",
     "exceljs": "^4.4.0",
-    "image-rating-platform": "file:..",
     "naive-ui": "^2.41.0",
     "pinia": "^4.0.3",
     "vue": "^3.5.13",

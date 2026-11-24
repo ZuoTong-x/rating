@@ -77,6 +77,7 @@ RELEASE_ITEMS=(
   'server/Dockerfile'
   'server/package.json'
   'server/package-lock.json'
+  'server/tsconfig.json'
   'server/src'
   'client/Dockerfile'
   'client/nginx.conf'

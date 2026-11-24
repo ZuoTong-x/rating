@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { NText, NUpload, NSelect, NDataTable, NPagination, NModal, NRadioGroup, NRadioButton, NForm, NFormItem, NInputNumber } from 'naive-ui';
 import { computed, h, onMounted, reactive, ref } from 'vue';
 import { NButton, NTag, useDialog, useMessage, type DataTableColumns, type DataTableRowKey, type UploadFileInfo } from 'naive-ui';
-import { imageApi } from '../services/images';
+import { adminScoringApi } from '../services/admin-scoring';
 import { useTaskStackStore } from '../stores/taskStack';
 import type {
   ScoringManagementSummary,
@@ -212,7 +213,7 @@ function extractTaskIdsFromJson(payload: unknown) {
 async function loadOptions() {
   scorersLoading.value = true;
   try {
-    const result = await imageApi.adminScoringOptions();
+    const result = await adminScoringApi.adminScoringOptions();
     projects.value = result.projects;
     scorerOptions.value = result.scorers.map(scorer => ({
       label: scorer,
@@ -226,7 +227,7 @@ async function loadOptions() {
 async function loadSummary(page = scorerPage.value, pageSize = scorerPageSize.value) {
   loading.value = true;
   try {
-    summary.value = await imageApi.adminScoringSummary({
+    summary.value = await adminScoringApi.adminScoringSummary({
       page,
       pageSize,
       scorer: filters.scorer,
@@ -262,7 +263,7 @@ async function exportScoringOperations() {
       stage: '正在提交导出作业',
       progress: 0
     });
-    await imageApi.exportScoringOperations({
+    await adminScoringApi.exportScoringOperations({
       scorer: filters.scorer,
       projectId: filters.projectId,
       submissionMode: filters.submissionMode,
@@ -298,7 +299,7 @@ async function exportScoringRiskReport() {
       stage: '正在提交导出作业',
       progress: 0
     });
-    await imageApi.exportScoringRiskReport({
+    await adminScoringApi.exportScoringRiskReport({
       scorers: selectedRollbackScorers.value,
       projectId: filters.projectId,
       submissionMode: filters.submissionMode
@@ -404,7 +405,7 @@ async function openScorerRollback() {
   rollbackRecipientScorers.value = [];
   rollbackRecipientAllocations.value = {};
   try {
-    const preview = await imageApi.previewScoringRollback({
+    const preview = await adminScoringApi.previewScoringRollback({
       source: 'scorer_full',
       scorers: selectedRollbackScorers.value,
       projectId: filters.projectId,
@@ -439,7 +440,7 @@ function wait(milliseconds: number) {
 
 async function waitForRollback(jobId: string, taskId: string) {
   while (true) {
-    const job = await imageApi.scoringRollbackStatus(jobId);
+    const job = await adminScoringApi.scoringRollbackStatus(jobId);
     taskStack.updateTask(taskId, {
       progress: job.progress,
       stage: job.stage || '正在回退任务'
@@ -472,7 +473,7 @@ async function handleRollbackFileChange(options: { file: UploadFileInfo }) {
   try {
     const payload = JSON.parse(await file.text()) as unknown;
     const taskIds = extractTaskIdsFromJson(payload);
-    rollbackPreview.value = await imageApi.previewScoringRollback({ taskIds });
+    rollbackPreview.value = await adminScoringApi.previewScoringRollback({ taskIds });
     rollbackVisible.value = true;
   } catch (error) {
     rollbackFileName.value = '';
@@ -504,7 +505,7 @@ function confirmRollback() {
           stage: '正在提交回退作业',
           progress: 0
         });
-        const job = await imageApi.rollbackScoringTasks({ taskIds: preview.taskIds });
+        const job = await adminScoringApi.rollbackScoringTasks({ taskIds: preview.taskIds });
         rollbackVisible.value = false;
         rollbackPreview.value = null;
         rollbackFileName.value = '';
@@ -559,7 +560,7 @@ function confirmScorerRollback() {
           stage: '正在提交回退作业',
           progress: 0
         });
-        const job = await imageApi.rollbackScoringTasks({
+        const job = await adminScoringApi.rollbackScoringTasks({
           source: 'scorer_full',
           scorers: preview.sourceScorers?.length ? preview.sourceScorers : selectedRollbackScorers.value,
           projectId: preview.projectId ?? filters.projectId,

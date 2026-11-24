@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NH2, NText, NSelect, NDataTable, NPagination, NModal, NForm, NFormItem, NInput, NUpload, NImageGroup } from 'naive-ui';
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref } from 'vue';
 import { NButton, NImage, NTag, useMessage, type DataTableColumns, type UploadFileInfo } from 'naive-ui';
 import { currentUser } from '../composables/auth';

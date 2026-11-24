@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NH2, NText, NSelect, NDataTable, NPagination, NModal, NImageGroup, NForm, NFormItem, NInput } from 'naive-ui';
 import { h, onMounted, reactive, ref } from 'vue';
 import { NButton, NImage, NTag, useMessage, type DataTableColumns } from 'naive-ui';
 import { imageApi } from '../services/images';

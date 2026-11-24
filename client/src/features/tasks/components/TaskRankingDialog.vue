@@ -1,9 +1,10 @@
 <script setup lang="ts">
+import { NModal, NAlert, NButton, NText, NIcon, NImage, NScrollbar } from 'naive-ui';
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue';
 import { NImagePreview, useDialog, useMessage } from 'naive-ui';
 import { currentUser } from '../../../composables/auth';
 import { taskCriteria, type TaskCriterionKey } from '../../../constants/scoreCriteria';
-import { imageApi } from '../../../services/images';
+import { taskApi } from '../../../services/tasks';
 import { HttpError, isQueryUnavailable } from '../../../services/http';
 import type { RankingRelation, RatingTask, RatingTaskItem, TaskSubmissionMode } from '../../../types/image';
 
@@ -14,7 +15,7 @@ const props = defineProps<{
 }>();
 const emit = defineEmits<{
   'update:show': [value: boolean];
-  saved: [task: RatingTask, advancing: boolean, previousTask: RatingTask | null];
+  saved: [task: RatingTask, previousTask: RatingTask | null];
   next: [task: RatingTask];
   released: [taskId: string];
   loading: [payload: { active: boolean; text?: string }];
@@ -303,7 +304,7 @@ async function releaseCurrentClaim() {
 
   releasingTaskId = task.id;
   try {
-    await imageApi.releaseTaskClaim(task.id, task.claimToken);
+    await taskApi.releaseTaskClaim(task.id, task.claimToken);
     emit('released', task.id);
   } catch {
     // Claim expiry remains the fallback when the browser closes unexpectedly.
@@ -500,14 +501,14 @@ async function submit(advance = false) {
       durationMs: Math.max(Date.now() - openedAt.value, 0)
     };
     const result = isEditing.value
-      ? await imageApi.updateCompletedTask(task.id, payload)
-      : await imageApi.completeTask(task.id, payload);
+      ? await taskApi.updateCompletedTask(task.id, payload)
+      : await taskApi.completeTask(task.id, payload);
     saving.value = false;
     await handleSavedTask(result.task, advance);
   } catch (error) {
     if (error instanceof HttpError && error.status === 409 && !isEditing.value) {
       try {
-        const recovered = (await imageApi.assignedTaskDetail(task.id, task.claimToken)).task;
+        const recovered = (await taskApi.assignedTaskDetail(task.id, task.claimToken)).task;
         if (recovered.status === 'completed' && recovered.scorer === scorer) {
           await handleSavedTask(recovered, advance);
           return;
@@ -526,7 +527,7 @@ async function handleSavedTask(savedTask: RatingTask, advance: boolean) {
   const mergedTask = mergeSavedTask(savedTask, previousTask || null);
   lastSubmissionAt.value = Date.now();
   lastSavedTask.value = mergedTask;
-  emit('saved', mergedTask, advance, previousTask || null);
+  emit('saved', mergedTask, previousTask || null);
 
   if (!advance) {
     message.success(isEditing.value ? '修改已保存' : '任务已提交');

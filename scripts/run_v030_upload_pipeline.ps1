@@ -90,7 +90,7 @@ function Verify-And-Import([string]$localPath, [string]$name, [int]$index) {
     ssh -o BatchMode=yes $HostName "mv '$remotePath' '$remotePath'"
     Write-ProgressRecord $index 'mv-complete' @{ sha256 = $localHash }
 
-    $importCommand = "cd '$ImportDir' && docker compose exec -T api node src/import-local.js '/app/inbox/$name'"
+    $importCommand = "cd '$ImportDir' && docker compose exec -T api node dist/import-local.js '/app/inbox/$name'"
     ssh -o BatchMode=yes $HostName $importCommand
     Write-ProgressRecord $index 'imported' @{ sha256 = $localHash }
 

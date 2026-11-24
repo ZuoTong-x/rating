@@ -1,5 +1,5 @@
-import ExcelJS from 'exceljs';
-import type { TaskAllocationImportResult } from '../services/images';
+import type ExcelJS from 'exceljs';
+import type { TaskAllocationImportResult } from '../services/tasks';
 
 function normalizedAllocationHeader(value: unknown) {
   return String(value ?? '')
@@ -40,6 +40,7 @@ function parseAllocationTaskCount(value: unknown) {
 export async function parseTaskAllocationWorkbook(file: File): Promise<TaskAllocationImportResult> {
   if (!file) throw new Error('请选择分配表');
 
+  const { default: ExcelJS } = await import('exceljs');
   const workbook = new ExcelJS.Workbook();
   try {
     await workbook.xlsx.load(await file.arrayBuffer());

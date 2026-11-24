@@ -1,10 +1,11 @@
 <script setup lang="ts">
+import { NText, NProgress, NSelect, NDataTable, NPagination } from 'naive-ui';
 import { computed, h, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue';
 import { NButton, NTag, useLoadingBar, useMessage, type DataTableColumns } from 'naive-ui';
 import { currentUser } from '../composables/auth';
 import TaskRankingDialog from '../features/tasks/components/TaskRankingDialog.vue';
 import { taskCriteria } from '../constants/scoreCriteria';
-import { imageApi } from '../services/images';
+import { taskApi } from '../services/tasks';
 import { isQueryUnavailable } from '../services/http';
 import type { RatingTask, ScorerDashboard, ScorerProjectOption, ScorerTaskListItem } from '../types/image';
 
@@ -75,12 +76,6 @@ function criterionLabel(key: RatingTask['criterion']) {
   return taskCriteria.find(item => item.key === key)?.label || key || '未指定维度';
 }
 
-function paginationPrefix({ itemCount }: { itemCount?: number }) {
-  return taskTotal.value
-    ? `共 ${itemCount ?? taskTotal.value} 个任务`
-    : `第 ${taskPage.value} 页`;
-}
-
 function changePage(page: number) {
   void loadTasks(page, taskPageSize.value);
 }
@@ -123,7 +118,7 @@ async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
   loading.value = true;
   taskListState.value = tasks.value.length ? 'stale' : 'loading';
   try {
-    const result = await imageApi.assignedTasks({
+    const result = await taskApi.assignedTasks({
       scorer,
       page,
       pageSize,
@@ -153,7 +148,7 @@ async function loadTasks(page = taskPage.value, pageSize = taskPageSize.value) {
 
 async function loadProjects() {
   try {
-    const result = await imageApi.assignedTaskOptions();
+    const result = await taskApi.assignedTaskOptions();
     projects.value = result.projects;
   } catch (error) {
     if (!isQueryUnavailable(error)) message.error(errorMessage(error));
@@ -169,7 +164,7 @@ async function loadTaskStats() {
   const request = (async () => {
     taskStatsState.value = taskStats.value.totalTasks ? 'stale' : 'loading';
     try {
-      const result = await imageApi.scorerDashboard({
+      const result = await taskApi.scorerDashboard({
         scorer,
         projectId: null
       });
@@ -242,7 +237,7 @@ async function openRanking(task: ScorerTaskListItem) {
   if (openingTaskId.value) return;
   openingTaskId.value = task.id;
   try {
-    const result = await imageApi.assignedTaskDetail(task.id, taskClaimTokens.get(task.id));
+    const result = await taskApi.assignedTaskDetail(task.id, taskClaimTokens.get(task.id));
     if (result.task.claimToken) taskClaimTokens.set(task.id, result.task.claimToken);
     activeTask.value = result.task;
     rankingVisible.value = true;
@@ -253,7 +248,7 @@ async function openRanking(task: ScorerTaskListItem) {
   }
 }
 
-function handleTaskSaved(task: RatingTask, advancing = false, previousTask: RatingTask | null = null) {
+function handleTaskSaved(task: RatingTask, previousTask: RatingTask | null = null) {
   if (activeTask.value?.id === task.id) activeTask.value = task;
   if (task.status === 'completed') taskClaimTokens.delete(task.id);
   else if (task.claimToken) taskClaimTokens.set(task.id, task.claimToken);
@@ -275,7 +270,7 @@ async function getNextTask(savedTask?: RatingTask) {
   const scorer = currentUser.value?.username;
   if (!scorer) throw new Error('未获取到当前打分人');
 
-  const nextPage = await imageApi.assignedTasks({
+  const nextPage = await taskApi.assignedTasks({
     scorer,
     projectId: taskFilters.projectId,
     criterion: taskFilters.criterion,
@@ -294,7 +289,7 @@ async function getNextTask(savedTask?: RatingTask) {
   if (!nextTask) {
     return null;
   }
-  const result = await imageApi.assignedTaskDetail(nextTask.id, taskClaimTokens.get(nextTask.id));
+  const result = await taskApi.assignedTaskDetail(nextTask.id, taskClaimTokens.get(nextTask.id));
   if (result.task.claimToken) taskClaimTokens.set(nextTask.id, result.task.claimToken);
   return result.task;
 }

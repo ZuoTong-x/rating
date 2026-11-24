@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { retryTaskStatsRefresh } from "../src/task-stats-retry.js";
+import { retryTaskStatsRefresh } from "../src/task-stats-retry.ts";
 
 test("retries a serialization conflict from a fresh transaction", async () => {
   let attempts = 0;

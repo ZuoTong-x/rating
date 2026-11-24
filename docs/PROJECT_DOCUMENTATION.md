@@ -5,7 +5,7 @@
 文档基于当前代码整理，适用范围如下：
 
 - 当前任务版本：`v3`
-- 后端入口：`server/src/index.js`
+- 后端入口：`server/src/index.ts`（编译后为 `server/dist/index.js`）
 - 前端入口：`client/src/main.ts`
 - 数据库：PostgreSQL
 - 生产部署：Docker Compose
@@ -167,8 +167,8 @@ Node.js / Express API 容器
 │  │  ├─ postgres-schema.sql       数据库表、索引和触发器
 │  │  ├─ task-generation-worker.js 任务生成子进程
 │  │  ├─ image-assets.js            原图和缩略图路径处理
-│  │  ├─ import-local.js            SFTP/inbox 本地导入命令
-│  │  ├─ backfill-thumbnails.js     历史图片缩略图补生成
+│  │  ├─ import-local.ts            SFTP/inbox 本地导入命令
+│  │  ├─ backfill-thumbnails.ts     历史图片缩略图补生成
 │  │  ├─ migrate-sqlite-to-postgres.js SQLite 迁移工具
 │  │  └─ services/
 │  │     ├─ admin-dashboard.js      仪表盘统计和导出逻辑
@@ -1438,7 +1438,7 @@ docker compose logs --tail=100 api
 
 ## 17. SQLite 迁移到 PostgreSQL
 
-迁移脚本：`server/src/migrate-sqlite-to-postgres.js`
+迁移脚本：`server/src/migrate-sqlite-to-postgres.ts`
 
 迁移前：
 
@@ -1503,7 +1503,7 @@ example.zip
 
 ```bash
 docker compose exec -T api \
-  node src/import-local.js /app/inbox/example.zip
+  node dist/import-local.js /app/inbox/example.zip
 ```
 
 成功后原始文件移动到：
@@ -1516,7 +1516,7 @@ docker compose exec -T api \
 
 ```bash
 docker compose exec -T api \
-  node src/import-local.js /app/inbox/example.zip --keep
+  node dist/import-local.js /app/inbox/example.zip --keep
 ```
 
 详细说明请参考 `docs/SFTP_IMPORT.md`。

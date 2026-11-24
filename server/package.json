@@ -2,14 +2,17 @@
   "name": "image-rating-api",
   "type": "module",
   "scripts": {
-    "start": "DOTENV_CONFIG_PATH=../.env node src/index.js",
-    "dev": "DOTENV_CONFIG_PATH=../.env node --watch src/index.js",
-    "migrate:schema": "DOTENV_CONFIG_PATH=../.env RUN_SCHEMA_INIT=0 node src/migrate-schema.js",
-    "test": "node --test test/*.test.js",
-    "import:local": "DOTENV_CONFIG_PATH=../.env node src/import-local.js",
-    "thumbnails:backfill": "DOTENV_CONFIG_PATH=../.env node src/backfill-thumbnails.js",
-    "thumbnails:worker": "DOTENV_CONFIG_PATH=../.env node src/thumbnail-worker.js",
-    "migrate:sqlite": "DOTENV_CONFIG_PATH=../.env node src/migrate-sqlite-to-postgres.js"
+    "build": "tsc -p tsconfig.json && mkdir -p dist/migrations && cp src/migrations/*.sql dist/migrations/ && cp src/postgres-schema.sql dist/postgres-schema.sql",
+    "start": "DOTENV_CONFIG_PATH=../.env node dist/index.js",
+    "dev": "DOTENV_CONFIG_PATH=../.env tsx watch src/index.ts",
+    "dev:thumbnails": "DOTENV_CONFIG_PATH=../.env THUMBNAIL_WORKER=1 tsx watch src/thumbnail-worker.ts",
+    "migrate:schema": "DOTENV_CONFIG_PATH=../.env RUN_SCHEMA_INIT=0 node dist/migrate-schema.js",
+    "test": "node --import tsx --test test/*.test.js",
+    "test:integration": "node --import tsx --test test/integration-flow.integration.js",
+    "import:local": "DOTENV_CONFIG_PATH=../.env node dist/import-local.js",
+    "thumbnails:backfill": "DOTENV_CONFIG_PATH=../.env node dist/backfill-thumbnails.js",
+    "thumbnails:worker": "DOTENV_CONFIG_PATH=../.env THUMBNAIL_WORKER=1 node dist/thumbnail-worker.js",
+    "migrate:sqlite": "DOTENV_CONFIG_PATH=../.env node dist/migrate-sqlite-to-postgres.js"
   },
   "dependencies": {
     "adm-zip": "^0.5.16",
@@ -18,10 +21,17 @@
     "exceljs": "^4.4.0",
     "express": "^4.21.2",
     "iconv-lite": "^0.4.24",
-    "image-rating-platform": "file:..",
     "multer": "^1.4.5-lts.1",
     "pg": "^8.16.3",
     "sharp": "^0.35.3",
     "yauzl": "^3.4.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.25",
+    "@types/multer": "^1.4.13",
+    "@types/node": "^22.20.5",
+    "@types/pg": "^8.23.1",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
   }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NText, NSpace, NInput, NSelect, NDatePicker, NDataTable, NPagination, NModal, NForm, NFormItem, NAlert } from 'naive-ui';
 import { computed, h, onMounted, reactive, ref } from 'vue';
 import { NButton, NTag, useDialog, useMessage, type DataTableColumns } from 'naive-ui';
 import BulkNameTagEditor from '../components/BulkNameTagEditor.vue';
@@ -434,7 +435,7 @@ onMounted(() => void initialize());
       <div class="account-filter-bar">
         <n-input v-model:value="filters.username" clearable placeholder="按名称筛选" @keyup.enter="applyFilters" />
         <n-select v-model:value="filters.teamId" clearable filterable :options="teamFilterOptions" placeholder="按团队筛选" />
-        <n-date-picker v-model:value="filters.lastLoginRange" type="daterange" value-format="yyyy-MM-dd" clearable placeholder="按最后登录日期筛选" />
+        <n-date-picker v-model:formatted-value="filters.lastLoginRange" type="daterange" value-format="yyyy-MM-dd" clearable placeholder="按最后登录日期筛选" />
         <div class="account-filter-actions">
           <n-button type="primary" @click="applyFilters">查询</n-button>
           <n-button :disabled="!hasFilters" @click="resetFilters">重置</n-button>

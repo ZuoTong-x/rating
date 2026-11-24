@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NButton, NText, NSpin, NPagination, NModal, NImage, NScrollbar } from 'naive-ui';
 import { computed, onMounted, ref, watch } from 'vue';
 import { useMessage } from 'naive-ui';
 import { useRoute, useRouter } from 'vue-router';
@@ -18,36 +19,11 @@ const selectedImage = ref<ImageItem | null>(null);
 const showDetail = ref(false);
 const imagePage = ref<ImagePage>({ total: 0, page: 1, pageSize, items: [] });
 
-const catalogFieldLabels: Record<string, string> = {
-  case_id: 'Case ID',
-  sample_index: 'Sample index',
-  category_id: '分类 ID',
-  category: '分类',
-  image_path: 'JSON 图片路径',
-  image_filename: 'JSON 图片名称',
-  model_folder: '模型目录',
-  model_id: '模型 ID',
-  model_name: '模型名称',
-  model_group: '模型分组',
-  is_ideogram: 'Ideogram',
-  prompt_type: 'Prompt 类型',
-  width: '宽度',
-  height: '高度',
-  seed: 'Seed',
-  match_method: '匹配方式'
-};
-
 const imagePrompt = computed(() => {
   const image = selectedImage.value;
   return image?.prompt?.trim() || image?.catalog?.actual_input_prompt?.trim() || image?.catalog?.prompt?.trim() || '';
 });
 
-
-function formatCatalogValue(value: unknown) {
-  if (typeof value === 'boolean') return value ? '是' : '否';
-  if (typeof value === 'object') return JSON.stringify(value);
-  return String(value);
-}
 
 function errorMessage(error: unknown) {
   return error instanceof Error ? error.message : '请求失败';

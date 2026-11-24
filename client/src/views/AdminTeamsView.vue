@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NText, NDataTable, NModal, NForm, NFormItem, NInput, NSpace } from 'naive-ui';
 import { h, onMounted, reactive, ref } from 'vue';
 import { NButton, NTag, useDialog, useMessage, type DataTableColumns } from 'naive-ui';
 import { authApi } from '../services/auth';

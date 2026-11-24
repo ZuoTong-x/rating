@@ -851,7 +851,6 @@ create index if not exists idx_task_stats_events_processed
     where processedat is not null;
 create index if not exists idx_users_role_status on users(role, status, username);
 create index if not exists idx_teams_status_name on teams(status, name);
-create index if not exists idx_project_packages_project_package on project_packages(projectid, packageid);
 create index if not exists idx_rating_tasks_project_assignment on rating_tasks(projectid, taskversion, status, assignmentkey, id);
 create index if not exists idx_rating_tasks_project_scorer_assignment on rating_tasks(projectid, taskversion, status, scorer, assignmentkey, id);
 create index if not exists idx_rating_tasks_project_backtest on rating_tasks(projectid, taskversion, isbacktest);

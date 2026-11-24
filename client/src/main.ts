@@ -1,7 +1,6 @@
 import { createApp } from 'vue';
 import { createPinia } from 'pinia';
 import { createRouter, createWebHistory } from 'vue-router';
-import { naive } from './plugins/naive-ui';
 import AppLayout from './layouts/AppLayout.vue';
 import { clearCurrentUser, currentUser, defaultRouteForUser, setCurrentUser } from './composables/auth';
 import { authApi } from './services/auth';
@@ -74,7 +73,7 @@ async function bootstrap() {
   } catch {
     clearCurrentUser();
   }
-  createApp(AppLayout).use(createPinia()).use(naive).use(router).mount('#app');
+  createApp(AppLayout).use(createPinia()).use(router).mount('#app');
 }
 
 void bootstrap();

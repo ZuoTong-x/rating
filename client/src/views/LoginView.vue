@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { NButton, NIcon, NText, NForm, NFormItem, NInput, NSpace } from 'naive-ui';
 import { reactive, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import { useMessage } from 'naive-ui';

@@ -87,7 +87,7 @@ export const useTaskStackStore = defineStore('taskStack', () => {
     });
   }
 
-  function finishTask(id: string, patch: Omit<TaskStackPatch, 'status' | 'error'> = {}) {
+  function finishTask(id: string, _patch: Omit<TaskStackPatch, 'status' | 'error'> = {}) {
     const nextTasks = tasks.value.filter(task => task.id !== id);
     tasks.value = nextTasks;
     if (!nextTasks.length) panelOpen.value = false;

@@ -1,7 +1,8 @@
 <script setup lang="ts">
+import { NH2, NText, NSpace, NSwitch, NButton, NDatePicker, NSelect, NInput, NAlert, NSpin, NTable, NTag, NPagination, NModal } from 'naive-ui';
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useMessage } from 'naive-ui';
-import { imageApi } from '../services/images';
+import { adminLogsApi } from '../services/admin-logs';
 import type { AdminOperationalLogEntry, AdminOperationalLogPage } from '../types/image';
 import { BUSINESS_TIME_ZONE, formatDateTime, shanghaiDateToUtc } from '../utils/time';
 
@@ -77,7 +78,7 @@ function errorMessage(error: unknown) {
 async function loadLogs(nextPage = page.value, silent = false) {
   if (!silent) loading.value = true;
   try {
-    result.value = await imageApi.adminOperationalLogs({
+    result.value = await adminLogsApi.adminOperationalLogs({
       page: nextPage,
       pageSize: pageSize.value,
       level: level.value,
